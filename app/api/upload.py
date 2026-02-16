@@ -67,7 +67,7 @@ async def _process_task(task_id: str):
     """Background task: run AI pipeline and update task status."""
     import logging
 
-    logger = logging.getLogger("colorbyte.process")
+    logger = logging.getLogger("artimagehub.process")
 
     from app.services.task_store import get_task
 

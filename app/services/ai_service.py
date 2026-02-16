@@ -125,7 +125,7 @@ class HuggingFaceProvider(AIProvider):
     async def _restore_face(self, input_path: str, progress_callback: ProgressCallback) -> tuple[str, bool]:
         """Try face restoration Spaces with fallback. Returns (path, did_upscale)."""
         import logging
-        logger = logging.getLogger("colorbyte.hf")
+        logger = logging.getLogger("artimagehub.hf")
         errors = []
 
         for space_id, space_type in self.RESTORE_SPACES:
@@ -151,7 +151,7 @@ class HuggingFaceProvider(AIProvider):
         import logging
         from gradio_client import Client, handle_file
 
-        logger = logging.getLogger("colorbyte.hf")
+        logger = logging.getLogger("artimagehub.hf")
         spaces = ["doevent/Face-Real-ESRGAN"]
 
         for space in spaces:
@@ -176,7 +176,7 @@ class HuggingFaceProvider(AIProvider):
         import logging
         from gradio_client import Client, handle_file
 
-        logger = logging.getLogger("colorbyte.hf")
+        logger = logging.getLogger("artimagehub.hf")
 
         for space in self.DEOLDIFY_SPACES:
             try:
@@ -249,7 +249,7 @@ class ReplicateProvider(AIProvider):
     async def _run_model(self, http: "httpx.AsyncClient", version: str, model_input: dict) -> str:
         """Run a Replicate model and wait for result. Returns output URL."""
         import logging
-        logger = logging.getLogger("colorbyte.replicate")
+        logger = logging.getLogger("artimagehub.replicate")
 
         headers = {"Authorization": f"Bearer {self.api_token}"}
 
@@ -308,7 +308,7 @@ class ReplicateProvider(AIProvider):
     ) -> ProcessingResult:
         import httpx
         import logging
-        logger = logging.getLogger("colorbyte.replicate")
+        logger = logging.getLogger("artimagehub.replicate")
 
         try:
             async with httpx.AsyncClient(timeout=180) as http:

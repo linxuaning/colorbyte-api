@@ -1,7 +1,7 @@
-# Render Blueprint - ColorByte Backend
+# Render Blueprint - ArtImageHub Backend
 services:
   - type: web
-    name: colorbyte-api
+    name: artimagehub-api
     runtime: docker
     repo: # Set via Render dashboard
     region: oregon

@@ -1,5 +1,5 @@
 """
-ColorByte Backend - FastAPI Application
+ArtImageHub Backend - FastAPI Application
 AI-powered photo restoration service
 """
 import logging
@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 app = FastAPI(
-    title="ColorByte API",
+    title="ArtImageHub API",
     description="AI-powered photo restoration service",
     version="0.1.0",
 )
@@ -41,7 +41,7 @@ app.include_router(download.router, prefix="/api", tags=["download"])
 
 @app.get("/")
 async def root():
-    return {"message": "ColorByte API", "version": "0.1.0"}
+    return {"message": "ArtImageHub API", "version": "0.1.0"}
 
 
 @app.get("/health")

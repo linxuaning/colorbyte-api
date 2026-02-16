@@ -1,5 +1,5 @@
 def main():
-    print("Hello from colorbyte-backend!")
+    print("Hello from artimagehub-backend!")
 
 
 if __name__ == "__main__":

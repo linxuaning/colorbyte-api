@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # App
-    app_name: str = "ColorByte API"
+    app_name: str = "ArtImageHub API"
     debug: bool = False
 
     # AI Provider: "huggingface" (free, dev) or "replicate" (paid, prod)
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     r2_account_id: str = ""
     r2_access_key_id: str = ""
     r2_secret_access_key: str = ""
-    r2_bucket_name: str = "colorbyte"
+    r2_bucket_name: str = "artimagehub"
 
     # CORS
     frontend_url: str = "http://localhost:3000"

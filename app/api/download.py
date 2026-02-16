@@ -31,7 +31,7 @@ async def download_result(task_id: str):
     return FileResponse(
         path=task.result_path,
         media_type="image/jpeg",
-        filename=f"colorbyte-{task_id}.jpg",
+        filename=f"artimagehub-{task_id}.jpg",
     )
 
 
