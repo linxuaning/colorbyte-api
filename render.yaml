@@ -11,7 +11,7 @@ services:
       - key: AI_PROVIDER
         value: huggingface
       - key: FRONTEND_URL
-        value: https://colorbyte.vercel.app
+        value: https://colorbyte-web.vercel.app
       - key: DEBUG
         value: "false"
     healthCheckPath: /health
