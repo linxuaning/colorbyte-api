@@ -239,69 +239,107 @@ class HuggingFaceProvider(AIProvider):
 
 
 class ReplicateProvider(AIProvider):
-    """Paid API via Replicate. Higher quality, faster, for production."""
+    """Paid API via Replicate. Uses HTTP API directly (no SDK) for Python 3.14 compat."""
+
+    REPLICATE_API = "https://api.replicate.com/v1/predictions"
 
     def __init__(self, api_token: str):
         self.api_token = api_token
-        self._client = None
 
-    def _get_client(self):
-        if self._client is None:
-            import replicate
-            self._client = replicate.Client(api_token=self.api_token)
-        return self._client
+    async def _run_model(self, http: "httpx.AsyncClient", version: str, model_input: dict) -> str:
+        """Run a Replicate model and wait for result. Returns output URL."""
+        import logging
+        logger = logging.getLogger("colorbyte.replicate")
+
+        resp = await http.post(
+            self.REPLICATE_API,
+            headers={"Authorization": f"Bearer {self.api_token}"},
+            json={"version": version, "input": model_input},
+        )
+        resp.raise_for_status()
+        prediction = resp.json()
+
+        poll_url = prediction["urls"]["get"]
+        for _ in range(120):  # max 2 min poll
+            await asyncio.sleep(1)
+            poll_resp = await http.get(poll_url, headers={"Authorization": f"Bearer {self.api_token}"})
+            poll_resp.raise_for_status()
+            data = poll_resp.json()
+            status = data["status"]
+            if status == "succeeded":
+                output = data["output"]
+                return output if isinstance(output, str) else str(output)
+            elif status in ("failed", "canceled"):
+                raise RuntimeError(f"Replicate prediction {status}: {data.get('error', 'unknown')}")
+
+        raise RuntimeError("Replicate prediction timed out")
+
+    async def _upload_file(self, http: "httpx.AsyncClient", file_path: str) -> str:
+        """Upload file to Replicate and return the serving URL."""
+        import mimetypes
+        content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        filename = Path(file_path).name
+
+        # Create upload
+        resp = await http.post(
+            "https://api.replicate.com/v1/files",
+            headers={"Authorization": f"Bearer {self.api_token}"},
+            files={"content": (filename, open(file_path, "rb"), content_type)},
+        )
+        resp.raise_for_status()
+        return resp.json()["urls"]["get"]
 
     async def process_photo(
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
     ) -> ProcessingResult:
         import httpx
 
-        client = self._get_client()
         try:
-            if progress_callback:
-                await progress_callback("Enhancing faces...", 20)
-
-            with open(input_path, "rb") as f:
-                gfpgan_output = await asyncio.to_thread(
-                    client.run,
-                    "tencentarc/gfpgan:0fbacf7afc6c144e5be9767cff80f25aff23e52b0708f17e20f9879b2f21516c",
-                    input={"img": f, "version": "v1.4", "scale": 2},
-                )
-            current_url = str(gfpgan_output)
-
-            if progress_callback:
-                await progress_callback("Upscaling resolution...", 50)
-
-            esrgan_output = await asyncio.to_thread(
-                client.run,
-                "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
-                input={"image": current_url, "scale": 4, "face_enhance": True},
-            )
-            current_url = str(esrgan_output)
-
-            if colorize:
+            async with httpx.AsyncClient(timeout=180) as http:
                 if progress_callback:
-                    await progress_callback("Colorizing...", 80)
+                    await progress_callback("Uploading image...", 10)
 
-                color_output = await asyncio.to_thread(
-                    client.run,
-                    "piddnad/ddcolor:ca494ba129e44e45f661d6ece83c4c98a9a7c774309beca01f4d095d7f4e4c97",
-                    input={"image": current_url, "model_size": "large"},
+                file_url = await self._upload_file(http, input_path)
+
+                if progress_callback:
+                    await progress_callback("Enhancing faces (GFPGAN)...", 20)
+
+                current_url = await self._run_model(
+                    http,
+                    "0fbacf7afc6c144e5be9767cff80f25aff23e52b0708f17e20f9879b2f21516c",
+                    {"img": file_url, "version": "v1.4", "scale": 2},
                 )
-                current_url = str(color_output)
 
-            if progress_callback:
-                await progress_callback("Generating result...", 95)
+                if progress_callback:
+                    await progress_callback("Upscaling resolution (Real-ESRGAN)...", 50)
 
-            async with httpx.AsyncClient() as http:
+                current_url = await self._run_model(
+                    http,
+                    "f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
+                    {"image": current_url, "scale": 4, "face_enhance": True},
+                )
+
+                if colorize:
+                    if progress_callback:
+                        await progress_callback("Colorizing (DDColor)...", 80)
+
+                    current_url = await self._run_model(
+                        http,
+                        "ca494ba129e44e45f661d6ece83c4c98a9a7c774309beca01f4d095d7f4e4c97",
+                        {"image": current_url, "model_size": "large"},
+                    )
+
+                if progress_callback:
+                    await progress_callback("Downloading result...", 95)
+
                 resp = await http.get(current_url)
                 resp.raise_for_status()
                 Path(output_path).write_bytes(resp.content)
 
-            if progress_callback:
-                await progress_callback("Complete", 100)
+                if progress_callback:
+                    await progress_callback("Complete", 100)
 
-            return ProcessingResult(success=True, output_path=output_path)
+                return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as e:
             return ProcessingResult(success=False, error=str(e))
