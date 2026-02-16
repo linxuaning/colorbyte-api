@@ -52,6 +52,16 @@ def init_db():
                 event_type TEXT NOT NULL,
                 processed_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL,
+                download_date TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_downloads_ip_date
+                ON downloads(ip, download_date);
         """)
     logger.info("Database initialized at %s", path)
 
@@ -177,3 +187,39 @@ def cancel_subscription_db(email: str):
             (now, email),
         )
     logger.info("Subscription cancel requested: %s", email)
+
+
+# --- Download tracking ---
+
+FREE_DAILY_LIMIT = 3
+
+
+def get_download_count(ip: str, date_str: str) -> int:
+    """Get number of downloads for an IP on a given date."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM downloads WHERE ip = ? AND download_date = ?",
+            (ip, date_str),
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+
+def record_download(ip: str, task_id: str):
+    """Record a download event."""
+    now = datetime.now(timezone.utc)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO downloads (ip, download_date, task_id, created_at) VALUES (?, ?, ?, ?)",
+            (ip, now.strftime("%Y-%m-%d"), task_id, now.isoformat()),
+        )
+
+
+def check_download_limit(ip: str, email: str | None = None) -> dict:
+    """Check if a download is allowed. Subscribers get unlimited access."""
+    if email and is_user_active(email):
+        return {"allowed": True, "remaining": -1, "is_subscriber": True}
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    count = get_download_count(ip, today)
+    remaining = max(0, FREE_DAILY_LIMIT - count)
+    return {"allowed": remaining > 0, "remaining": remaining, "is_subscriber": False}
