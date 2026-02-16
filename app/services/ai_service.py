@@ -53,55 +53,120 @@ class MockProvider(AIProvider):
 
 
 class HuggingFaceProvider(AIProvider):
-    """Free API via HuggingFace Spaces Gradio endpoints."""
+    """Free API via HuggingFace Spaces Gradio endpoints with fallback."""
+
+    # Fallback lists: try each Space in order until one works
+    GFPGAN_SPACES = [
+        "Xintao/GFPGAN",
+        "nightfury/Image_Face_Upscale_Restoration-GFPGAN",
+        "leonelhs/GFPGAN",
+        "akhaliq/GFPGAN",
+    ]
+    ESRGAN_SPACES = [
+        "doevent/Face-Real-ESRGAN",
+    ]
+    DEOLDIFY_SPACES = [
+        "jantic/DeOldify",
+    ]
+
+    async def _call_gfpgan(self, input_path: str) -> str:
+        """Try GFPGAN Spaces with fallback. Returns output file path."""
+        import logging
+        from gradio_client import Client, handle_file
+
+        logger = logging.getLogger("colorbyte.hf")
+
+        for space in self.GFPGAN_SPACES:
+            try:
+                logger.info("Trying GFPGAN space: %s", space)
+                client = Client(space, verbose=False)
+                result = await asyncio.to_thread(
+                    client.predict,
+                    handle_file(input_path),
+                    "v1.4",
+                    2,
+                    api_name="/predict",
+                )
+                logger.info("GFPGAN succeeded with: %s", space)
+                return str(result)
+            except Exception as e:
+                logger.warning("GFPGAN space %s failed: %s", space, e)
+                continue
+
+        raise RuntimeError("All GFPGAN Spaces are unavailable")
+
+    async def _call_esrgan(self, input_path: str) -> str:
+        """Try Real-ESRGAN Spaces with fallback."""
+        import logging
+        from gradio_client import Client, handle_file
+
+        logger = logging.getLogger("colorbyte.hf")
+
+        for space in self.ESRGAN_SPACES:
+            try:
+                logger.info("Trying ESRGAN space: %s", space)
+                client = Client(space, verbose=False)
+                result = await asyncio.to_thread(
+                    client.predict,
+                    handle_file(input_path),
+                    api_name="/predict",
+                )
+                logger.info("ESRGAN succeeded with: %s", space)
+                return str(result)
+            except Exception as e:
+                logger.warning("ESRGAN space %s failed: %s", space, e)
+                continue
+
+        raise RuntimeError("All Real-ESRGAN Spaces are unavailable")
+
+    async def _call_deoldify(self, input_path: str) -> str:
+        """Try DeOldify Spaces with fallback."""
+        import logging
+        from gradio_client import Client, handle_file
+
+        logger = logging.getLogger("colorbyte.hf")
+
+        for space in self.DEOLDIFY_SPACES:
+            try:
+                logger.info("Trying DeOldify space: %s", space)
+                client = Client(space, verbose=False)
+                result = await asyncio.to_thread(
+                    client.predict,
+                    handle_file(input_path),
+                    10,
+                    api_name="/predict",
+                )
+                logger.info("DeOldify succeeded with: %s", space)
+                return str(result)
+            except Exception as e:
+                logger.warning("DeOldify space %s failed: %s", space, e)
+                continue
+
+        raise RuntimeError("All DeOldify Spaces are unavailable")
 
     async def process_photo(
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
     ) -> ProcessingResult:
         try:
-            from gradio_client import Client, handle_file
-
-            # Step 1: Face restoration via GFPGAN
+            # Step 1: Face restoration via GFPGAN (with fallback)
             if progress_callback:
                 await progress_callback("Enhancing faces (GFPGAN)...", 15)
 
-            gfpgan = Client("Xintao/GFPGAN", verbose=False)
-            result = await asyncio.to_thread(
-                gfpgan.predict,
-                handle_file(input_path),
-                "v1.4",  # version
-                2,  # rescaling_factor
-                api_name="/predict",
-            )
-            # GFPGAN returns a filepath string
-            current_path = str(result)
+            current_path = await self._call_gfpgan(input_path)
 
-            # Step 2: Super resolution via Real-ESRGAN
+            # Step 2: Super resolution via Real-ESRGAN (with fallback)
             if progress_callback:
                 await progress_callback("Upscaling resolution (Real-ESRGAN)...", 50)
 
-            esrgan = Client("doevent/Face-Real-ESRGAN", verbose=False)
-            result = await asyncio.to_thread(
-                esrgan.predict,
-                handle_file(current_path),
-                api_name="/predict",
-            )
-            current_path = str(result)
+            current_path = await self._call_esrgan(current_path)
 
-            # Step 3: Colorization (optional)
+            # Step 3: Colorization (optional, with fallback)
             if colorize:
                 if progress_callback:
                     await progress_callback("Colorizing (DeOldify)...", 80)
 
                 try:
-                    deoldify = Client("jantic/DeOldify", verbose=False)
-                    result = await asyncio.to_thread(
-                        deoldify.predict,
-                        handle_file(current_path),
-                        10,  # render_factor
-                        api_name="/predict",
-                    )
-                    current_path = str(result)
+                    current_path = await self._call_deoldify(current_path)
                 except Exception:
                     # Colorization is optional - continue without it
                     pass
