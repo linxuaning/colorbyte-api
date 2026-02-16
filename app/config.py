@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     r2_secret_access_key: str = ""
     r2_bucket_name: str = "artimagehub"
 
+    # Stripe
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_price_id: str = ""  # Recurring price ID for $9.9/month subscription
+    trial_days: int = 7
+
+    # Database
+    database_path: str = "data/artimagehub.db"
+
     # CORS
     frontend_url: str = "http://localhost:3000"
 

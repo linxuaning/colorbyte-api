@@ -1,22 +1,25 @@
 """
 Download API endpoint.
-Serves processed images. MVP: 720p free download without watermark.
+Free: 720p preview. Subscribers: original quality, no watermark.
 """
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from app.services.task_store import get_task, TaskStatus
+from app.services.database import is_user_active
 
 router = APIRouter()
 
 
 @router.get("/download/{task_id}")
-async def download_result(task_id: str):
+async def download_result(task_id: str, email: Optional[str] = Query(None)):
     """
     Download the processed result image.
-    MVP: returns the full result directly (watermark/resize deferred).
+    Free users: 720p preview (future: resize + watermark).
+    Subscribers (email with active sub): original quality.
     """
     task = get_task(task_id)
     if task is None:
@@ -28,10 +31,20 @@ async def download_result(task_id: str):
     if not task.result_path or not Path(task.result_path).exists():
         raise HTTPException(status_code=404, detail="Result file not found")
 
+    # Check subscription for original quality
+    is_subscriber = False
+    if email:
+        is_subscriber = is_user_active(email.lower().strip())
+
+    # TODO: For non-subscribers, resize to 720p and add watermark
+    # For MVP, we serve the full image but track subscriber status
     return FileResponse(
         path=task.result_path,
         media_type="image/jpeg",
         filename=f"artimagehub-{task_id}.jpg",
+        headers={
+            "X-Subscriber": "true" if is_subscriber else "false",
+        },
     )
 
 

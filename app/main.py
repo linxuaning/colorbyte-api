@@ -7,7 +7,8 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import upload, tasks, download
+from app.api import upload, tasks, download, payment
+from app.services.database import init_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,10 +34,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize database
+init_db()
+
 # Include routers
 app.include_router(upload.router, prefix="/api", tags=["upload"])
 app.include_router(tasks.router, prefix="/api", tags=["tasks"])
 app.include_router(download.router, prefix="/api", tags=["download"])
+app.include_router(payment.router, prefix="/api", tags=["payment"])
 
 
 @app.get("/")

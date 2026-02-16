@@ -1,2 +1,2 @@
 """API routers"""
-from . import upload, tasks, download
+from . import upload, tasks, download, payment
