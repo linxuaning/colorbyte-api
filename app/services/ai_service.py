@@ -75,25 +75,39 @@ class HuggingFaceProvider(AIProvider):
         from gradio_client import Client, handle_file
 
         logger = logging.getLogger("colorbyte.hf")
+        errors = []
+
+        # Different spaces may have different API signatures
+        call_variants = [
+            # (space_id, args, kwargs) — try standard 3-arg call first, then 1-arg
+            lambda f: (f, "v1.4", 2),   # standard: image, version, scale
+            lambda f: (f, "v1.4",),     # some forks omit scale
+            lambda f: (f,),             # minimal: image only
+        ]
 
         for space in self.GFPGAN_SPACES:
-            try:
-                logger.info("Trying GFPGAN space: %s", space)
-                client = Client(space, verbose=False)
-                result = await asyncio.to_thread(
-                    client.predict,
-                    handle_file(input_path),
-                    "v1.4",
-                    2,
-                    api_name="/predict",
-                )
-                logger.info("GFPGAN succeeded with: %s", space)
-                return str(result)
-            except Exception as e:
-                logger.warning("GFPGAN space %s failed: %s", space, e)
-                continue
+            for variant in call_variants:
+                try:
+                    args = variant(handle_file(input_path))
+                    logger.info("Trying GFPGAN space: %s with %d args", space, len(args))
+                    client = Client(space, verbose=False)
+                    result = await asyncio.to_thread(
+                        client.predict,
+                        *args,
+                        api_name="/predict",
+                    )
+                    logger.info("GFPGAN succeeded with: %s", space)
+                    return str(result)
+                except Exception as e:
+                    err_msg = str(e)
+                    logger.warning("GFPGAN space %s failed: %s", space, err_msg)
+                    errors.append(f"{space}: {err_msg[:100]}")
+                    # If space itself is broken (RUNTIME_ERROR, etc), skip other variants
+                    if "RUNTIME_ERROR" in err_msg or "not running" in err_msg.lower():
+                        break
+                    continue
 
-        raise RuntimeError("All GFPGAN Spaces are unavailable")
+        raise RuntimeError(f"All GFPGAN Spaces failed: {'; '.join(errors[-4:])}")
 
     async def _call_esrgan(self, input_path: str) -> str:
         """Try Real-ESRGAN Spaces with fallback."""
