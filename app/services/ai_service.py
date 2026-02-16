@@ -53,72 +53,110 @@ class MockProvider(AIProvider):
 
 
 class HuggingFaceProvider(AIProvider):
-    """Free API via HuggingFace Spaces Gradio endpoints with fallback."""
+    """Free API via HuggingFace Spaces Gradio endpoints with fallback.
 
-    # Fallback lists: try each Space in order until one works
-    GFPGAN_SPACES = [
-        "Xintao/GFPGAN",
-        "nightfury/Image_Face_Upscale_Restoration-GFPGAN",
-        "leonelhs/GFPGAN",
-        "akhaliq/GFPGAN",
+    Strategy: try multiple face restoration approaches in order:
+    1. CodeFormer (face restore + background enhance + upscale in one call)
+    2. Multi-model spaces (GFPGAN/CodeFormer/RestoreFormer via avans06 forks)
+    3. GFPGAN-only spaces (original + forks)
+    If CodeFormer succeeds, skip separate ESRGAN step (it already upscales).
+    """
+
+    # Each entry: (space_id, call_fn, includes_upscale)
+    # call_fn takes (handle_file(path),) and returns predict args
+    RESTORE_SPACES: list[tuple[str, str]] = [
+        # CodeFormer: image, bg_enhance, face_upsample, upscale, fidelity_weight
+        ("sczhou/CodeFormer", "codeformer"),
+        # Multi-model spaces (avans06 forks) — use GFPGAN model within them
+        ("avans06/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel"),
+        ("titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel"),
+        # GFPGAN-only spaces
+        ("Xintao/GFPGAN", "gfpgan"),
+        ("nightfury/Image_Face_Upscale_Restoration-GFPGAN", "gfpgan"),
+        ("leonelhs/GFPGAN", "gfpgan"),
+        ("akhaliq/GFPGAN", "gfpgan"),
     ]
-    ESRGAN_SPACES = [
-        "doevent/Face-Real-ESRGAN",
-    ]
+
     DEOLDIFY_SPACES = [
         "jantic/DeOldify",
     ]
 
-    async def _call_gfpgan(self, input_path: str) -> str:
-        """Try GFPGAN Spaces with fallback. Returns output file path."""
-        import logging
+    async def _try_space(self, space_id: str, space_type: str, input_path: str) -> tuple[str, bool]:
+        """Try a single Space. Returns (output_path, includes_upscale)."""
         from gradio_client import Client, handle_file
 
+        client = Client(space_id, verbose=False)
+        img = handle_file(input_path)
+
+        if space_type == "codeformer":
+            # CodeFormer: image, bg_enhance, face_upsample, upscale_factor, codeformer_fidelity
+            result = await asyncio.to_thread(
+                client.predict,
+                img,
+                True,    # background_enhance
+                True,    # face_upsample
+                2,       # rescaling_factor
+                0.7,     # codeformer_fidelity (0=quality, 1=fidelity)
+                api_name="/predict",
+            )
+            return str(result), True  # CodeFormer includes upscale
+
+        elif space_type == "multimodel":
+            # avans06 multi-model: image, model_name, rescale
+            result = await asyncio.to_thread(
+                client.predict,
+                img,
+                "CodeFormer",  # model selection
+                2,             # rescale factor
+                api_name="/predict",
+            )
+            return str(result), True  # includes upscale
+
+        else:  # gfpgan
+            result = await asyncio.to_thread(
+                client.predict,
+                img,
+                "v1.4",  # version
+                2,        # rescaling_factor
+                api_name="/predict",
+            )
+            return str(result), False  # GFPGAN alone doesn't super-resolve well
+
+    async def _restore_face(self, input_path: str, progress_callback: ProgressCallback) -> tuple[str, bool]:
+        """Try face restoration Spaces with fallback. Returns (path, did_upscale)."""
+        import logging
         logger = logging.getLogger("colorbyte.hf")
         errors = []
 
-        # Different spaces may have different API signatures
-        call_variants = [
-            # (space_id, args, kwargs) — try standard 3-arg call first, then 1-arg
-            lambda f: (f, "v1.4", 2),   # standard: image, version, scale
-            lambda f: (f, "v1.4",),     # some forks omit scale
-            lambda f: (f,),             # minimal: image only
-        ]
+        for space_id, space_type in self.RESTORE_SPACES:
+            try:
+                logger.info("Trying %s (%s)...", space_id, space_type)
+                if progress_callback:
+                    short_name = space_id.split("/")[-1][:20]
+                    await progress_callback(f"Restoring faces ({short_name})...", 20)
 
-        for space in self.GFPGAN_SPACES:
-            for variant in call_variants:
-                try:
-                    args = variant(handle_file(input_path))
-                    logger.info("Trying GFPGAN space: %s with %d args", space, len(args))
-                    client = Client(space, verbose=False)
-                    result = await asyncio.to_thread(
-                        client.predict,
-                        *args,
-                        api_name="/predict",
-                    )
-                    logger.info("GFPGAN succeeded with: %s", space)
-                    return str(result)
-                except Exception as e:
-                    err_msg = str(e)
-                    logger.warning("GFPGAN space %s failed: %s", space, err_msg)
-                    errors.append(f"{space}: {err_msg[:100]}")
-                    # If space itself is broken (RUNTIME_ERROR, etc), skip other variants
-                    if "RUNTIME_ERROR" in err_msg or "not running" in err_msg.lower():
-                        break
-                    continue
+                result_path, includes_upscale = await self._try_space(space_id, space_type, input_path)
+                logger.info("Succeeded with: %s", space_id)
+                return result_path, includes_upscale
+            except Exception as e:
+                err_msg = str(e)
+                logger.warning("%s failed: %s", space_id, err_msg[:200])
+                errors.append(f"{space_id.split('/')[-1]}: {err_msg[:80]}")
+                continue
 
-        raise RuntimeError(f"All GFPGAN Spaces failed: {'; '.join(errors[-4:])}")
+        raise RuntimeError(f"All face restoration Spaces failed: {'; '.join(errors[-3:])}")
 
     async def _call_esrgan(self, input_path: str) -> str:
-        """Try Real-ESRGAN Spaces with fallback."""
+        """Try Real-ESRGAN for super resolution."""
         import logging
         from gradio_client import Client, handle_file
 
         logger = logging.getLogger("colorbyte.hf")
+        spaces = ["doevent/Face-Real-ESRGAN"]
 
-        for space in self.ESRGAN_SPACES:
+        for space in spaces:
             try:
-                logger.info("Trying ESRGAN space: %s", space)
+                logger.info("Trying ESRGAN: %s", space)
                 client = Client(space, verbose=False)
                 result = await asyncio.to_thread(
                     client.predict,
@@ -128,13 +166,13 @@ class HuggingFaceProvider(AIProvider):
                 logger.info("ESRGAN succeeded with: %s", space)
                 return str(result)
             except Exception as e:
-                logger.warning("ESRGAN space %s failed: %s", space, e)
+                logger.warning("ESRGAN %s failed: %s", space, e)
                 continue
 
-        raise RuntimeError("All Real-ESRGAN Spaces are unavailable")
+        raise RuntimeError("Real-ESRGAN unavailable")
 
     async def _call_deoldify(self, input_path: str) -> str:
-        """Try DeOldify Spaces with fallback."""
+        """Try DeOldify for colorization."""
         import logging
         from gradio_client import Client, handle_file
 
@@ -142,7 +180,7 @@ class HuggingFaceProvider(AIProvider):
 
         for space in self.DEOLDIFY_SPACES:
             try:
-                logger.info("Trying DeOldify space: %s", space)
+                logger.info("Trying DeOldify: %s", space)
                 client = Client(space, verbose=False)
                 result = await asyncio.to_thread(
                     client.predict,
@@ -153,42 +191,42 @@ class HuggingFaceProvider(AIProvider):
                 logger.info("DeOldify succeeded with: %s", space)
                 return str(result)
             except Exception as e:
-                logger.warning("DeOldify space %s failed: %s", space, e)
+                logger.warning("DeOldify %s failed: %s", space, e)
                 continue
 
-        raise RuntimeError("All DeOldify Spaces are unavailable")
+        raise RuntimeError("DeOldify unavailable")
 
     async def process_photo(
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
     ) -> ProcessingResult:
         try:
-            # Step 1: Face restoration via GFPGAN (with fallback)
+            # Step 1: Face restoration (tries CodeFormer → multi-model → GFPGAN)
             if progress_callback:
-                await progress_callback("Enhancing faces (GFPGAN)...", 15)
+                await progress_callback("Starting face restoration...", 10)
 
-            current_path = await self._call_gfpgan(input_path)
+            current_path, did_upscale = await self._restore_face(input_path, progress_callback)
 
-            # Step 2: Super resolution via Real-ESRGAN (with fallback)
-            if progress_callback:
-                await progress_callback("Upscaling resolution (Real-ESRGAN)...", 50)
+            # Step 2: Super resolution (skip if restoration already upscaled)
+            if not did_upscale:
+                if progress_callback:
+                    await progress_callback("Upscaling resolution (Real-ESRGAN)...", 55)
+                try:
+                    current_path = await self._call_esrgan(current_path)
+                except Exception:
+                    pass  # ESRGAN is nice-to-have, face restore is the core value
 
-            current_path = await self._call_esrgan(current_path)
-
-            # Step 3: Colorization (optional, with fallback)
+            # Step 3: Colorization (optional)
             if colorize:
                 if progress_callback:
                     await progress_callback("Colorizing (DeOldify)...", 80)
-
                 try:
                     current_path = await self._call_deoldify(current_path)
                 except Exception:
-                    # Colorization is optional - continue without it
-                    pass
+                    pass  # Colorization is optional
 
             if progress_callback:
                 await progress_callback("Generating result...", 95)
 
-            # Copy final result to output path
             shutil.copy2(current_path, output_path)
 
             if progress_callback:
