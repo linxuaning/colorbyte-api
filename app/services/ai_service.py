@@ -264,6 +264,8 @@ class ReplicateProvider(AIProvider):
                 logger.warning("Rate limited (429), retrying in %ds...", wait)
                 await asyncio.sleep(wait)
                 continue
+            if resp.status_code == 402:
+                raise RuntimeError("Replicate credits exhausted (402). Add billing at replicate.com/account/billing")
             resp.raise_for_status()
             break
         else:
@@ -305,6 +307,8 @@ class ReplicateProvider(AIProvider):
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
     ) -> ProcessingResult:
         import httpx
+        import logging
+        logger = logging.getLogger("colorbyte.replicate")
 
         try:
             async with httpx.AsyncClient(timeout=180) as http:
@@ -322,24 +326,32 @@ class ReplicateProvider(AIProvider):
                     {"img": file_url, "version": "v1.4", "scale": 2},
                 )
 
-                if progress_callback:
-                    await progress_callback("Upscaling resolution (Real-ESRGAN)...", 50)
-
-                current_url = await self._run_model(
-                    http,
-                    "f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
-                    {"image": current_url, "scale": 4, "face_enhance": True},
-                )
-
-                if colorize:
+                # ESRGAN: optional enhancement, skip on billing/rate errors
+                try:
                     if progress_callback:
-                        await progress_callback("Colorizing (DDColor)...", 80)
+                        await progress_callback("Upscaling resolution (Real-ESRGAN)...", 50)
 
                     current_url = await self._run_model(
                         http,
-                        "ca494ba129e44e45f661d6ece83c4c98a9a7c774309beca01f4d095d7f4e4c97",
-                        {"image": current_url, "model_size": "large"},
+                        "f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
+                        {"image": current_url, "scale": 4, "face_enhance": True},
                     )
+                except Exception as e:
+                    logger.warning("ESRGAN skipped: %s", str(e)[:100])
+
+                # DDColor: optional colorization, skip on billing/rate errors
+                if colorize:
+                    try:
+                        if progress_callback:
+                            await progress_callback("Colorizing (DDColor)...", 80)
+
+                        current_url = await self._run_model(
+                            http,
+                            "ca494ba129e44e45f661d6ece83c4c98a9a7c774309beca01f4d095d7f4e4c97",
+                            {"image": current_url, "model_size": "large"},
+                        )
+                    except Exception as e:
+                        logger.warning("DDColor skipped: %s", str(e)[:100])
 
                 if progress_callback:
                     await progress_callback("Downloading result...", 95)
