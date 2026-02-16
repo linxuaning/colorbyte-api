@@ -1,0 +1,17 @@
+# Render Blueprint - ColorByte Backend
+services:
+  - type: web
+    name: colorbyte-api
+    runtime: docker
+    repo: # Set via Render dashboard
+    region: oregon
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: AI_PROVIDER
+        value: huggingface
+      - key: FRONTEND_URL
+        value: https://colorbyte.vercel.app
+      - key: DEBUG
+        value: "false"
+    healthCheckPath: /health
