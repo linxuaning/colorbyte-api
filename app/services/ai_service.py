@@ -251,12 +251,24 @@ class ReplicateProvider(AIProvider):
         import logging
         logger = logging.getLogger("colorbyte.replicate")
 
-        resp = await http.post(
-            self.REPLICATE_API,
-            headers={"Authorization": f"Bearer {self.api_token}"},
-            json={"version": version, "input": model_input},
-        )
-        resp.raise_for_status()
+        headers = {"Authorization": f"Bearer {self.api_token}"}
+
+        # Retry with backoff on 429 rate limit
+        for attempt in range(4):
+            resp = await http.post(
+                self.REPLICATE_API, headers=headers,
+                json={"version": version, "input": model_input},
+            )
+            if resp.status_code == 429:
+                wait = (attempt + 1) * 5  # 5s, 10s, 15s, 20s
+                logger.warning("Rate limited (429), retrying in %ds...", wait)
+                await asyncio.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            raise RuntimeError("Replicate rate limit exceeded after retries")
+
         prediction = resp.json()
 
         poll_url = prediction["urls"]["get"]
