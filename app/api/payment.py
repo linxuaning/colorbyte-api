@@ -1,13 +1,15 @@
 """
 Payment API endpoints.
-Stripe Checkout integration for subscription with 7-day free trial.
+LemonSqueezy integration for subscription with 7-day free trial.
 MVP: $9.9/month, email-based (no user accounts/passwords).
 """
 import json
 import logging
+import hmac
+import hashlib
 from datetime import datetime, timezone
 
-import stripe
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr
 
@@ -40,7 +42,7 @@ class StartTrialResponse(BaseModel):
 class SubscriptionStatusResponse(BaseModel):
     email: str
     is_active: bool
-    status: str  # none, trialing, active, canceled, past_due
+    status: str  # none, on_trial, active, cancelled, expired, past_due
     trial_end: str | None = None
     current_period_end: str | None = None
     cancel_at_period_end: bool = False
@@ -50,17 +52,109 @@ class CancelRequest(BaseModel):
     email: EmailStr
 
 
+# --- LemonSqueezy API Helper ---
+
+class LemonSqueezyAPI:
+    """Helper class for LemonSqueezy API calls."""
+
+    BASE_URL = "https://api.lemonsqueezy.com/v1"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/vnd.api+json",
+            "Content-Type": "application/vnd.api+json",
+        }
+
+    async def create_checkout(
+        self,
+        store_id: str,
+        variant_id: str,
+        email: str,
+        trial_days: int,
+        success_url: str,
+        cancel_url: str,
+    ) -> dict:
+        """Create a checkout session."""
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.BASE_URL}/checkouts",
+                headers=self.headers,
+                json={
+                    "data": {
+                        "type": "checkouts",
+                        "attributes": {
+                            "checkout_data": {
+                                "email": email,
+                                "custom": {
+                                    "email": email,
+                                },
+                            },
+                            "checkout_options": {
+                                "embed": False,
+                                "media": False,
+                                "logo": True,
+                                "discount": False,
+                                "button_color": "#2563eb",
+                            },
+                            "expires_at": None,
+                            "preview": False,
+                        },
+                        "relationships": {
+                            "store": {
+                                "data": {
+                                    "type": "stores",
+                                    "id": store_id,
+                                }
+                            },
+                            "variant": {
+                                "data": {
+                                    "type": "variants",
+                                    "id": variant_id,
+                                }
+                            },
+                        },
+                    }
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["data"]
+
+    async def get_subscription(self, subscription_id: str) -> dict:
+        """Get subscription details."""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.BASE_URL}/subscriptions/{subscription_id}",
+                headers=self.headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["data"]
+
+    async def cancel_subscription(self, subscription_id: str) -> dict:
+        """Cancel a subscription (at period end)."""
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{self.BASE_URL}/subscriptions/{subscription_id}",
+                headers=self.headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["data"]
+
+
 # --- Endpoints ---
 
 @router.post("/payment/start-trial", response_model=StartTrialResponse)
 async def start_trial(req: StartTrialRequest):
-    """Create a Stripe Checkout session for 7-day free trial + subscription."""
+    """Create a LemonSqueezy Checkout session for 7-day free trial + subscription."""
     settings = get_settings()
 
-    if not settings.stripe_secret_key:
+    if not settings.lemonsqueezy_api_key:
         raise HTTPException(status_code=503, detail="Payment system not configured")
 
-    stripe.api_key = settings.stripe_secret_key
     email = req.email.lower().strip()
 
     # Check if user already has an active subscription
@@ -68,34 +162,31 @@ async def start_trial(req: StartTrialRequest):
         raise HTTPException(status_code=409, detail="You already have an active subscription")
 
     try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            customer_email=email,
-            line_items=[
-                {
-                    "price": settings.stripe_price_id,
-                    "quantity": 1,
-                }
-            ],
-            mode="subscription",
-            subscription_data={
-                "trial_period_days": settings.trial_days,
-                "metadata": {"email": email},
-            },
-            success_url=f"{settings.frontend_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
+        api = LemonSqueezyAPI(settings.lemonsqueezy_api_key)
+        checkout = await api.create_checkout(
+            store_id=settings.lemonsqueezy_store_id,
+            variant_id=settings.lemonsqueezy_variant_id,
+            email=email,
+            trial_days=settings.trial_days,
+            success_url=f"{settings.frontend_url}/payment/success?email={{email}}",
             cancel_url=f"{settings.frontend_url}/payment/cancel",
-            metadata={"email": email},
         )
 
-        logger.info("Trial checkout session created: %s for %s", session.id, email)
-        return StartTrialResponse(checkout_url=session.url, session_id=session.id)
+        checkout_url = checkout["attributes"]["url"]
+        checkout_id = checkout["id"]
 
-    except stripe.StripeError as e:
-        logger.error("Stripe error: %s", e)
+        logger.info("Trial checkout created: %s for %s", checkout_id, email)
+        return StartTrialResponse(checkout_url=checkout_url, session_id=checkout_id)
+
+    except httpx.HTTPStatusError as e:
+        logger.error("LemonSqueezy HTTP error: %s - %s", e.response.status_code, e.response.text)
         raise HTTPException(
             status_code=502,
-            detail=f"Payment service error: {getattr(e, 'user_message', None) or str(e)}",
+            detail=f"Payment service error: {e.response.text}",
         )
+    except Exception as e:
+        logger.error("LemonSqueezy error: %s", e)
+        raise HTTPException(status_code=502, detail=f"Payment service error: {str(e)}")
 
 
 @router.get("/payment/subscription/{email}", response_model=SubscriptionStatusResponse)
@@ -111,7 +202,7 @@ async def check_subscription(email: str):
 
     return SubscriptionStatusResponse(
         email=email,
-        is_active=sub["status"] in ("trialing", "active"),
+        is_active=sub["status"] in ("on_trial", "active"),
         status=sub["status"],
         trial_end=sub.get("trial_end"),
         current_period_end=sub.get("current_period_end"),
@@ -126,20 +217,15 @@ async def cancel_subscription(req: CancelRequest):
     email = req.email.lower().strip()
     sub = get_subscription(email)
 
-    if sub is None or sub["status"] not in ("trialing", "active"):
+    if sub is None or sub["status"] not in ("on_trial", "active"):
         raise HTTPException(status_code=404, detail="No active subscription found")
 
-    if not settings.stripe_secret_key:
+    if not settings.lemonsqueezy_api_key:
         raise HTTPException(status_code=503, detail="Payment system not configured")
 
-    stripe.api_key = settings.stripe_secret_key
-
     try:
-        # Cancel at period end (user keeps access until end of billing period)
-        stripe.Subscription.modify(
-            sub["stripe_subscription_id"],
-            cancel_at_period_end=True,
-        )
+        api = LemonSqueezyAPI(settings.lemonsqueezy_api_key)
+        await api.cancel_subscription(sub["lemonsqueezy_subscription_id"])
         cancel_subscription_db(email)
 
         logger.info("Subscription cancellation requested: %s", email)
@@ -149,36 +235,27 @@ async def cancel_subscription(req: CancelRequest):
             "cancel_at": sub.get("current_period_end") or sub.get("trial_end"),
         }
 
-    except stripe.StripeError as e:
+    except httpx.HTTPStatusError as e:
         logger.error("Cancel error: %s", e)
         raise HTTPException(status_code=502, detail="Could not cancel subscription")
 
 
 @router.post("/payment/create-portal-session")
 async def create_portal_session(req: CancelRequest):
-    """Create a Stripe Customer Portal session for self-serve management."""
+    """Get LemonSqueezy subscription management URL."""
     settings = get_settings()
     email = req.email.lower().strip()
     sub = get_subscription(email)
 
-    if sub is None or not sub.get("stripe_customer_id"):
+    if sub is None or not sub.get("lemonsqueezy_subscription_id"):
         raise HTTPException(status_code=404, detail="No subscription found for this email")
 
-    if not settings.stripe_secret_key:
-        raise HTTPException(status_code=503, detail="Payment system not configured")
+    # LemonSqueezy subscription management URL
+    # Format: https://app.lemonsqueezy.com/my-orders/{subscription_id}
+    subscription_id = sub["lemonsqueezy_subscription_id"]
+    portal_url = f"https://app.lemonsqueezy.com/my-orders/{subscription_id}"
 
-    stripe.api_key = settings.stripe_secret_key
-
-    try:
-        portal_session = stripe.billing_portal.Session.create(
-            customer=sub["stripe_customer_id"],
-            return_url=f"{settings.frontend_url}/subscription",
-        )
-        return {"url": portal_session.url}
-
-    except stripe.StripeError as e:
-        logger.error("Portal session error: %s", e)
-        raise HTTPException(status_code=502, detail="Could not create portal session")
+    return {"url": portal_url}
 
 
 @router.get("/payment/verify-session/{session_id}")
@@ -186,54 +263,48 @@ async def verify_session(session_id: str):
     """Verify a checkout session status (called from success page)."""
     settings = get_settings()
 
-    if not settings.stripe_secret_key:
+    if not settings.lemonsqueezy_api_key:
         raise HTTPException(status_code=503, detail="Payment system not configured")
 
-    stripe.api_key = settings.stripe_secret_key
+    # For LemonSqueezy, we'll look up by email from the success URL parameter
+    # The session_id is actually the checkout ID, but we don't need to verify it
+    # because the webhook will handle the subscription creation
 
-    try:
-        session = stripe.checkout.Session.retrieve(session_id)
-        email = session.customer_email or session.metadata.get("email", "")
-        sub = get_subscription(email)
-
-        return {
-            "status": "success" if session.status == "complete" else session.status,
-            "email": email,
-            "subscription_status": sub["status"] if sub else "pending",
-            "trial_end": sub.get("trial_end") if sub else None,
-        }
-
-    except stripe.StripeError as e:
-        logger.error("Session verification error: %s", e)
-        raise HTTPException(status_code=502, detail="Could not verify session")
+    # Return a generic success response
+    return {
+        "status": "success",
+        "message": "Checkout completed. Your subscription will be activated shortly.",
+    }
 
 
 @router.post("/payment/webhook")
-async def stripe_webhook(request: Request):
-    """Handle Stripe webhook events for subscription lifecycle."""
+async def lemonsqueezy_webhook(request: Request):
+    """Handle LemonSqueezy webhook events for subscription lifecycle."""
     settings = get_settings()
-    stripe.api_key = settings.stripe_secret_key
 
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
+    sig_header = request.headers.get("x-signature", "")
 
     # Verify webhook signature
-    if settings.stripe_webhook_secret:
-        try:
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, settings.stripe_webhook_secret
-            )
-        except stripe.SignatureVerificationError:
+    if settings.lemonsqueezy_webhook_secret:
+        expected_sig = hmac.new(
+            settings.lemonsqueezy_webhook_secret.encode(),
+            payload,
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(sig_header, expected_sig):
             logger.error("Webhook signature verification failed")
             raise HTTPException(status_code=400, detail="Invalid signature")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid payload")
     else:
         logger.warning("Webhook secret not configured, skipping signature verification")
-        event = json.loads(payload)
 
-    event_id = event.get("id", "")
-    event_type = event["type"]
+    event = json.loads(payload)
+
+    # LemonSqueezy webhook structure:
+    # { "meta": { "event_name": "...", "custom_data": {...} }, "data": {...} }
+    event_id = event.get("meta", {}).get("event_name", "") + "_" + event.get("data", {}).get("id", "")
+    event_type = event.get("meta", {}).get("event_name", "")
 
     # Idempotency check
     if is_event_processed(event_id):
@@ -243,20 +314,36 @@ async def stripe_webhook(request: Request):
     logger.info("Processing webhook: %s (%s)", event_type, event_id)
 
     # Handle subscription events
-    if event_type == "customer.subscription.created":
-        _handle_subscription_update(event["data"]["object"])
+    # LemonSqueezy event names:
+    # - subscription_created
+    # - subscription_updated
+    # - subscription_cancelled
+    # - subscription_resumed
+    # - subscription_expired
+    # - subscription_paused
+    # - subscription_unpaused
+    # - order_created (for one-time purchases)
+    # - subscription_payment_failed
+    # - subscription_payment_success
+    # - subscription_payment_recovered
 
-    elif event_type == "customer.subscription.updated":
-        _handle_subscription_update(event["data"]["object"])
+    if event_type == "subscription_created":
+        _handle_subscription_update(event["data"])
 
-    elif event_type == "customer.subscription.deleted":
-        _handle_subscription_deleted(event["data"]["object"])
+    elif event_type == "subscription_updated":
+        _handle_subscription_update(event["data"])
 
-    elif event_type == "invoice.payment_failed":
-        _handle_payment_failed(event["data"]["object"])
+    elif event_type == "subscription_cancelled":
+        _handle_subscription_cancelled(event["data"])
 
-    elif event_type == "checkout.session.completed":
-        _handle_checkout_completed(event["data"]["object"])
+    elif event_type == "subscription_expired":
+        _handle_subscription_expired(event["data"])
+
+    elif event_type == "subscription_payment_failed":
+        _handle_payment_failed(event["data"])
+
+    elif event_type == "order_created":
+        _handle_order_created(event["data"])
 
     # Mark as processed
     mark_event_processed(event_id, event_type)
@@ -266,92 +353,137 @@ async def stripe_webhook(request: Request):
 
 # --- Webhook Handlers ---
 
-def _handle_checkout_completed(session: dict):
-    """Handle checkout.session.completed - link customer to email."""
-    email = session.get("customer_email") or session.get("metadata", {}).get("email", "")
-    customer_id = session.get("customer")
-    subscription_id = session.get("subscription")
+def _handle_order_created(order: dict):
+    """Handle order_created - link customer to email when checkout completes."""
+    attrs = order.get("attributes", {})
+    email = attrs.get("user_email") or attrs.get("customer_email", "")
+    customer_id = attrs.get("customer_id")
+    first_subscription_item = attrs.get("first_subscription_item")
 
-    if email and customer_id:
+    if email and customer_id and first_subscription_item:
+        subscription_id = first_subscription_item.get("subscription_id")
+
         upsert_subscription(
             email=email,
-            stripe_customer_id=customer_id,
-            stripe_subscription_id=subscription_id,
-            status="trialing",  # Will be updated by subscription.created event
+            lemonsqueezy_customer_id=str(customer_id),
+            lemonsqueezy_subscription_id=str(subscription_id) if subscription_id else None,
+            status="on_trial",  # Will be updated by subscription_created event
         )
-        logger.info("Checkout completed: %s → customer=%s sub=%s", email, customer_id, subscription_id)
+        logger.info("Order created: %s → customer=%s sub=%s", email, customer_id, subscription_id)
 
 
 def _handle_subscription_update(subscription: dict):
     """Handle subscription created/updated events."""
-    customer_id = subscription.get("customer")
+    attrs = subscription.get("attributes", {})
     sub_id = subscription.get("id")
-    status = subscription.get("status")  # trialing, active, past_due, canceled, etc.
+    customer_id = attrs.get("customer_id")
+    status = attrs.get("status")  # on_trial, active, paused, past_due, unpaid, cancelled, expired
 
-    # Extract dates
-    trial_start = _ts_to_iso(subscription.get("trial_start"))
-    trial_end = _ts_to_iso(subscription.get("trial_end"))
-    period_start = _ts_to_iso(subscription.get("current_period_start"))
-    period_end = _ts_to_iso(subscription.get("current_period_end"))
-    cancel_at_period_end = subscription.get("cancel_at_period_end", False)
+    # LemonSqueezy uses different status names than Stripe:
+    # - on_trial: In trial period
+    # - active: Active subscription
+    # - paused: Paused by customer
+    # - past_due: Payment failed
+    # - unpaid: Payment failed multiple times
+    # - cancelled: Cancelled (still active until end of period)
+    # - expired: Ended
 
-    # Find email by customer ID
-    email = _get_email_for_customer(customer_id)
+    # Extract dates (ISO 8601 strings)
+    trial_ends_at = attrs.get("trial_ends_at")
+    renews_at = attrs.get("renews_at")
+    ends_at = attrs.get("ends_at")
+
+    # Get email from custom data or user email
+    email = attrs.get("user_email", "")
+
     if not email:
-        logger.warning("No email found for customer %s, skipping", customer_id)
+        # Try to find email by customer ID
+        sub_record = get_subscription_by_customer(str(customer_id))
+        if sub_record:
+            email = sub_record["email"]
+
+    if not email:
+        logger.warning("No email found for subscription %s, skipping", sub_id)
         return
 
     upsert_subscription(
         email=email,
-        stripe_customer_id=customer_id,
-        stripe_subscription_id=sub_id,
+        lemonsqueezy_customer_id=str(customer_id),
+        lemonsqueezy_subscription_id=str(sub_id),
         status=status,
-        trial_start=trial_start,
-        trial_end=trial_end,
-        current_period_start=period_start,
-        current_period_end=period_end,
-        cancel_at_period_end=cancel_at_period_end,
+        trial_end=trial_ends_at,
+        current_period_end=renews_at or ends_at,
+        cancel_at_period_end=status == "cancelled",
     )
     logger.info("Subscription updated: %s status=%s", email, status)
 
 
-def _handle_subscription_deleted(subscription: dict):
-    """Handle subscription canceled/deleted."""
-    customer_id = subscription.get("customer")
-    email = _get_email_for_customer(customer_id)
+def _handle_subscription_cancelled(subscription: dict):
+    """Handle subscription cancelled."""
+    attrs = subscription.get("attributes", {})
+    sub_id = subscription.get("id")
+    customer_id = attrs.get("customer_id")
+    email = attrs.get("user_email", "")
+
+    if not email:
+        sub_record = get_subscription_by_customer(str(customer_id))
+        if sub_record:
+            email = sub_record["email"]
+
     if not email:
         return
 
     upsert_subscription(
         email=email,
-        stripe_customer_id=customer_id,
-        stripe_subscription_id=subscription.get("id"),
-        status="canceled",
+        lemonsqueezy_customer_id=str(customer_id),
+        lemonsqueezy_subscription_id=str(sub_id),
+        status="cancelled",
+        cancel_at_period_end=True,
     )
-    logger.info("Subscription canceled: %s", email)
+    logger.info("Subscription cancelled: %s", email)
 
 
-def _handle_payment_failed(invoice: dict):
-    """Handle failed payment (after trial ends and card is charged)."""
-    customer_id = invoice.get("customer")
-    email = _get_email_for_customer(customer_id)
+def _handle_subscription_expired(subscription: dict):
+    """Handle subscription expired."""
+    attrs = subscription.get("attributes", {})
+    sub_id = subscription.get("id")
+    customer_id = attrs.get("customer_id")
+    email = attrs.get("user_email", "")
+
+    if not email:
+        sub_record = get_subscription_by_customer(str(customer_id))
+        if sub_record:
+            email = sub_record["email"]
+
     if not email:
         return
 
-    upsert_subscription(email=email, status="past_due")
+    upsert_subscription(
+        email=email,
+        lemonsqueezy_customer_id=str(customer_id),
+        lemonsqueezy_subscription_id=str(sub_id),
+        status="expired",
+    )
+    logger.info("Subscription expired: %s", email)
+
+
+def _handle_payment_failed(subscription: dict):
+    """Handle failed payment."""
+    attrs = subscription.get("attributes", {})
+    sub_id = subscription.get("id")
+    customer_id = attrs.get("customer_id")
+    email = attrs.get("user_email", "")
+
+    if not email:
+        sub_record = get_subscription_by_customer(str(customer_id))
+        if sub_record:
+            email = sub_record["email"]
+
+    if not email:
+        return
+
+    upsert_subscription(
+        email=email,
+        status="past_due",
+    )
     logger.warning("Payment failed for %s", email)
-
-
-# --- Helpers ---
-
-def _get_email_for_customer(customer_id: str) -> str | None:
-    """Look up email by Stripe customer ID from our DB."""
-    sub = get_subscription_by_customer(customer_id)
-    return sub["email"] if sub else None
-
-
-def _ts_to_iso(ts: int | None) -> str | None:
-    """Convert Unix timestamp to ISO string."""
-    if ts is None:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()

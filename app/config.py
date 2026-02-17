@@ -25,10 +25,11 @@ class Settings(BaseSettings):
     r2_secret_access_key: str = ""
     r2_bucket_name: str = "artimagehub"
 
-    # Stripe
-    stripe_secret_key: str = ""
-    stripe_webhook_secret: str = ""
-    stripe_price_id: str = ""  # Recurring price ID for $9.9/month subscription
+    # LemonSqueezy
+    lemonsqueezy_api_key: str = ""
+    lemonsqueezy_store_id: str = ""
+    lemonsqueezy_variant_id: str = ""  # Variant ID for $9.9/month subscription
+    lemonsqueezy_webhook_secret: str = ""
     trial_days: int = 7
 
     # Database

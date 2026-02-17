@@ -30,8 +30,8 @@ def init_db():
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS subscriptions (
                 email TEXT PRIMARY KEY,
-                stripe_customer_id TEXT,
-                stripe_subscription_id TEXT,
+                lemonsqueezy_customer_id TEXT,
+                lemonsqueezy_subscription_id TEXT,
                 status TEXT NOT NULL DEFAULT 'none',
                 trial_start TEXT,
                 trial_end TEXT,
@@ -42,10 +42,10 @@ def init_db():
                 updated_at TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_sub_stripe_customer
-                ON subscriptions(stripe_customer_id);
-            CREATE INDEX IF NOT EXISTS idx_sub_stripe_sub
-                ON subscriptions(stripe_subscription_id);
+            CREATE INDEX IF NOT EXISTS idx_sub_lemonsqueezy_customer
+                ON subscriptions(lemonsqueezy_customer_id);
+            CREATE INDEX IF NOT EXISTS idx_sub_lemonsqueezy_sub
+                ON subscriptions(lemonsqueezy_subscription_id);
 
             CREATE TABLE IF NOT EXISTS webhook_events (
                 event_id TEXT PRIMARY KEY,
@@ -102,8 +102,8 @@ def mark_event_processed(event_id: str, event_type: str):
 
 def upsert_subscription(
     email: str,
-    stripe_customer_id: str | None = None,
-    stripe_subscription_id: str | None = None,
+    lemonsqueezy_customer_id: str | None = None,
+    lemonsqueezy_subscription_id: str | None = None,
     status: str = "none",
     trial_start: str | None = None,
     trial_end: str | None = None,
@@ -118,13 +118,13 @@ def upsert_subscription(
     with get_db() as conn:
         conn.execute(
             """INSERT INTO subscriptions
-               (email, stripe_customer_id, stripe_subscription_id, status,
+               (email, lemonsqueezy_customer_id, lemonsqueezy_subscription_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 cancel_at_period_end, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(email) DO UPDATE SET
-                   stripe_customer_id = COALESCE(?, stripe_customer_id),
-                   stripe_subscription_id = COALESCE(?, stripe_subscription_id),
+                   lemonsqueezy_customer_id = COALESCE(?, lemonsqueezy_customer_id),
+                   lemonsqueezy_subscription_id = COALESCE(?, lemonsqueezy_subscription_id),
                    status = ?,
                    trial_start = COALESCE(?, trial_start),
                    trial_end = COALESCE(?, trial_end),
@@ -133,11 +133,11 @@ def upsert_subscription(
                    cancel_at_period_end = ?,
                    updated_at = ?""",
             (
-                email, stripe_customer_id, stripe_subscription_id, status,
+                email, lemonsqueezy_customer_id, lemonsqueezy_subscription_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 1 if cancel_at_period_end else 0, now, now,
                 # ON CONFLICT params:
-                stripe_customer_id, stripe_subscription_id, status,
+                lemonsqueezy_customer_id, lemonsqueezy_subscription_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 1 if cancel_at_period_end else 0, now,
             ),
@@ -157,12 +157,12 @@ def get_subscription(email: str) -> dict | None:
         return dict(row)
 
 
-def get_subscription_by_customer(stripe_customer_id: str) -> dict | None:
-    """Look up subscription by Stripe customer ID."""
+def get_subscription_by_customer(lemonsqueezy_customer_id: str) -> dict | None:
+    """Look up subscription by LemonSqueezy customer ID."""
     with get_db() as conn:
         row = conn.execute(
-            "SELECT * FROM subscriptions WHERE stripe_customer_id = ?",
-            (stripe_customer_id,),
+            "SELECT * FROM subscriptions WHERE lemonsqueezy_customer_id = ?",
+            (lemonsqueezy_customer_id,),
         ).fetchone()
         if row is None:
             return None
