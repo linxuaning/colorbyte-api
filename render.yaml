@@ -3,15 +3,34 @@ services:
   - type: web
     name: colorbyte-api
     runtime: docker
-    repo: # Set via Render dashboard
     region: oregon
     plan: free
     dockerfilePath: ./Dockerfile
     envVars:
-      - key: AI_PROVIDER
-        value: huggingface
-      - key: FRONTEND_URL
-        value: https://artimagehub.com
+      # App
       - key: DEBUG
         value: "false"
+      # AI Provider: replicate for production
+      - key: AI_PROVIDER
+        value: replicate
+      # Frontend URL for CORS
+      - key: FRONTEND_URL
+        value: https://artimagehub.vercel.app
+      # Replicate AI (required when AI_PROVIDER=replicate)
+      - key: REPLICATE_API_TOKEN
+        sync: false  # Set in Render dashboard (sensitive)
+      # LemonSqueezy Payment
+      - key: LEMONSQUEEZY_API_KEY
+        sync: false  # Set in Render dashboard (sensitive)
+      - key: LEMONSQUEEZY_STORE_ID
+        value: "295039"
+      - key: LEMONSQUEEZY_VARIANT_ID
+        value: "1317124"
+      - key: LEMONSQUEEZY_WEBHOOK_SECRET
+        sync: false  # Set in Render dashboard (sensitive)
+      - key: TRIAL_DAYS
+        value: "7"
+      # Database path (ephemeral on free tier - data resets on deploy)
+      - key: DATABASE_PATH
+        value: data/artimagehub.db
     healthCheckPath: /health
