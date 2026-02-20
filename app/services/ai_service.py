@@ -239,14 +239,35 @@ class HuggingFaceProvider(AIProvider):
 
 
 class ReplicateProvider(AIProvider):
-    """Paid API via Replicate. Uses HTTP API directly (no SDK) for Python 3.14 compat."""
+    """Free tier API via Replicate using free models with fallback strategy.
+
+    Uses free Replicate models for photo restoration:
+    - GFPGAN: Best for old photo restoration and face enhancement
+    - CodeFormer: Alternative face enhancement with quality/fidelity control
+    - Real-ESRGAN: Upscaling for improved resolution
+
+    Fallback strategy:
+    1. Try GFPGAN first (tencentarc/gfpgan) - best for old photos
+    2. If GFPGAN fails, try CodeFormer (sczhou/codeformer)
+    3. If both fail, use Real-ESRGAN (nightmareai/real-esrgan) for upscaling only
+    """
 
     REPLICATE_API = "https://api.replicate.com/v1/predictions"
+
+    # FREE tier models - pinned versions for stability
+    # https://replicate.com/tencentarc/gfpgan
+    GFPGAN_VERSION = "0fbacf7afc6c144e5be9767cff80f25aff23e52b0708f17e20f9879b2f21516c"
+
+    # https://replicate.com/sczhou/codeformer
+    CODEFORMER_VERSION = "7de2ea26c616d5bf2245ad0d5e24f0ff9a6204578a5c876db53142edd9d2cd56"
+
+    # https://replicate.com/nightmareai/real-esrgan
+    REAL_ESRGAN_VERSION = "f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
 
     def __init__(self, api_token: str):
         self.api_token = api_token
 
-    async def _run_model(self, http: "httpx.AsyncClient", version: str, model_input: dict) -> str:
+    async def _run_model(self, http: "httpx.AsyncClient", version: str, model_input: dict, model_name: str = "model") -> str:
         """Run a Replicate model and wait for result. Returns output URL."""
         import logging
         logger = logging.getLogger("artimagehub.replicate")
@@ -261,15 +282,15 @@ class ReplicateProvider(AIProvider):
             )
             if resp.status_code == 429:
                 wait = (attempt + 1) * 5  # 5s, 10s, 15s, 20s
-                logger.warning("Rate limited (429), retrying in %ds...", wait)
+                logger.warning("%s rate limited (429), retrying in %ds...", model_name, wait)
                 await asyncio.sleep(wait)
                 continue
             if resp.status_code == 402:
-                raise RuntimeError("Replicate credits exhausted (402). Add billing at replicate.com/account/billing")
+                raise RuntimeError(f"{model_name} credits exhausted (402). Add billing at replicate.com/account/billing")
             resp.raise_for_status()
             break
         else:
-            raise RuntimeError("Replicate rate limit exceeded after retries")
+            raise RuntimeError(f"{model_name} rate limit exceeded after retries")
 
         prediction = resp.json()
 
@@ -284,9 +305,10 @@ class ReplicateProvider(AIProvider):
                 output = data["output"]
                 return output if isinstance(output, str) else str(output)
             elif status in ("failed", "canceled"):
-                raise RuntimeError(f"Replicate prediction {status}: {data.get('error', 'unknown')}")
+                error_msg = data.get('error', 'unknown')
+                raise RuntimeError(f"{model_name} prediction {status}: {error_msg}")
 
-        raise RuntimeError("Replicate prediction timed out")
+        raise RuntimeError(f"{model_name} prediction timed out")
 
     async def _upload_file(self, http: "httpx.AsyncClient", file_path: str) -> str:
         """Upload file to Replicate and return the serving URL."""
@@ -303,6 +325,65 @@ class ReplicateProvider(AIProvider):
         resp.raise_for_status()
         return resp.json()["urls"]["get"]
 
+    async def _try_gfpgan(self, http: "httpx.AsyncClient", image_url: str, progress_callback: ProgressCallback) -> str:
+        """Try GFPGAN for face restoration. Best for old photos."""
+        import logging
+        logger = logging.getLogger("artimagehub.replicate")
+
+        logger.info("Trying GFPGAN (tencentarc/gfpgan) for face restoration...")
+        if progress_callback:
+            await progress_callback("Enhancing faces (GFPGAN)...", 20)
+
+        # GFPGAN parameters: img, version, scale
+        result_url = await self._run_model(
+            http,
+            self.GFPGAN_VERSION,
+            {"img": image_url, "version": "v1.4", "scale": 2},
+            "GFPGAN"
+        )
+        logger.info("GFPGAN succeeded")
+        return result_url
+
+    async def _try_codeformer(self, http: "httpx.AsyncClient", image_url: str, progress_callback: ProgressCallback) -> str:
+        """Try CodeFormer for face restoration. Alternative to GFPGAN."""
+        import logging
+        logger = logging.getLogger("artimagehub.replicate")
+
+        logger.info("Trying CodeFormer (sczhou/codeformer) for face restoration...")
+        if progress_callback:
+            await progress_callback("Enhancing faces (CodeFormer)...", 25)
+
+        # CodeFormer parameters: image, upscale, codeformer_fidelity
+        # upscale: 1-4 (default 2)
+        # codeformer_fidelity: 0-1 (0=better quality, 1=more identity preservation)
+        result_url = await self._run_model(
+            http,
+            self.CODEFORMER_VERSION,
+            {"image": image_url, "upscale": 2, "codeformer_fidelity": 0.7},
+            "CodeFormer"
+        )
+        logger.info("CodeFormer succeeded")
+        return result_url
+
+    async def _try_real_esrgan(self, http: "httpx.AsyncClient", image_url: str, progress_callback: ProgressCallback) -> str:
+        """Try Real-ESRGAN for upscaling. Fallback when face enhancement fails."""
+        import logging
+        logger = logging.getLogger("artimagehub.replicate")
+
+        logger.info("Trying Real-ESRGAN (nightmareai/real-esrgan) for upscaling...")
+        if progress_callback:
+            await progress_callback("Upscaling (Real-ESRGAN)...", 30)
+
+        # Real-ESRGAN parameters: image, scale, face_enhance
+        result_url = await self._run_model(
+            http,
+            self.REAL_ESRGAN_VERSION,
+            {"image": image_url, "scale": 2, "face_enhance": True},
+            "Real-ESRGAN"
+        )
+        logger.info("Real-ESRGAN succeeded")
+        return result_url
+
     async def process_photo(
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
     ) -> ProcessingResult:
@@ -316,42 +397,60 @@ class ReplicateProvider(AIProvider):
                     await progress_callback("Uploading image...", 10)
 
                 file_url = await self._upload_file(http, input_path)
+                current_url = file_url
+                restoration_success = False
 
-                if progress_callback:
-                    await progress_callback("Enhancing faces (GFPGAN)...", 20)
+                # Fallback strategy for face restoration:
+                # 1. Try GFPGAN first (best for old photos)
+                # 2. If GFPGAN fails, try CodeFormer
+                # 3. If both fail, use Real-ESRGAN for upscaling only
 
-                current_url = await self._run_model(
-                    http,
-                    "0fbacf7afc6c144e5be9767cff80f25aff23e52b0708f17e20f9879b2f21516c",
-                    {"img": file_url, "version": "v1.4", "scale": 2},
-                )
-
-                # ESRGAN: optional enhancement, skip on billing/rate errors
+                # Try GFPGAN first (primary method)
                 try:
-                    if progress_callback:
-                        await progress_callback("Upscaling resolution (Real-ESRGAN)...", 50)
-
-                    current_url = await self._run_model(
-                        http,
-                        "f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
-                        {"image": current_url, "scale": 4, "face_enhance": True},
-                    )
+                    current_url = await self._try_gfpgan(http, file_url, progress_callback)
+                    restoration_success = True
                 except Exception as e:
-                    logger.warning("ESRGAN skipped: %s", str(e)[:100])
+                    logger.warning("GFPGAN failed: %s", str(e)[:200])
 
-                # DDColor: optional colorization, skip on billing/rate errors
-                if colorize:
+                    # Fallback to CodeFormer
+                    try:
+                        current_url = await self._try_codeformer(http, file_url, progress_callback)
+                        restoration_success = True
+                    except Exception as e2:
+                        logger.warning("CodeFormer failed: %s", str(e2)[:200])
+
+                        # Last resort: Real-ESRGAN for upscaling only
+                        try:
+                            current_url = await self._try_real_esrgan(http, file_url, progress_callback)
+                            restoration_success = True
+                            logger.info("Using Real-ESRGAN as fallback (upscaling only)")
+                        except Exception as e3:
+                            logger.error("All restoration methods failed. GFPGAN: %s, CodeFormer: %s, Real-ESRGAN: %s",
+                                       str(e)[:100], str(e2)[:100], str(e3)[:100])
+                            raise RuntimeError("All restoration methods failed. Please try again later.")
+
+                # Additional upscaling pass if we only did face restoration (not Real-ESRGAN)
+                # Skip if colorization is requested to avoid too many steps
+                if restoration_success and not colorize:
                     try:
                         if progress_callback:
-                            await progress_callback("Colorizing (DDColor)...", 80)
+                            await progress_callback("Additional upscaling (Real-ESRGAN)...", 60)
 
                         current_url = await self._run_model(
                             http,
-                            "ca494ba129e44e45f661d6ece83c4c98a9a7c774309beca01f4d095d7f4e4c97",
-                            {"image": current_url, "model_size": "large"},
+                            self.REAL_ESRGAN_VERSION,
+                            {"image": current_url, "scale": 2, "face_enhance": False},
+                            "Real-ESRGAN"
                         )
                     except Exception as e:
-                        logger.warning("DDColor skipped: %s", str(e)[:100])
+                        logger.info("Additional upscaling skipped: %s", str(e)[:100])
+
+                # Note: Colorization removed for free tier
+                # DeOldify and DDColor are not in the free tier model list
+                if colorize:
+                    logger.warning("Colorization not available in free tier - skipping")
+                    if progress_callback:
+                        await progress_callback("Colorization not available in free tier", 80)
 
                 if progress_callback:
                     await progress_callback("Downloading result...", 95)
@@ -366,6 +465,7 @@ class ReplicateProvider(AIProvider):
                 return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as e:
+            logger.error("Photo processing failed: %s", str(e))
             return ProcessingResult(success=False, error=str(e))
 
 
