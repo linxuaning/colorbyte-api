@@ -328,10 +328,10 @@ async def lemonsqueezy_webhook(request: Request):
     # - subscription_payment_recovered
 
     if event_type == "subscription_created":
-        _handle_subscription_update(event["data"])
+        _handle_subscription_update(event["data"], event.get("meta", {}))
 
     elif event_type == "subscription_updated":
-        _handle_subscription_update(event["data"])
+        _handle_subscription_update(event["data"], event.get("meta", {}))
 
     elif event_type == "subscription_cancelled":
         _handle_subscription_cancelled(event["data"])
@@ -372,7 +372,7 @@ def _handle_order_created(order: dict):
         logger.info("Order created: %s → customer=%s sub=%s", email, customer_id, subscription_id)
 
 
-def _handle_subscription_update(subscription: dict):
+def _handle_subscription_update(subscription: dict, meta: dict = None):
     """Handle subscription created/updated events."""
     attrs = subscription.get("attributes", {})
     sub_id = subscription.get("id")
@@ -393,17 +393,26 @@ def _handle_subscription_update(subscription: dict):
     renews_at = attrs.get("renews_at")
     ends_at = attrs.get("ends_at")
 
-    # Get email from custom data or user email
-    email = attrs.get("user_email", "")
+    # Get email from multiple sources (in order of preference)
+    email = None
 
+    # 1. From custom_data (passed during checkout)
+    if meta:
+        custom_data = meta.get("custom_data", {})
+        email = custom_data.get("email")
+
+    # 2. From subscription attributes
     if not email:
-        # Try to find email by customer ID
+        email = attrs.get("user_email", "")
+
+    # 3. Try to find email by customer ID
+    if not email:
         sub_record = get_subscription_by_customer(str(customer_id))
         if sub_record:
             email = sub_record["email"]
 
     if not email:
-        logger.warning("No email found for subscription %s, skipping", sub_id)
+        logger.warning("No email found for subscription %s (customer %s), skipping", sub_id, customer_id)
         return
 
     upsert_subscription(
