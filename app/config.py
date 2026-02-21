@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     bmc_webhook_secret: str = ""  # Secret for webhook signature verification
     bmc_page_url: str = ""  # User's BMC page URL (e.g., https://buymeacoffee.com/username)
 
+    # PayPal
+    paypal_client_id: str = ""  # PayPal REST API Client ID
+    paypal_client_secret: str = ""  # PayPal REST API Secret
+    paypal_mode: Literal["sandbox", "live"] = "live"  # PayPal environment mode
+    paypal_webhook_id: str = ""  # PayPal Webhook ID for signature verification
+
     # Database
     database_path: str = "data/artimagehub.db"
 

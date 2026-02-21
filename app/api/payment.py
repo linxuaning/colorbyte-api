@@ -744,3 +744,235 @@ def _handle_bmc_donation(data: dict):
             support_coffees,
             REQUIRED_COFFEES,
         )
+
+
+# ============================================================================
+# PayPal Integration
+# ============================================================================
+
+
+class PayPalCreateOrderRequest(BaseModel):
+    """Request to create PayPal order."""
+    email: EmailStr
+
+
+class PayPalCreateOrderResponse(BaseModel):
+    """Response from creating PayPal order."""
+    order_id: str
+    approval_url: str | None
+
+
+class PayPalCapturePaymentRequest(BaseModel):
+    """Request to capture PayPal payment."""
+    order_id: str
+
+
+class PayPalCapturePaymentResponse(BaseModel):
+    """Response from capturing PayPal payment."""
+    success: bool
+    email: str | None
+    status: str
+
+
+@router.post("/payment/paypal-create-order", response_model=PayPalCreateOrderResponse)
+async def create_paypal_order(request: PayPalCreateOrderRequest):
+    """
+    Create a PayPal order for $29.9 Lifetime Pro access.
+
+    Frontend will call this, then redirect user to PayPal for approval.
+    """
+    from app.services.paypal import create_order
+
+    try:
+        result = create_order(
+            amount="29.90",
+            currency="USD",
+            description=f"ArtImageHub Pro Lifetime - {request.email}",
+        )
+
+        logger.info(
+            "PayPal order created: order_id=%s email=%s",
+            result["order_id"],
+            request.email,
+        )
+
+        return PayPalCreateOrderResponse(
+            order_id=result["order_id"],
+            approval_url=result.get("approval_url"),
+        )
+
+    except Exception as e:
+        logger.error("Failed to create PayPal order: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create PayPal order")
+
+
+@router.post("/payment/paypal-capture-payment", response_model=PayPalCapturePaymentResponse)
+async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
+    """
+    Capture PayPal payment after user approves.
+
+    Frontend calls this after user returns from PayPal.
+    This activates Pro Lifetime access.
+    """
+    from app.services.paypal import capture_order
+    from datetime import timedelta
+
+    try:
+        result = capture_order(request.order_id)
+
+        if result["status"] == "COMPLETED":
+            payer_email = result.get("payer_email")
+
+            if payer_email:
+                # Activate Pro Lifetime access
+                now = datetime.now(timezone.utc)
+                period_end = now + timedelta(days=36500)  # 100 years
+
+                upsert_subscription(
+                    email=payer_email,
+                    payment_provider="paypal",
+                    paypal_order_id=request.order_id,
+                    paypal_payer_id=result.get("payer_id"),
+                    status="active",
+                    current_period_start=now.isoformat(),
+                    current_period_end=period_end.isoformat(),
+                )
+
+                logger.info(
+                    "PayPal payment captured & Pro activated: order_id=%s email=%s",
+                    request.order_id,
+                    payer_email,
+                )
+
+                return PayPalCapturePaymentResponse(
+                    success=True,
+                    email=payer_email,
+                    status="active",
+                )
+            else:
+                logger.error(
+                    "PayPal capture succeeded but no payer email: order_id=%s",
+                    request.order_id,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Payment succeeded but could not extract payer email",
+                )
+        else:
+            logger.warning(
+                "PayPal capture incomplete: order_id=%s status=%s",
+                request.order_id,
+                result["status"],
+            )
+            return PayPalCapturePaymentResponse(
+                success=False,
+                email=None,
+                status=result["status"],
+            )
+
+    except Exception as e:
+        logger.error(
+            "Failed to capture PayPal payment: order_id=%s error=%s",
+            request.order_id,
+            str(e),
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to capture payment")
+
+
+@router.post("/payment/paypal-webhook")
+async def paypal_webhook(request: Request):
+    """
+    Handle PayPal webhook events.
+
+    Events we care about:
+    - PAYMENT.CAPTURE.COMPLETED
+    - PAYMENT.CAPTURE.REFUNDED
+    """
+    from app.services.paypal import verify_webhook_signature
+
+    settings = get_settings()
+    payload = await request.body()
+    payload_str = payload.decode()
+
+    # Verify webhook signature
+    headers = dict(request.headers)
+    if not verify_webhook_signature(
+        webhook_id=settings.paypal_webhook_id,
+        headers=headers,
+        body=payload_str,
+    ):
+        logger.error("PayPal webhook signature verification failed")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        event_data = json.loads(payload_str)
+        event_type = event_data.get("event_type", "")
+        event_id = event_data.get("id", "")
+
+        logger.info("PayPal webhook received: event_type=%s event_id=%s", event_type, event_id)
+
+        # Idempotency check
+        if is_event_processed(event_id):
+            logger.info("PayPal webhook already processed: %s", event_id)
+            return {"status": "ok", "message": "already processed"}
+
+        # Handle different event types
+        if event_type == "PAYMENT.CAPTURE.COMPLETED":
+            _handle_paypal_capture_completed(event_data)
+        elif event_type == "PAYMENT.CAPTURE.REFUNDED":
+            _handle_paypal_refund(event_data)
+        else:
+            logger.info("PayPal webhook ignored: %s", event_type)
+
+        # Mark as processed
+        mark_event_processed(event_id, event_type)
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        logger.error("PayPal webhook processing error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="Webhook processing failed")
+
+
+def _handle_paypal_capture_completed(event_data: dict):
+    """Handle PAYMENT.CAPTURE.COMPLETED webhook event."""
+    from datetime import timedelta
+
+    resource = event_data.get("resource", {})
+    payer_email = resource.get("payer", {}).get("email_address")
+    payer_id = resource.get("payer", {}).get("payer_id")
+    capture_id = resource.get("id")
+
+    if not payer_email:
+        logger.warning("PayPal capture completed but no payer email: %s", capture_id)
+        return
+
+    # Activate Pro Lifetime
+    now = datetime.now(timezone.utc)
+    period_end = now + timedelta(days=36500)  # 100 years
+
+    upsert_subscription(
+        email=payer_email,
+        payment_provider="paypal",
+        paypal_order_id=capture_id,
+        paypal_payer_id=payer_id,
+        status="active",
+        current_period_start=now.isoformat(),
+        current_period_end=period_end.isoformat(),
+    )
+
+    logger.info("PayPal webhook activated Pro: email=%s capture_id=%s", payer_email, capture_id)
+
+
+def _handle_paypal_refund(event_data: dict):
+    """Handle PAYMENT.CAPTURE.REFUNDED webhook event."""
+    # For MVP, we might not implement refund handling
+    # Just log it for now
+    resource = event_data.get("resource", {})
+    refund_id = resource.get("id")
+
+    logger.warning("PayPal refund received (not handled): refund_id=%s", refund_id)
+    # TODO: Implement refund handling if needed
+    # - Deactivate user's Pro access
+    # - Update subscription status to 'refunded'

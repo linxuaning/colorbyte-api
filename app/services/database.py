@@ -30,12 +30,14 @@ def init_db():
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS subscriptions (
                 email TEXT PRIMARY KEY,
-                -- Payment provider fields (provider can be 'lemonsqueezy' or 'bmc')
+                -- Payment provider fields (provider can be 'lemonsqueezy', 'bmc', or 'paypal')
                 payment_provider TEXT DEFAULT 'lemonsqueezy',
                 lemonsqueezy_customer_id TEXT,
                 lemonsqueezy_subscription_id TEXT,
                 bmc_supporter_id TEXT,
                 bmc_membership_id TEXT,
+                paypal_order_id TEXT,
+                paypal_payer_id TEXT,
                 -- Subscription status
                 status TEXT NOT NULL DEFAULT 'none',
                 trial_start TEXT,
@@ -112,6 +114,8 @@ def upsert_subscription(
     lemonsqueezy_subscription_id: str | None = None,
     bmc_supporter_id: str | None = None,
     bmc_membership_id: str | None = None,
+    paypal_order_id: str | None = None,
+    paypal_payer_id: str | None = None,
     status: str = "none",
     trial_start: str | None = None,
     trial_end: str | None = None,
@@ -127,16 +131,18 @@ def upsert_subscription(
         conn.execute(
             """INSERT INTO subscriptions
                (email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
-                bmc_supporter_id, bmc_membership_id, status,
+                bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 cancel_at_period_end, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(email) DO UPDATE SET
                    payment_provider = ?,
                    lemonsqueezy_customer_id = COALESCE(?, lemonsqueezy_customer_id),
                    lemonsqueezy_subscription_id = COALESCE(?, lemonsqueezy_subscription_id),
                    bmc_supporter_id = COALESCE(?, bmc_supporter_id),
                    bmc_membership_id = COALESCE(?, bmc_membership_id),
+                   paypal_order_id = COALESCE(?, paypal_order_id),
+                   paypal_payer_id = COALESCE(?, paypal_payer_id),
                    status = ?,
                    trial_start = COALESCE(?, trial_start),
                    trial_end = COALESCE(?, trial_end),
@@ -146,13 +152,13 @@ def upsert_subscription(
                    updated_at = ?""",
             (
                 email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
-                bmc_supporter_id, bmc_membership_id, status,
+                bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 1 if cancel_at_period_end else 0, now, now,
                 # ON CONFLICT params:
                 payment_provider,
                 lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
-                bmc_supporter_id, bmc_membership_id, status,
+                bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 1 if cancel_at_period_end else 0, now,
             ),
