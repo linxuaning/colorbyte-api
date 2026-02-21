@@ -581,8 +581,7 @@ async def buymeacoffee_webhook(request: Request):
         _handle_bmc_membership_cancelled(data)
 
     elif event_type == "supporter.new_donation":
-        # One-time donations don't create subscriptions
-        logger.info("BMC one-time donation: %s", data.get("supporter_email"))
+        _handle_bmc_donation(data)
 
     else:
         logger.warning("Unhandled BMC webhook event: %s", event_type)
@@ -679,3 +678,69 @@ def _handle_bmc_membership_cancelled(data: dict):
         cancel_at_period_end=True,
     )
     logger.info("BMC membership cancelled: %s", email)
+
+
+def _handle_bmc_donation(data: dict):
+    """Handle BMC one-time donation (used for Lifetime Pro access)."""
+    email = data.get("supporter_email", "").lower().strip()
+    supporter_id = data.get("supporter_id", "")
+    supporter_name = data.get("supporter_name", "")
+    support_coffees = data.get("support_coffees", 0)  # Number of coffees
+    support_message = data.get("support_message", "")
+    created_at = data.get("created_at", "")
+
+    # BMC sends coffee count, typically 1 coffee = $5
+    # For $29.9, that would be ~6 coffees
+    # We'll check if >= 6 coffees (>= $29.9)
+    REQUIRED_COFFEES = 6
+
+    if not email:
+        logger.warning("BMC donation without email: %s", supporter_name)
+        return
+
+    logger.info(
+        "BMC donation received: %s coffees from %s (%s)",
+        support_coffees,
+        email,
+        supporter_name,
+    )
+
+    # Only activate Pro for donations >= $29.9 (6 coffees)
+    if support_coffees >= REQUIRED_COFFEES:
+        # Grant lifetime Pro access
+        from datetime import datetime, timedelta, timezone
+
+        # Set period_end far in the future (100 years) for lifetime access
+        if created_at:
+            try:
+                period_start = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except ValueError:
+                period_start = datetime.now(timezone.utc)
+        else:
+            period_start = datetime.now(timezone.utc)
+
+        # Lifetime = 100 years from now
+        period_end = period_start + timedelta(days=36500)
+
+        upsert_subscription(
+            email=email,
+            payment_provider="bmc",
+            bmc_supporter_id=supporter_id,
+            status="active",
+            current_period_start=period_start.isoformat(),
+            current_period_end=period_end.isoformat(),
+        )
+        logger.info(
+            "BMC donation activated Pro Lifetime: %s (%d coffees >= %d required)",
+            email,
+            support_coffees,
+            REQUIRED_COFFEES,
+        )
+    else:
+        # Thank them but don't activate Pro
+        logger.info(
+            "BMC donation appreciated but insufficient: %s (%d coffees < %d required)",
+            email,
+            support_coffees,
+            REQUIRED_COFFEES,
+        )
