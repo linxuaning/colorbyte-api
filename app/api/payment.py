@@ -802,8 +802,9 @@ async def create_paypal_order(request: PayPalCreateOrderRequest):
         )
 
     except Exception as e:
-        logger.error("Failed to create PayPal order: %s", str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to create PayPal order")
+        error_msg = str(e)
+        logger.error("Failed to create PayPal order: %s", error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create PayPal order: {error_msg}")
 
 
 @router.post("/payment/paypal-capture-payment", response_model=PayPalCapturePaymentResponse)

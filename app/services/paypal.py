@@ -25,6 +25,12 @@ def get_access_token() -> str:
     settings = get_settings()
     base_url = get_paypal_base_url()
 
+    # Validate credentials are configured
+    if not settings.paypal_client_id or not settings.paypal_client_secret:
+        error_msg = "PayPal credentials not configured. Check PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET environment variables."
+        logger.error(error_msg)
+        raise Exception(error_msg)
+
     # Encode credentials
     credentials = f"{settings.paypal_client_id}:{settings.paypal_client_secret}"
     encoded_credentials = base64.b64encode(credentials.encode()).decode()
@@ -46,12 +52,13 @@ def get_access_token() -> str:
     if response.status_code == 200:
         return response.json()["access_token"]
     else:
+        error_detail = response.text
         logger.error(
             "Failed to get PayPal access token: %d %s",
             response.status_code,
-            response.text,
+            error_detail,
         )
-        raise Exception(f"Failed to get PayPal access token: {response.status_code}")
+        raise Exception(f"PayPal OAuth failed (status {response.status_code}): {error_detail}")
 
 
 def create_order(
@@ -116,12 +123,13 @@ def create_order(
             "status": result.get("status"),
         }
     else:
+        error_detail = response.text
         logger.error(
             "PayPal order creation failed: %d %s",
             response.status_code,
-            response.text,
+            error_detail,
         )
-        raise Exception(f"PayPal order creation failed: {response.status_code}")
+        raise Exception(f"PayPal order creation failed (status {response.status_code}): {error_detail}")
 
 
 def capture_order(order_id: str) -> Dict[str, Any]:
