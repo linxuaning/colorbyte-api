@@ -30,8 +30,13 @@ def init_db():
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS subscriptions (
                 email TEXT PRIMARY KEY,
+                -- Payment provider fields (provider can be 'lemonsqueezy' or 'bmc')
+                payment_provider TEXT DEFAULT 'lemonsqueezy',
                 lemonsqueezy_customer_id TEXT,
                 lemonsqueezy_subscription_id TEXT,
+                bmc_supporter_id TEXT,
+                bmc_membership_id TEXT,
+                -- Subscription status
                 status TEXT NOT NULL DEFAULT 'none',
                 trial_start TEXT,
                 trial_end TEXT,
@@ -102,8 +107,11 @@ def mark_event_processed(event_id: str, event_type: str):
 
 def upsert_subscription(
     email: str,
+    payment_provider: str = "lemonsqueezy",
     lemonsqueezy_customer_id: str | None = None,
     lemonsqueezy_subscription_id: str | None = None,
+    bmc_supporter_id: str | None = None,
+    bmc_membership_id: str | None = None,
     status: str = "none",
     trial_start: str | None = None,
     trial_end: str | None = None,
@@ -118,13 +126,17 @@ def upsert_subscription(
     with get_db() as conn:
         conn.execute(
             """INSERT INTO subscriptions
-               (email, lemonsqueezy_customer_id, lemonsqueezy_subscription_id, status,
+               (email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
+                bmc_supporter_id, bmc_membership_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 cancel_at_period_end, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(email) DO UPDATE SET
+                   payment_provider = ?,
                    lemonsqueezy_customer_id = COALESCE(?, lemonsqueezy_customer_id),
                    lemonsqueezy_subscription_id = COALESCE(?, lemonsqueezy_subscription_id),
+                   bmc_supporter_id = COALESCE(?, bmc_supporter_id),
+                   bmc_membership_id = COALESCE(?, bmc_membership_id),
                    status = ?,
                    trial_start = COALESCE(?, trial_start),
                    trial_end = COALESCE(?, trial_end),
@@ -133,16 +145,19 @@ def upsert_subscription(
                    cancel_at_period_end = ?,
                    updated_at = ?""",
             (
-                email, lemonsqueezy_customer_id, lemonsqueezy_subscription_id, status,
+                email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
+                bmc_supporter_id, bmc_membership_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 1 if cancel_at_period_end else 0, now, now,
                 # ON CONFLICT params:
-                lemonsqueezy_customer_id, lemonsqueezy_subscription_id, status,
+                payment_provider,
+                lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
+                bmc_supporter_id, bmc_membership_id, status,
                 trial_start, trial_end, current_period_start, current_period_end,
                 1 if cancel_at_period_end else 0, now,
             ),
         )
-    logger.info("Subscription upserted: %s status=%s", email, status)
+    logger.info("Subscription upserted: %s provider=%s status=%s", email, payment_provider, status)
 
 
 def get_subscription(email: str) -> dict | None:

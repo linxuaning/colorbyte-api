@@ -496,3 +496,186 @@ def _handle_payment_failed(subscription: dict):
         status="past_due",
     )
     logger.warning("Payment failed for %s", email)
+
+
+# --- Buy Me a Coffee Integration ---
+
+@router.post("/payment/bmc-webhook")
+async def buymeacoffee_webhook(request: Request):
+    """
+    Handle Buy Me a Coffee webhook events.
+
+    Webhook events from BMC:
+    - supporter.new_donation: One-time donation
+    - supporter.new_membership: New membership subscription
+    - membership.updated: Membership status changed
+    - membership.cancelled: Membership cancelled
+
+    BMC webhook payload structure:
+    {
+        "event": "supporter.new_membership",
+        "data": {
+            "supporter_id": "abc123",
+            "supporter_name": "John Doe",
+            "supporter_email": "john@example.com",
+            "support_coffee_count": 5,
+            "support_message": "Thanks!",
+            "membership_id": "mem_xyz789",
+            "membership_level_id": "level_123",
+            "membership_level_name": "Premium",
+            "is_monthly": true,
+            "created_at": "2026-02-17T12:00:00Z"
+        }
+    }
+    """
+    settings = get_settings()
+
+    # Get raw payload for signature verification
+    payload = await request.body()
+    payload_str = payload.decode()
+
+    # Verify webhook signature (Bearer token or HMAC)
+    # BMC uses Bearer token in Authorization header
+    auth_header = request.headers.get("authorization", "")
+
+    if settings.bmc_webhook_secret:
+        expected_auth = f"Bearer {settings.bmc_webhook_secret}"
+        if not auth_header or auth_header != expected_auth:
+            logger.error("BMC webhook auth failed: invalid token")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    else:
+        logger.warning("BMC webhook secret not configured, skipping auth verification")
+
+    # Parse webhook payload
+    try:
+        event_data = json.loads(payload_str)
+    except json.JSONDecodeError:
+        logger.error("BMC webhook: invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event_type = event_data.get("event", "")
+    data = event_data.get("data", {})
+
+    # Generate event ID for idempotency
+    # BMC doesn't provide event IDs, so we create one from event type + supporter ID + timestamp
+    supporter_id = data.get("supporter_id", "")
+    membership_id = data.get("membership_id", "")
+    created_at = data.get("created_at", "")
+    event_id = f"bmc_{event_type}_{supporter_id}_{membership_id}_{created_at}"
+
+    # Idempotency check
+    if is_event_processed(event_id):
+        logger.info("BMC webhook already processed: %s", event_id)
+        return {"status": "ok", "already_processed": True}
+
+    logger.info("Processing BMC webhook: %s (%s)", event_type, event_id)
+
+    # Handle different event types
+    if event_type == "supporter.new_membership":
+        _handle_bmc_new_membership(data)
+
+    elif event_type == "membership.updated":
+        _handle_bmc_membership_updated(data)
+
+    elif event_type == "membership.cancelled":
+        _handle_bmc_membership_cancelled(data)
+
+    elif event_type == "supporter.new_donation":
+        # One-time donations don't create subscriptions
+        logger.info("BMC one-time donation: %s", data.get("supporter_email"))
+
+    else:
+        logger.warning("Unhandled BMC webhook event: %s", event_type)
+
+    # Mark as processed
+    mark_event_processed(event_id, event_type)
+
+    return {"status": "ok"}
+
+
+# --- BMC Webhook Handlers ---
+
+def _handle_bmc_new_membership(data: dict):
+    """Handle new BMC membership subscription."""
+    email = data.get("supporter_email", "").lower().strip()
+    supporter_id = data.get("supporter_id", "")
+    membership_id = data.get("membership_id", "")
+    membership_level_name = data.get("membership_level_name", "")
+    is_monthly = data.get("is_monthly", True)
+    created_at = data.get("created_at", "")
+
+    if not email:
+        logger.error("BMC new_membership without email: %s", membership_id)
+        return
+
+    # BMC doesn't have trials - memberships are active immediately after payment
+    # We'll set status to "active" and calculate period end based on monthly/annual
+    # For now, assume monthly subscriptions renew every 30 days
+    from datetime import datetime, timedelta, timezone
+
+    if created_at:
+        try:
+            period_start = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            # Assume monthly subscription (30 days)
+            period_end = period_start + timedelta(days=30)
+        except ValueError:
+            period_start = datetime.now(timezone.utc)
+            period_end = period_start + timedelta(days=30)
+    else:
+        period_start = datetime.now(timezone.utc)
+        period_end = period_start + timedelta(days=30)
+
+    upsert_subscription(
+        email=email,
+        payment_provider="bmc",
+        bmc_supporter_id=supporter_id,
+        bmc_membership_id=membership_id,
+        status="active",
+        current_period_start=period_start.isoformat(),
+        current_period_end=period_end.isoformat(),
+    )
+    logger.info("BMC membership created: %s (level=%s)", email, membership_level_name)
+
+
+def _handle_bmc_membership_updated(data: dict):
+    """Handle BMC membership update (renewal, etc.)."""
+    email = data.get("supporter_email", "").lower().strip()
+    membership_id = data.get("membership_id", "")
+
+    if not email:
+        logger.warning("BMC membership_updated without email: %s", membership_id)
+        return
+
+    # Update period end (assume renewal for 30 days from now)
+    from datetime import datetime, timedelta, timezone
+    period_start = datetime.now(timezone.utc)
+    period_end = period_start + timedelta(days=30)
+
+    upsert_subscription(
+        email=email,
+        payment_provider="bmc",
+        bmc_membership_id=membership_id,
+        status="active",
+        current_period_start=period_start.isoformat(),
+        current_period_end=period_end.isoformat(),
+    )
+    logger.info("BMC membership updated: %s", email)
+
+
+def _handle_bmc_membership_cancelled(data: dict):
+    """Handle BMC membership cancellation."""
+    email = data.get("supporter_email", "").lower().strip()
+    membership_id = data.get("membership_id", "")
+
+    if not email:
+        logger.warning("BMC membership_cancelled without email: %s", membership_id)
+        return
+
+    # Mark as cancelled (BMC cancellations are immediate, no "cancel at period end")
+    upsert_subscription(
+        email=email,
+        payment_provider="bmc",
+        status="cancelled",
+        cancel_at_period_end=True,
+    )
+    logger.info("BMC membership cancelled: %s", email)
