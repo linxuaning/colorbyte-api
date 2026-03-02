@@ -871,6 +871,8 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
                 status=result["status"],
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(
             "Failed to capture PayPal payment: order_id=%s error=%s",
@@ -878,7 +880,10 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
             str(e),
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail="Failed to capture payment")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to capture payment: {str(e)}",
+        )
 
 
 @router.post("/payment/paypal-webhook")

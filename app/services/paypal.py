@@ -175,13 +175,16 @@ def capture_order(order_id: str) -> Dict[str, Any]:
             "payer_id": payer_id,
         }
     else:
+        error_detail = response.text
         logger.error(
             "PayPal order capture failed: order_id=%s status=%d %s",
             order_id,
             response.status_code,
-            response.text,
+            error_detail,
         )
-        raise Exception(f"PayPal capture failed: {response.status_code}")
+        raise Exception(
+            f"PayPal capture failed (status {response.status_code}): {error_detail}"
+        )
 
 
 def verify_webhook_signature(
