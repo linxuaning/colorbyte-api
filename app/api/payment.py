@@ -777,7 +777,7 @@ class PayPalCapturePaymentResponse(BaseModel):
 @router.post("/payment/paypal-create-order", response_model=PayPalCreateOrderResponse)
 async def create_paypal_order(request: PayPalCreateOrderRequest):
     """
-    Create a PayPal order for $29.9 Lifetime Pro access.
+    Create a PayPal order for $4.99 Lifetime Pro access.
 
     Frontend will call this, then redirect user to PayPal for approval.
     """
@@ -785,7 +785,7 @@ async def create_paypal_order(request: PayPalCreateOrderRequest):
 
     try:
         result = create_order(
-            amount="29.90",
+            amount="4.99",
             currency="USD",
             description=f"ArtImageHub Pro Lifetime - {request.email}",
         )

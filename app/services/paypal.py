@@ -62,7 +62,7 @@ def get_access_token() -> str:
 
 
 def create_order(
-    amount: str = "29.90",
+    amount: str = "4.99",
     currency: str = "USD",
     description: str = "ArtImageHub Pro Lifetime Access",
 ) -> Dict[str, Any]:
