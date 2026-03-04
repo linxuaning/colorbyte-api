@@ -160,6 +160,13 @@ def capture_order(order_id: str) -> Dict[str, Any]:
         payer_email = result.get("payer", {}).get("email_address")
         payer_id = result.get("payer", {}).get("payer_id")
         status = result.get("status")
+        captures = (
+            result.get("purchase_units", [{}])[0]
+            .get("payments", {})
+            .get("captures", [{}])
+        )
+        captured_amount = captures[0].get("amount", {}).get("value")
+        captured_currency = captures[0].get("amount", {}).get("currency_code")
 
         logger.info(
             "PayPal order captured: order_id=%s payer_email=%s status=%s",
@@ -173,6 +180,8 @@ def capture_order(order_id: str) -> Dict[str, Any]:
             "status": status,
             "payer_email": payer_email,
             "payer_id": payer_id,
+            "captured_amount": captured_amount,
+            "captured_currency": captured_currency,
         }
     else:
         error_detail = response.text

@@ -760,6 +760,8 @@ class PayPalCreateOrderResponse(BaseModel):
     """Response from creating PayPal order."""
     order_id: str
     approval_url: str | None
+    amount: str
+    currency: str
 
 
 class PayPalCapturePaymentRequest(BaseModel):
@@ -772,6 +774,8 @@ class PayPalCapturePaymentResponse(BaseModel):
     success: bool
     email: str | None
     status: str
+    captured_amount: str | None = None
+    captured_currency: str | None = None
 
 
 @router.post("/payment/paypal-create-order", response_model=PayPalCreateOrderResponse)
@@ -782,11 +786,14 @@ async def create_paypal_order(request: PayPalCreateOrderRequest):
     Frontend will call this, then redirect user to PayPal for approval.
     """
     from app.services.paypal import create_order
+    settings = get_settings()
+    amount = f"{settings.paypal_price_usd:.2f}"
+    currency = "USD"
 
     try:
         result = create_order(
-            amount="4.99",
-            currency="USD",
+            amount=amount,
+            currency=currency,
             description=f"ArtImageHub Pro Lifetime - {request.email}",
         )
 
@@ -799,6 +806,8 @@ async def create_paypal_order(request: PayPalCreateOrderRequest):
         return PayPalCreateOrderResponse(
             order_id=result["order_id"],
             approval_url=result.get("approval_url"),
+            amount=amount,
+            currency=currency,
         )
 
     except Exception as e:
@@ -849,6 +858,8 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
                     success=True,
                     email=payer_email,
                     status="active",
+                    captured_amount=result.get("captured_amount"),
+                    captured_currency=result.get("captured_currency"),
                 )
             else:
                 logger.error(
@@ -869,6 +880,8 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
                 success=False,
                 email=None,
                 status=result["status"],
+                captured_amount=result.get("captured_amount"),
+                captured_currency=result.get("captured_currency"),
             )
 
     except HTTPException:

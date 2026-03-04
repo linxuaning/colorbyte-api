@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     paypal_client_secret: str = ""  # PayPal REST API Secret
     paypal_mode: Literal["sandbox", "live"] = "live"  # PayPal environment mode
     paypal_webhook_id: str = ""  # PayPal Webhook ID for signature verification
+    paypal_price_usd: float = 4.99  # One-time Pro Lifetime price
 
     # Database
     database_path: str = "data/artimagehub.db"
