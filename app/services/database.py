@@ -69,6 +69,14 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_downloads_ip_date
                 ON downloads(ip, download_date);
+
+            CREATE TABLE IF NOT EXISTS processing_events (
+                task_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_processing_events_completed_at
+                ON processing_events(completed_at);
         """)
     logger.info("Database initialized at %s", path)
 
@@ -244,3 +252,43 @@ def check_download_limit(ip: str, email: str | None = None) -> dict:
     count = get_download_count(ip, today)
     remaining = max(0, FREE_DAILY_LIMIT - count)
     return {"allowed": remaining > 0, "remaining": remaining, "is_subscriber": False}
+
+
+def record_processing_complete(task_id: str, mode: str):
+    """Persist a processing completion event for 24h metric aggregation."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO processing_events (task_id, mode, completed_at) VALUES (?, ?, ?)",
+            (task_id, mode, now),
+        )
+
+
+def get_processing_complete_metrics(hours: int = 24) -> dict:
+    """Return completion count and mode split in the trailing N hours."""
+    now = datetime.now(timezone.utc)
+    start = now.timestamp() - max(1, hours) * 3600
+    start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+
+    with get_db() as conn:
+        total_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM processing_events WHERE completed_at >= ?",
+            (start_iso,),
+        ).fetchone()
+        mode_rows = conn.execute(
+            """
+            SELECT mode, COUNT(*) AS cnt
+            FROM processing_events
+            WHERE completed_at >= ?
+            GROUP BY mode
+            ORDER BY cnt DESC
+            """,
+            (start_iso,),
+        ).fetchall()
+
+    return {
+        "count": int(total_row["cnt"]) if total_row else 0,
+        "by_mode": {row["mode"]: int(row["cnt"]) for row in mode_rows},
+        "window_hours": max(1, hours),
+        "generated_at": now.isoformat(),
+    }

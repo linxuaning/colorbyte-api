@@ -11,6 +11,7 @@ from app.services.storage import save_upload
 from app.services.task_store import create_task, update_task, TaskStatus
 from app.services.ai_service import get_ai_service
 from app.services.storage import RESULT_DIR
+from app.services.database import record_processing_complete
 
 router = APIRouter()
 
@@ -92,6 +93,8 @@ async def _process_task(task_id: str):
         )
 
         if result.success:
+            mode = "colorize" if task.colorize else "restore"
+            record_processing_complete(task_id=task_id, mode=mode)
             update_task(
                 task_id,
                 status=TaskStatus.COMPLETED,
