@@ -1,9 +1,9 @@
 """
 Application configuration
 """
-from pydantic_settings import BaseSettings
 from functools import lru_cache
 from typing import Literal
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -59,3 +59,16 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+
+def get_effective_ai_provider(settings: Settings | None = None) -> Literal["huggingface", "replicate", "mock"]:
+    """Prefer Replicate automatically when a token is present and AI_PROVIDER is unset/defaulted."""
+    settings = settings or get_settings()
+
+    if settings.ai_provider == "mock":
+        return "mock"
+
+    if settings.ai_provider == "huggingface" and settings.replicate_api_token:
+        return "replicate"
+
+    return settings.ai_provider

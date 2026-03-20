@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 
-from app.config import get_settings
+from app.config import get_settings, get_effective_ai_provider
 
 
 class ProcessingResult:
@@ -474,9 +474,11 @@ class AIService:
 
     def __init__(self):
         settings = get_settings()
-        if settings.ai_provider == "replicate":
+        provider = get_effective_ai_provider(settings)
+
+        if provider == "replicate":
             self._provider: AIProvider = ReplicateProvider(settings.replicate_api_token)
-        elif settings.ai_provider == "huggingface":
+        elif provider == "huggingface":
             self._provider = HuggingFaceProvider()
         else:
             self._provider = MockProvider()

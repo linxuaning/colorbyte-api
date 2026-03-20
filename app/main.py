@@ -52,5 +52,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    from app.config import get_settings
-    return {"status": "healthy", "ai_provider": get_settings().ai_provider}
+    from app.config import get_settings, get_effective_ai_provider
+
+    settings = get_settings()
+    return {"status": "healthy", "ai_provider": get_effective_ai_provider(settings)}
