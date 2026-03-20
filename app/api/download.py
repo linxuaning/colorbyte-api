@@ -1,7 +1,7 @@
 """
 Download API endpoint.
-Free: 720p preview with watermark, 3/day limit.
-Subscribers: original quality, unlimited.
+Free users get a watermarked 720p preview.
+Pro users can request the original-quality result.
 """
 import logging
 import tempfile
@@ -106,8 +106,8 @@ async def download_result(
 ):
     """
     Download the processed result image.
-    Free users: 720p preview with watermark, 3/day limit.
-    Subscribers: original quality, unlimited.
+    Free users receive a 720p watermarked preview.
+    Pro users can request the original-quality file.
     """
     task = get_task(task_id)
     if task is None:
@@ -122,7 +122,6 @@ async def download_result(
     client_ip = _get_client_ip(request)
     limit_check = check_download_limit(client_ip, email)
 
-    # Subscriber with original quality requested → serve original
     if limit_check["is_subscriber"] and quality == "original":
         record_download(client_ip, task_id)
         return FileResponse(
@@ -131,41 +130,19 @@ async def download_result(
             filename=f"artimagehub-{task_id}.jpg",
             headers={
                 "X-Subscriber": "true",
-                "X-Remaining": "-1",
+                "X-Quality": "original",
             },
         )
 
-    # Free user — check daily limit
-    if not limit_check["is_subscriber"] and not limit_check["allowed"]:
-        raise HTTPException(
-            status_code=429,
-            detail="Daily download limit reached (3/day). Start a free trial for unlimited downloads.",
-        )
-
-    # Create 720p preview with watermark for free users
-    if not limit_check["is_subscriber"]:
-        preview_path = _create_preview(task.result_path, task_id)
-        record_download(client_ip, task_id)
-        remaining = limit_check["remaining"] - 1  # just used one
-        return FileResponse(
-            path=preview_path,
-            media_type="image/jpeg",
-            filename=f"artimagehub-{task_id}-preview.jpg",
-            headers={
-                "X-Subscriber": "false",
-                "X-Remaining": str(remaining),
-            },
-        )
-
-    # Subscriber requesting default (non-original) — still serve original
+    preview_path = _create_preview(task.result_path, task_id)
     record_download(client_ip, task_id)
     return FileResponse(
-        path=task.result_path,
+        path=preview_path,
         media_type="image/jpeg",
-        filename=f"artimagehub-{task_id}.jpg",
+        filename=f"artimagehub-{task_id}-preview.jpg",
         headers={
-            "X-Subscriber": "true",
-            "X-Remaining": "-1",
+            "X-Subscriber": "false",
+            "X-Quality": "preview",
         },
     )
 

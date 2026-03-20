@@ -46,6 +46,7 @@ class SubscriptionStatusResponse(BaseModel):
     email: str
     is_active: bool
     status: str  # none, on_trial, active, cancelled, expired, past_due
+    payment_provider: str | None = None
     trial_end: str | None = None
     current_period_end: str | None = None
     cancel_at_period_end: bool = False
@@ -207,6 +208,7 @@ async def check_subscription(email: str):
         email=email,
         is_active=sub["status"] in ("on_trial", "active"),
         status=sub["status"],
+        payment_provider=sub.get("payment_provider"),
         trial_end=sub.get("trial_end"),
         current_period_end=sub.get("current_period_end"),
         cancel_at_period_end=bool(sub.get("cancel_at_period_end", 0)),
@@ -770,6 +772,7 @@ class PayPalCreateOrderResponse(BaseModel):
 class PayPalCapturePaymentRequest(BaseModel):
     """Request to capture PayPal payment."""
     order_id: str
+    email: str | None = None
 
 
 class PayPalCapturePaymentResponse(BaseModel):
@@ -838,7 +841,8 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
         if result["status"] == "COMPLETED":
             payer_email = result.get("payer_email")
             checkout_email = get_paypal_checkout_email(request.order_id)
-            activation_email = checkout_email or payer_email
+            request_email = request.email.lower().strip() if request.email else None
+            activation_email = checkout_email or payer_email or request_email
 
             if activation_email:
                 # Activate Pro Lifetime access
@@ -861,11 +865,23 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
                     current_period_end=period_end.isoformat(),
                 )
 
+                if checkout_email and payer_email and checkout_email != payer_email:
+                    upsert_subscription(
+                        email=payer_email,
+                        payment_provider="paypal",
+                        paypal_order_id=request.order_id,
+                        paypal_payer_id=result.get("payer_id"),
+                        status="active",
+                        current_period_start=now.isoformat(),
+                        current_period_end=period_end.isoformat(),
+                    )
+
                 logger.info(
-                    "PayPal payment captured & Pro activated: order_id=%s activation_email=%s payer_email=%s",
+                    "PayPal payment captured & Pro activated: order_id=%s activation_email=%s payer_email=%s request_email=%s",
                     request.order_id,
                     activation_email,
                     payer_email,
+                    request_email,
                 )
 
                 return PayPalCapturePaymentResponse(

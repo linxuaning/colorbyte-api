@@ -293,7 +293,7 @@ def is_user_active(email: str) -> bool:
     sub = get_subscription(email)
     if sub is None:
         return False
-    return sub["status"] in ("trialing", "active")
+    return sub["status"] in ("trialing", "active", "on_trial")
 
 
 def cancel_subscription_db(email: str):

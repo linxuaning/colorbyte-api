@@ -26,12 +26,15 @@ class UploadResponse(BaseModel):
 async def upload_image(
     file: UploadFile = File(...),
     colorize: bool = Form(False),
+    email: str = Form(""),
 ):
     """
     Upload an image for AI restoration.
     Accepts JPG, PNG, WEBP up to 20MB.
     Returns a task_id to poll for status.
     """
+    _ = email
+
     # Validate file type
     allowed_types = ["image/jpeg", "image/png", "image/webp"]
     if file.content_type not in allowed_types:
