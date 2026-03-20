@@ -55,4 +55,15 @@ async def health_check():
     from app.config import get_settings, get_effective_ai_provider
 
     settings = get_settings()
-    return {"status": "healthy", "ai_provider": get_effective_ai_provider(settings)}
+    effective_provider = get_effective_ai_provider(settings)
+    provider_source = "config"
+    if settings.ai_provider == "huggingface" and settings.replicate_api_token:
+        provider_source = "replicate_token_auto"
+
+    return {
+        "status": "healthy",
+        "ai_provider": effective_provider,
+        "configured_ai_provider": settings.ai_provider,
+        "provider_source": provider_source,
+        "replicate_token_configured": bool(settings.replicate_api_token),
+    }

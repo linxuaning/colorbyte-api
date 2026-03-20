@@ -392,6 +392,9 @@ class ReplicateProvider(AIProvider):
         logger = logging.getLogger("artimagehub.replicate")
 
         try:
+            if not self.api_token:
+                return ProcessingResult(success=False, error="Replicate API token missing")
+
             async with httpx.AsyncClient(timeout=180) as http:
                 if progress_callback:
                     await progress_callback("Uploading image...", 10)
@@ -399,6 +402,7 @@ class ReplicateProvider(AIProvider):
                 file_url = await self._upload_file(http, input_path)
                 current_url = file_url
                 restoration_success = False
+                errors: list[str] = []
 
                 # Fallback strategy for face restoration:
                 # 1. Try GFPGAN first (best for old photos)
@@ -410,14 +414,18 @@ class ReplicateProvider(AIProvider):
                     current_url = await self._try_gfpgan(http, file_url, progress_callback)
                     restoration_success = True
                 except Exception as e:
-                    logger.warning("GFPGAN failed: %s", str(e)[:200])
+                    gfpgan_error = str(e)
+                    logger.warning("GFPGAN failed: %s", gfpgan_error[:200])
+                    errors.append(f"GFPGAN: {gfpgan_error[:160]}")
 
                     # Fallback to CodeFormer
                     try:
                         current_url = await self._try_codeformer(http, file_url, progress_callback)
                         restoration_success = True
                     except Exception as e2:
-                        logger.warning("CodeFormer failed: %s", str(e2)[:200])
+                        codeformer_error = str(e2)
+                        logger.warning("CodeFormer failed: %s", codeformer_error[:200])
+                        errors.append(f"CodeFormer: {codeformer_error[:160]}")
 
                         # Last resort: Real-ESRGAN for upscaling only
                         try:
@@ -425,9 +433,11 @@ class ReplicateProvider(AIProvider):
                             restoration_success = True
                             logger.info("Using Real-ESRGAN as fallback (upscaling only)")
                         except Exception as e3:
+                            realesrgan_error = str(e3)
                             logger.error("All restoration methods failed. GFPGAN: %s, CodeFormer: %s, Real-ESRGAN: %s",
-                                       str(e)[:100], str(e2)[:100], str(e3)[:100])
-                            raise RuntimeError("All restoration methods failed. Please try again later.")
+                                       gfpgan_error[:100], codeformer_error[:100], realesrgan_error[:100])
+                            errors.append(f"Real-ESRGAN: {realesrgan_error[:160]}")
+                            raise RuntimeError(f"All restoration methods failed: {'; '.join(errors)}")
 
                 # Additional upscaling pass if we only did face restoration (not Real-ESRGAN)
                 # Skip if colorization is requested to avoid too many steps
