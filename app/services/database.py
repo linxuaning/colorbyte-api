@@ -77,6 +77,19 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_processing_events_completed_at
                 ON processing_events(completed_at);
+
+            CREATE TABLE IF NOT EXISTS paypal_checkout_context (
+                order_id TEXT PRIMARY KEY,
+                checkout_email TEXT NOT NULL,
+                payer_email TEXT,
+                capture_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_paypal_checkout_email
+                ON paypal_checkout_context(checkout_email);
+            CREATE INDEX IF NOT EXISTS idx_paypal_capture_id
+                ON paypal_checkout_context(capture_id);
         """)
     logger.info("Database initialized at %s", path)
 
@@ -196,6 +209,83 @@ def get_subscription_by_customer(lemonsqueezy_customer_id: str) -> dict | None:
         if row is None:
             return None
         return dict(row)
+
+
+def save_paypal_checkout_email(order_id: str, checkout_email: str):
+    """Persist the checkout email chosen before PayPal approval."""
+    now = datetime.now(timezone.utc).isoformat()
+    normalized_email = checkout_email.lower().strip()
+
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO paypal_checkout_context
+               (order_id, checkout_email, created_at, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(order_id) DO UPDATE SET
+                   checkout_email = excluded.checkout_email,
+                   updated_at = excluded.updated_at""",
+            (order_id, normalized_email, now, now),
+        )
+
+    logger.info(
+        "Saved PayPal checkout email: order_id=%s checkout_email=%s",
+        order_id,
+        normalized_email,
+    )
+
+
+def get_paypal_checkout_email(order_id: str) -> str | None:
+    """Return the saved checkout email for a PayPal order, if present."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT checkout_email FROM paypal_checkout_context WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["checkout_email"]
+
+
+def record_paypal_capture(
+    order_id: str,
+    capture_id: str | None = None,
+    payer_email: str | None = None,
+):
+    """Attach capture audit data to a stored PayPal checkout context."""
+    now = datetime.now(timezone.utc).isoformat()
+    normalized_payer_email = payer_email.lower().strip() if payer_email else None
+
+    with get_db() as conn:
+        conn.execute(
+            """UPDATE paypal_checkout_context
+               SET payer_email = COALESCE(?, payer_email),
+                   capture_id = COALESCE(?, capture_id),
+                   updated_at = ?
+               WHERE order_id = ?""",
+            (normalized_payer_email, capture_id, now, order_id),
+        )
+
+        if conn.total_changes == 0 and normalized_payer_email:
+            conn.execute(
+                """INSERT OR IGNORE INTO paypal_checkout_context
+                   (order_id, checkout_email, payer_email, capture_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    order_id,
+                    normalized_payer_email,
+                    normalized_payer_email,
+                    capture_id,
+                    now,
+                    now,
+                ),
+            )
+
+    logger.info(
+        "Recorded PayPal capture audit: order_id=%s capture_id=%s payer_email=%s",
+        order_id,
+        capture_id,
+        normalized_payer_email,
+    )
 
 
 def is_user_active(email: str) -> bool:

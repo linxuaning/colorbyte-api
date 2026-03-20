@@ -74,6 +74,8 @@ def create_order(
     """
     base_url = get_paypal_base_url()
     access_token = get_access_token()
+    settings = get_settings()
+    frontend_url = settings.frontend_url.rstrip("/")
 
     headers = {
         "Content-Type": "application/json",
@@ -92,8 +94,8 @@ def create_order(
             }
         ],
         "application_context": {
-            "return_url": "https://colorbyte.vercel.app/payment/success",
-            "cancel_url": "https://colorbyte.vercel.app/#pricing",
+            "return_url": f"{frontend_url}/payment/success",
+            "cancel_url": f"{frontend_url}/payment/cancel",
         },
     }
 
@@ -165,6 +167,7 @@ def capture_order(order_id: str) -> Dict[str, Any]:
             .get("payments", {})
             .get("captures", [{}])
         )
+        capture_id = captures[0].get("id")
         captured_amount = captures[0].get("amount", {}).get("value")
         captured_currency = captures[0].get("amount", {}).get("currency_code")
 
@@ -180,6 +183,7 @@ def capture_order(order_id: str) -> Dict[str, Any]:
             "status": status,
             "payer_email": payer_email,
             "payer_id": payer_id,
+            "capture_id": capture_id,
             "captured_amount": captured_amount,
             "captured_currency": captured_currency,
         }

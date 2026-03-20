@@ -18,10 +18,13 @@ from app.services.database import (
     upsert_subscription,
     get_subscription,
     get_subscription_by_customer,
+    get_paypal_checkout_email,
     is_user_active,
     cancel_subscription_db,
     is_event_processed,
     mark_event_processed,
+    record_paypal_capture,
+    save_paypal_checkout_email,
 )
 
 logger = logging.getLogger("artimagehub.payment")
@@ -803,6 +806,8 @@ async def create_paypal_order(request: PayPalCreateOrderRequest):
             request.email,
         )
 
+        save_paypal_checkout_email(result["order_id"], request.email)
+
         return PayPalCreateOrderResponse(
             order_id=result["order_id"],
             approval_url=result.get("approval_url"),
@@ -832,14 +837,22 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
 
         if result["status"] == "COMPLETED":
             payer_email = result.get("payer_email")
+            checkout_email = get_paypal_checkout_email(request.order_id)
+            activation_email = checkout_email or payer_email
 
-            if payer_email:
+            if activation_email:
                 # Activate Pro Lifetime access
                 now = datetime.now(timezone.utc)
                 period_end = now + timedelta(days=36500)  # 100 years
 
+                record_paypal_capture(
+                    request.order_id,
+                    capture_id=result.get("capture_id"),
+                    payer_email=payer_email,
+                )
+
                 upsert_subscription(
-                    email=payer_email,
+                    email=activation_email,
                     payment_provider="paypal",
                     paypal_order_id=request.order_id,
                     paypal_payer_id=result.get("payer_id"),
@@ -849,26 +862,27 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
                 )
 
                 logger.info(
-                    "PayPal payment captured & Pro activated: order_id=%s email=%s",
+                    "PayPal payment captured & Pro activated: order_id=%s activation_email=%s payer_email=%s",
                     request.order_id,
+                    activation_email,
                     payer_email,
                 )
 
                 return PayPalCapturePaymentResponse(
                     success=True,
-                    email=payer_email,
+                    email=activation_email,
                     status="active",
                     captured_amount=result.get("captured_amount"),
                     captured_currency=result.get("captured_currency"),
                 )
             else:
                 logger.error(
-                    "PayPal capture succeeded but no payer email: order_id=%s",
+                    "PayPal capture succeeded but no activation email: order_id=%s",
                     request.order_id,
                 )
                 raise HTTPException(
                     status_code=500,
-                    detail="Payment succeeded but could not extract payer email",
+                    detail="Payment succeeded but could not resolve the activation email",
                 )
         else:
             logger.warning(
@@ -962,26 +976,40 @@ def _handle_paypal_capture_completed(event_data: dict):
     payer_email = resource.get("payer", {}).get("email_address")
     payer_id = resource.get("payer", {}).get("payer_id")
     capture_id = resource.get("id")
+    order_id = resource.get("supplementary_data", {}).get("related_ids", {}).get("order_id")
+    activation_email = get_paypal_checkout_email(order_id) if order_id else None
 
-    if not payer_email:
-        logger.warning("PayPal capture completed but no payer email: %s", capture_id)
+    if not activation_email and not payer_email:
+        logger.warning("PayPal capture completed but no activation email: capture_id=%s", capture_id)
         return
+
+    activation_email = activation_email or payer_email
+    paypal_order_id = order_id or capture_id
 
     # Activate Pro Lifetime
     now = datetime.now(timezone.utc)
     period_end = now + timedelta(days=36500)  # 100 years
 
+    if order_id:
+        record_paypal_capture(order_id, capture_id=capture_id, payer_email=payer_email)
+
     upsert_subscription(
-        email=payer_email,
+        email=activation_email,
         payment_provider="paypal",
-        paypal_order_id=capture_id,
+        paypal_order_id=paypal_order_id,
         paypal_payer_id=payer_id,
         status="active",
         current_period_start=now.isoformat(),
         current_period_end=period_end.isoformat(),
     )
 
-    logger.info("PayPal webhook activated Pro: email=%s capture_id=%s", payer_email, capture_id)
+    logger.info(
+        "PayPal webhook activated Pro: activation_email=%s payer_email=%s order_id=%s capture_id=%s",
+        activation_email,
+        payer_email,
+        order_id,
+        capture_id,
+    )
 
 
 def _handle_paypal_refund(event_data: dict):
