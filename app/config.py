@@ -13,11 +13,25 @@ class Settings(BaseSettings):
     app_name: str = "ArtImageHub API"
     debug: bool = False
 
-    # AI Provider: "huggingface" (free, dev) or "replicate" (paid, prod)
-    ai_provider: Literal["huggingface", "replicate", "mock"] = "huggingface"
+    # AI Provider:
+    # - "huggingface": legacy Spaces/Gradio flow
+    # - "hf_inference": Hugging Face HTTP inference API
+    # - "replicate": Replicate API
+    # - "mock": local no-op provider
+    ai_provider: Literal["huggingface", "hf_inference", "replicate", "mock"] = "huggingface"
 
     # Replicate AI (only needed when ai_provider=replicate)
     replicate_api_token: str = ""
+
+    # Hugging Face Inference API (needed when ai_provider=hf_inference)
+    hf_token: str = ""
+    # Comma-separated model fallback order. Keep overrideable because
+    # serverless image models can change availability without code changes.
+    hf_inference_models: str = (
+        "stabilityai/stable-diffusion-x4-upscaler,"
+        "caidas/swin2SR-classical-sr-x2-64,"
+        "caidas/swin2SR-lightweight-x2-64"
+    )
 
     # Storage (Cloudflare R2 - future)
     r2_account_id: str = ""
@@ -61,7 +75,9 @@ def get_settings() -> Settings:
     return Settings()
 
 
-def get_effective_ai_provider(settings: Settings | None = None) -> Literal["huggingface", "replicate", "mock"]:
+def get_effective_ai_provider(
+    settings: Settings | None = None,
+) -> Literal["huggingface", "hf_inference", "replicate", "mock"]:
     """Prefer Replicate automatically when a token is present and AI_PROVIDER is unset/defaulted."""
     settings = settings or get_settings()
 
