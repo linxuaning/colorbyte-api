@@ -2,8 +2,7 @@
 AI Service - Strategy pattern with multiple AI backends.
 """
 import asyncio
-import base64
-import mimetypes
+import io
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -241,12 +240,7 @@ class HuggingFaceProvider(AIProvider):
 
 
 class HFInferenceProvider(AIProvider):
-    """HTTP-based Hugging Face inference with model and endpoint fallback."""
-
-    ENDPOINT_TEMPLATES = (
-        "https://api-inference.huggingface.co/models/{model_id}",
-        "https://router.huggingface.co/hf-inference/models/{model_id}",
-    )
+    """Hugging Face image-to-image provider using the official InferenceClient."""
 
     DEFAULT_MODELS = (
         "stabilityai/stable-diffusion-x4-upscaler",
@@ -262,6 +256,7 @@ class HFInferenceProvider(AIProvider):
         "Restore and gently colorize this old photo while preserving identity, "
         "composition, and realistic skin tones."
     )
+    NEGATIVE_PROMPT = "blurry, low quality, distorted, artifacts, text, watermark, duplicate"
 
     def __init__(self, api_token: str, model_candidates: Optional[Sequence[str]] = None):
         self.api_token = api_token.strip()
@@ -270,142 +265,34 @@ class HFInferenceProvider(AIProvider):
             for candidate in (model_candidates or self.DEFAULT_MODELS)
             if candidate and candidate.strip()
         ]
+        self.timeout = 180
 
-    def _build_headers(self, content_type: str) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_token}",
-            "Accept": "image/*",
-            "Content-Type": content_type,
-        }
+    def _is_prompt_driven_model(self, model_id: str) -> bool:
+        return "stable-diffusion" in model_id.lower()
 
-    def _extract_error_details(self, response: "httpx.Response") -> tuple[str, float | None]:
-        estimated_time: float | None = None
+    async def _run_model(self, model_id: str, input_path: str, colorize: bool) -> bytes:
+        from huggingface_hub import InferenceClient
 
-        try:
-            payload = response.json()
-        except Exception:
-            payload = None
-
-        if isinstance(payload, dict):
-            if payload.get("estimated_time") is not None:
-                try:
-                    estimated_time = float(payload["estimated_time"])
-                except (TypeError, ValueError):
-                    estimated_time = None
-
-            for key in ("error", "message", "detail"):
-                value = payload.get(key)
-                if value:
-                    return str(value), estimated_time
-
-        text = response.text.strip()
-        if text:
-            return text[:200], estimated_time
-        return f"HTTP {response.status_code}", estimated_time
-
-    async def _post_with_retries(
-        self,
-        http: "httpx.AsyncClient",
-        endpoint: str,
-        headers: dict[str, str],
-        *,
-        content: bytes | None = None,
-        json_payload: dict | None = None,
-    ) -> bytes:
-        attempt = 0
-
-        while attempt < 4:
-            if json_payload is not None:
-                response = await http.post(endpoint, headers=headers, json=json_payload)
-            else:
-                response = await http.post(endpoint, headers=headers, content=content)
-
-            if response.is_success:
-                content_type = response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    message, _ = self._extract_error_details(response)
-                    raise RuntimeError(f"unexpected JSON response: {message}")
-                return response.content
-
-            message, estimated_time = self._extract_error_details(response)
-            is_retryable = response.status_code in {408, 429, 500, 502, 503, 504}
-            if not is_retryable or attempt == 3:
-                raise RuntimeError(f"HTTP {response.status_code}: {message}")
-
-            wait_seconds = estimated_time if estimated_time and estimated_time > 0 else (attempt + 1) * 4
-            await asyncio.sleep(min(wait_seconds, 20))
-            attempt += 1
-
-        raise RuntimeError("request retries exhausted")
-
-    def _build_json_payload(self, input_bytes: bytes, colorize: bool) -> dict:
-        payload = {"inputs": base64.b64encode(input_bytes).decode("utf-8")}
         prompt = self.COLORIZE_PROMPT if colorize else self.RESTORE_PROMPT
-        payload["parameters"] = {"prompt": prompt}
-        return payload
 
-    async def _call_endpoint_variants(
-        self,
-        http: "httpx.AsyncClient",
-        endpoint: str,
-        input_bytes: bytes,
-        content_type: str,
-        colorize: bool,
-    ) -> bytes:
-        errors = []
+        def _invoke() -> bytes:
+            client = InferenceClient(provider="hf-inference", token=self.api_token, timeout=self.timeout)
 
-        # Legacy serverless endpoints often accept raw bytes directly. Keep JSON
-        # as a fallback for models that expect encoded `inputs` with parameters.
-        request_variants = (
-            (
-                "raw-bytes",
-                self._build_headers(content_type),
-                {"content": input_bytes},
-            ),
-            (
-                "json",
-                self._build_headers("application/json"),
-                {"json_payload": self._build_json_payload(input_bytes, colorize)},
-            ),
-        )
+            call_kwargs: dict = {"image": input_path, "model": model_id}
+            if self._is_prompt_driven_model(model_id):
+                call_kwargs["prompt"] = prompt
+                call_kwargs["negative_prompt"] = self.NEGATIVE_PROMPT
 
-        for variant_name, headers, kwargs in request_variants:
-            try:
-                return await self._post_with_retries(http, endpoint, headers, **kwargs)
-            except Exception as exc:
-                errors.append(f"{variant_name}: {exc}")
+            image = client.image_to_image(**call_kwargs)
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=95)
+            return buffer.getvalue()
 
-        raise RuntimeError("; ".join(errors))
-
-    async def _run_model(
-        self,
-        http: "httpx.AsyncClient",
-        model_id: str,
-        input_bytes: bytes,
-        content_type: str,
-        colorize: bool,
-    ) -> bytes:
-        errors = []
-
-        for template in self.ENDPOINT_TEMPLATES:
-            endpoint = template.format(model_id=model_id)
-            try:
-                return await self._call_endpoint_variants(
-                    http,
-                    endpoint,
-                    input_bytes,
-                    content_type,
-                    colorize,
-                )
-            except Exception as exc:
-                errors.append(f"{endpoint}: {exc}")
-
-        raise RuntimeError("; ".join(errors))
+        return await asyncio.to_thread(_invoke)
 
     async def process_photo(
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
     ) -> ProcessingResult:
-        import httpx
         import logging
 
         logger = logging.getLogger("artimagehub.hf_inference")
@@ -423,49 +310,39 @@ class HFInferenceProvider(AIProvider):
             )
 
         try:
-            input_bytes = Path(input_path).read_bytes()
-            content_type = mimetypes.guess_type(input_path)[0] or "application/octet-stream"
             errors = []
 
-            async with httpx.AsyncClient(timeout=180) as http:
-                for index, model_id in enumerate(self.model_candidates, start=1):
-                    progress = min(15 + (index - 1) * 20, 75)
-                    try:
-                        if progress_callback:
-                            short_name = model_id.split("/")[-1][:24]
-                            await progress_callback(
-                                f"Enhancing photo ({short_name})...",
-                                progress,
-                            )
-
-                        logger.info("Trying HF inference model: %s", model_id)
-                        result_bytes = await self._run_model(
-                            http,
-                            model_id,
-                            input_bytes,
-                            content_type,
-                            colorize,
+            for index, model_id in enumerate(self.model_candidates, start=1):
+                progress = min(15 + (index - 1) * 20, 75)
+                try:
+                    if progress_callback:
+                        short_name = model_id.split("/")[-1][:24]
+                        await progress_callback(
+                            f"Enhancing photo ({short_name})...",
+                            progress,
                         )
 
-                        if colorize:
-                            logger.warning(
-                                "HF inference colorization is best-effort only; "
-                                "actual support depends on the selected model."
-                            )
+                    logger.info("Trying HF inference model via InferenceClient: %s", model_id)
+                    result_bytes = await self._run_model(model_id, input_path, colorize)
 
-                        if progress_callback:
-                            await progress_callback("Writing result...", 95)
+                    if colorize:
+                        logger.warning(
+                            "HF inference colorization is best-effort only; "
+                            "actual support depends on the selected model."
+                        )
 
-                        Path(output_path).write_bytes(result_bytes)
+                    if progress_callback:
+                        await progress_callback("Writing result...", 95)
 
-                        if progress_callback:
-                            await progress_callback("Complete", 100)
+                    Path(output_path).write_bytes(result_bytes)
 
-                        return ProcessingResult(success=True, output_path=output_path)
-                    except Exception as exc:
-                        logger.warning("HF inference model %s failed: %s", model_id, exc)
-                        errors.append(f"{model_id}: {str(exc)[:160]}")
+                    if progress_callback:
+                        await progress_callback("Complete", 100)
 
+                    return ProcessingResult(success=True, output_path=output_path)
+                except Exception as exc:
+                    logger.warning("HF inference model %s failed: %s", model_id, exc)
+                    errors.append(f"{model_id}: {str(exc)[:280]}")
         except Exception as exc:
             logger.error("HF inference processing failed: %s", exc)
             return ProcessingResult(success=False, error=str(exc))
