@@ -3,6 +3,8 @@ AI Service - Strategy pattern with multiple AI backends.
 """
 import asyncio
 import io
+import json
+import mimetypes
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -592,6 +594,190 @@ class ReplicateProvider(AIProvider):
             return ProcessingResult(success=False, error=str(e))
 
 
+class NeroAIProvider(AIProvider):
+    """Nero AI task API for single-step face restoration."""
+
+    TASK_API = "https://api.nero.com/biz/api/task"
+    POLL_INTERVAL_SECONDS = 2
+    MAX_POLLS = 120
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key.strip()
+
+    def _headers(self) -> dict[str, str]:
+        return {"x-neroai-api-key": self.api_key}
+
+    def _extract_message(self, payload: dict) -> str:
+        for key in ("msg", "message", "error"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("msg", "message", "error"):
+                value = data.get(key)
+                if value:
+                    return str(value)
+
+        return "unknown Nero API error"
+
+    def _decode_api_payload(self, response: "httpx.Response") -> dict:
+        try:
+            payload = response.json()
+        except Exception as exc:
+            snippet = response.text.strip()[:200]
+            raise RuntimeError(f"Nero returned a non-JSON response: {snippet or 'empty body'}") from exc
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("Nero returned an unexpected response body")
+
+        code = payload.get("code")
+        normalized_code = None if code is None else str(code)
+        if normalized_code not in {"0", None}:
+            message = self._extract_message(payload)
+            if normalized_code == "11002":
+                raise RuntimeError(f"Nero API key is invalid (11002): {message}")
+            if normalized_code == "11003":
+                raise RuntimeError(f"Nero API key is expired (11003): {message}")
+            if normalized_code == "11004":
+                raise RuntimeError(f"Nero credits are exhausted (11004): {message}")
+            raise RuntimeError(f"Nero API error {normalized_code}: {message}")
+
+        return payload
+
+    async def _request_api_json(
+        self,
+        http: "httpx.AsyncClient",
+        method: str,
+        url: str,
+        **kwargs,
+    ) -> dict:
+        for attempt in range(4):
+            response = await http.request(method, url, headers=self._headers(), **kwargs)
+
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < 3:
+                await asyncio.sleep(min(2 * (attempt + 1), 10))
+                continue
+
+            response.raise_for_status()
+            return self._decode_api_payload(response)
+
+        raise RuntimeError("Nero request retries exhausted")
+
+    async def _create_task(self, http: "httpx.AsyncClient", input_path: str) -> str:
+        content_type = mimetypes.guess_type(input_path)[0] or "application/octet-stream"
+        file_path = Path(input_path)
+        form_payload = json.dumps({"type": "FaceRestoration", "body": {}})
+        file_bytes = file_path.read_bytes()
+
+        payload = await self._request_api_json(
+            http,
+            "POST",
+            self.TASK_API,
+            data={"payload": form_payload},
+            files={"file": (file_path.name, file_bytes, content_type)},
+        )
+
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("task_id"):
+            raise RuntimeError("Nero create-task response did not include task_id")
+
+        return str(data["task_id"])
+
+    async def _poll_for_output(
+        self,
+        http: "httpx.AsyncClient",
+        task_id: str,
+        progress_callback: ProgressCallback,
+    ) -> str:
+        for _ in range(self.MAX_POLLS):
+            await asyncio.sleep(self.POLL_INTERVAL_SECONDS)
+
+            payload = await self._request_api_json(
+                http,
+                "GET",
+                self.TASK_API,
+                params={"task_id": task_id},
+            )
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise RuntimeError("Nero poll response did not include task data")
+
+            status = str(data.get("status", "")).lower()
+            progress_value = data.get("progress")
+            if status == "done":
+                result = data.get("result")
+                output_url = result.get("output") if isinstance(result, dict) else None
+                if not output_url:
+                    raise RuntimeError("Nero finished without an output URL")
+                return str(output_url)
+
+            if status == "failed":
+                raise RuntimeError(self._extract_message(payload))
+
+            if status not in {"pending", "running"}:
+                raise RuntimeError(f"Unexpected Nero task status: {status or 'missing'}")
+
+            if progress_callback:
+                if isinstance(progress_value, (int, float)):
+                    progress = 30 + int(max(0, min(float(progress_value), 100)) * 0.55)
+                else:
+                    progress = 35 if status == "pending" else 60
+                stage = "Queued at Nero AI..." if status == "pending" else "Restoring faces..."
+                await progress_callback(stage, min(progress, 90))
+
+        raise RuntimeError(f"Nero task {task_id} timed out after {self.MAX_POLLS * self.POLL_INTERVAL_SECONDS}s")
+
+    async def process_photo(
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+    ) -> ProcessingResult:
+        import httpx
+        import logging
+
+        logger = logging.getLogger("artimagehub.nero")
+
+        if not self.api_key:
+            return ProcessingResult(
+                success=False,
+                error="NERO_API_KEY is required when AI_PROVIDER=nero",
+            )
+
+        try:
+            if colorize:
+                logger.warning("Nero provider is currently running FaceRestoration only; colorize flag is ignored")
+
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=30.0, read=60.0, write=60.0, pool=60.0),
+                follow_redirects=True,
+            ) as http:
+                if progress_callback:
+                    await progress_callback("Uploading image...", 10)
+
+                task_id = await self._create_task(http, input_path)
+
+                if progress_callback:
+                    await progress_callback("Submitted to Nero AI...", 20)
+
+                output_url = await self._poll_for_output(http, task_id, progress_callback)
+
+                if progress_callback:
+                    await progress_callback("Downloading result...", 95)
+
+                response = await http.get(output_url)
+                response.raise_for_status()
+                Path(output_path).write_bytes(response.content)
+
+                if progress_callback:
+                    await progress_callback("Complete", 100)
+
+                return ProcessingResult(success=True, output_path=output_path)
+
+        except Exception as exc:
+            logger.error("Nero photo processing failed: %s", exc)
+            return ProcessingResult(success=False, error=str(exc))
+
+
 class AIService:
     """Delegates to the configured AI provider."""
 
@@ -601,6 +787,8 @@ class AIService:
 
         if provider == "replicate":
             self._provider: AIProvider = ReplicateProvider(settings.replicate_api_token)
+        elif provider == "nero":
+            self._provider = NeroAIProvider(settings.nero_api_key)
         elif provider == "hf_inference":
             model_candidates = [
                 candidate.strip()

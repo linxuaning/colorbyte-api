@@ -17,11 +17,15 @@ class Settings(BaseSettings):
     # - "huggingface": legacy Spaces/Gradio flow
     # - "hf_inference": Hugging Face HTTP inference API
     # - "replicate": Replicate API
+    # - "nero": Nero AI task API
     # - "mock": local no-op provider
-    ai_provider: Literal["huggingface", "hf_inference", "replicate", "mock"] = "huggingface"
+    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "mock"] = "huggingface"
 
     # Replicate AI (only needed when ai_provider=replicate)
     replicate_api_token: str = ""
+
+    # Nero AI task API (only needed when ai_provider=nero)
+    nero_api_key: str = ""
 
     # Hugging Face Inference API (needed when ai_provider=hf_inference)
     hf_token: str = ""
@@ -73,7 +77,7 @@ def get_settings() -> Settings:
 
 def get_effective_ai_provider(
     settings: Settings | None = None,
-) -> Literal["huggingface", "hf_inference", "replicate", "mock"]:
+) -> Literal["huggingface", "hf_inference", "replicate", "nero", "mock"]:
     """Prefer Replicate automatically when a token is present and AI_PROVIDER is unset/defaulted."""
     settings = settings or get_settings()
 
