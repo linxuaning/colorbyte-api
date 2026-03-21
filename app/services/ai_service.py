@@ -595,11 +595,13 @@ class ReplicateProvider(AIProvider):
 
 
 class NeroAIProvider(AIProvider):
-    """Nero AI task API for single-step face restoration."""
+    """Nero AI task API with restore and optional colorize chaining."""
 
     TASK_API = "https://api.nero.com/biz/api/task"
     POLL_INTERVAL_SECONDS = 2
     MAX_POLLS = 120
+    FACE_RESTORATION_TASK = "FaceRestoration"
+    COLORIZE_TASK = "ColorizePhoto"
 
     def __init__(self, api_key: str):
         self.api_key = api_key.strip()
@@ -665,10 +667,16 @@ class NeroAIProvider(AIProvider):
 
         raise RuntimeError("Nero request retries exhausted")
 
-    async def _create_task(self, http: "httpx.AsyncClient", input_path: str) -> str:
+    async def _create_task_from_file(
+        self,
+        http: "httpx.AsyncClient",
+        input_path: str,
+        task_type: str,
+        body: Optional[dict] = None,
+    ) -> str:
         content_type = mimetypes.guess_type(input_path)[0] or "application/octet-stream"
         file_path = Path(input_path)
-        form_payload = json.dumps({"type": "FaceRestoration", "body": {}})
+        form_payload = json.dumps({"type": task_type, "body": body or {}})
         file_bytes = file_path.read_bytes()
 
         payload = await self._request_api_json(
@@ -685,11 +693,42 @@ class NeroAIProvider(AIProvider):
 
         return str(data["task_id"])
 
+    async def _create_task_from_url(
+        self,
+        http: "httpx.AsyncClient",
+        task_type: str,
+        image_url: str,
+        body: Optional[dict] = None,
+    ) -> str:
+        payload = await self._request_api_json(
+            http,
+            "POST",
+            self.TASK_API,
+            json={
+                "type": task_type,
+                "body": {
+                    "image": image_url,
+                    **(body or {}),
+                },
+            },
+        )
+
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("task_id"):
+            raise RuntimeError("Nero create-task response did not include task_id")
+
+        return str(data["task_id"])
+
     async def _poll_for_output(
         self,
         http: "httpx.AsyncClient",
         task_id: str,
         progress_callback: ProgressCallback,
+        *,
+        pending_stage: str,
+        running_stage: str,
+        progress_base: int,
+        progress_span: int,
     ) -> str:
         for _ in range(self.MAX_POLLS):
             await asyncio.sleep(self.POLL_INTERVAL_SECONDS)
@@ -721,10 +760,12 @@ class NeroAIProvider(AIProvider):
 
             if progress_callback:
                 if isinstance(progress_value, (int, float)):
-                    progress = 30 + int(max(0, min(float(progress_value), 100)) * 0.55)
+                    progress = progress_base + int(
+                        max(0, min(float(progress_value), 100)) * (progress_span / 100)
+                    )
                 else:
-                    progress = 35 if status == "pending" else 60
-                stage = "Queued at Nero AI..." if status == "pending" else "Restoring faces..."
+                    progress = progress_base + (5 if status == "pending" else max(progress_span // 2, 1))
+                stage = pending_stage if status == "pending" else running_stage
                 await progress_callback(stage, min(progress, 90))
 
         raise RuntimeError(f"Nero task {task_id} timed out after {self.MAX_POLLS * self.POLL_INTERVAL_SECONDS}s")
@@ -744,9 +785,6 @@ class NeroAIProvider(AIProvider):
             )
 
         try:
-            if colorize:
-                logger.warning("Nero provider is currently running FaceRestoration only; colorize flag is ignored")
-
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(60.0, connect=30.0, read=60.0, write=60.0, pool=60.0),
                 follow_redirects=True,
@@ -754,12 +792,43 @@ class NeroAIProvider(AIProvider):
                 if progress_callback:
                     await progress_callback("Uploading image...", 10)
 
-                task_id = await self._create_task(http, input_path)
+                task_id = await self._create_task_from_file(
+                    http,
+                    input_path,
+                    self.FACE_RESTORATION_TASK,
+                )
 
                 if progress_callback:
                     await progress_callback("Submitted to Nero AI...", 20)
 
-                output_url = await self._poll_for_output(http, task_id, progress_callback)
+                output_url = await self._poll_for_output(
+                    http,
+                    task_id,
+                    progress_callback,
+                    pending_stage="Queued at Nero AI...",
+                    running_stage="Restoring faces...",
+                    progress_base=25,
+                    progress_span=45,
+                )
+
+                if colorize:
+                    if progress_callback:
+                        await progress_callback("Starting colorization...", 72)
+
+                    colorize_task_id = await self._create_task_from_url(
+                        http,
+                        self.COLORIZE_TASK,
+                        output_url,
+                    )
+                    output_url = await self._poll_for_output(
+                        http,
+                        colorize_task_id,
+                        progress_callback,
+                        pending_stage="Queued for colorization...",
+                        running_stage="Colorizing photo...",
+                        progress_base=72,
+                        progress_span=18,
+                    )
 
                 if progress_callback:
                     await progress_callback("Downloading result...", 95)

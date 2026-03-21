@@ -1,7 +1,6 @@
 """
-Download API endpoint.
-Free users get a watermarked 720p preview.
-Pro users can request the original-quality result.
+Download and preview API endpoints.
+Processed results can be previewed online, but Pro access is required for file export.
 """
 import logging
 import tempfile
@@ -32,6 +31,20 @@ def _get_client_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def _get_completed_task_or_404(task_id: str):
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Task is not yet completed")
+
+    if not task.result_path or not Path(task.result_path).exists():
+        raise HTTPException(status_code=404, detail="Result file not found")
+
+    return task
 
 
 def _create_preview(source_path: str, task_id: str) -> str:
@@ -104,43 +117,47 @@ async def download_result(
     email: Optional[str] = Query(None),
     quality: Optional[str] = Query(None),
 ):
-    """
-    Download the processed result image.
-    Free users receive a 720p watermarked preview.
-    Pro users can request the original-quality file.
-    """
-    task = get_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    if task.status != TaskStatus.COMPLETED:
-        raise HTTPException(status_code=400, detail="Task is not yet completed")
-
-    if not task.result_path or not Path(task.result_path).exists():
-        raise HTTPException(status_code=404, detail="Result file not found")
+    """Download the processed result image in original quality for Pro users only."""
+    task = _get_completed_task_or_404(task_id)
 
     client_ip = _get_client_ip(request)
     limit_check = check_download_limit(client_ip, email)
 
-    if limit_check["is_subscriber"] and quality == "original":
-        record_download(client_ip, task_id)
-        return FileResponse(
-            path=task.result_path,
-            media_type="image/jpeg",
-            filename=f"artimagehub-{task_id}.jpg",
-            headers={
-                "X-Subscriber": "true",
-                "X-Quality": "original",
-            },
+    if not limit_check["is_subscriber"]:
+        raise HTTPException(
+            status_code=402,
+            detail="Pro payment required to download this photo. Preview remains available online.",
         )
 
-    preview_path = _create_preview(task.result_path, task_id)
+    if quality != "original":
+        raise HTTPException(
+            status_code=400,
+            detail="Use quality=original when requesting a paid download.",
+        )
+
     record_download(client_ip, task_id)
+    return FileResponse(
+        path=task.result_path,
+        media_type="image/jpeg",
+        filename=f"artimagehub-{task_id}.jpg",
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "X-Subscriber": "true",
+            "X-Quality": "original",
+        },
+    )
+
+
+@router.get("/result-preview/{task_id}")
+async def preview_result(task_id: str):
+    """Serve a watermarked preview for in-browser comparison without export access."""
+    task = _get_completed_task_or_404(task_id)
+    preview_path = _create_preview(task.result_path, task_id)
     return FileResponse(
         path=preview_path,
         media_type="image/jpeg",
-        filename=f"artimagehub-{task_id}-preview.jpg",
         headers={
+            "Cache-Control": "private, no-store, max-age=0",
             "X-Subscriber": "false",
             "X-Quality": "preview",
         },
