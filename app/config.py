@@ -27,11 +27,7 @@ class Settings(BaseSettings):
     hf_token: str = ""
     # Comma-separated model fallback order. Keep overrideable because
     # serverless image models can change availability without code changes.
-    hf_inference_models: str = (
-        "stabilityai/stable-diffusion-x4-upscaler,"
-        "caidas/swin2SR-classical-sr-x2-64,"
-        "caidas/swin2SR-lightweight-x2-64"
-    )
+    hf_inference_models: str = "black-forest-labs/FLUX.1-Kontext-dev"
 
     # Storage (Cloudflare R2 - future)
     r2_account_id: str = ""

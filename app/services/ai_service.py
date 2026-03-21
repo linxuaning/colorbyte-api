@@ -243,18 +243,16 @@ class HFInferenceProvider(AIProvider):
     """Hugging Face image-to-image provider using the official InferenceClient."""
 
     DEFAULT_MODELS = (
-        "stabilityai/stable-diffusion-x4-upscaler",
-        "caidas/swin2SR-classical-sr-x2-64",
-        "caidas/swin2SR-lightweight-x2-64",
+        "black-forest-labs/FLUX.1-Kontext-dev",
     )
 
     RESTORE_PROMPT = (
-        "Restore and enhance this old photo while preserving identity, "
-        "composition, and realistic details."
+        "Restore and enhance this old damaged photograph. "
+        "Fix scratches, improve clarity, sharpen details, correct colors."
     )
     COLORIZE_PROMPT = (
-        "Restore and gently colorize this old photo while preserving identity, "
-        "composition, and realistic skin tones."
+        "Restore and colorize this old damaged photograph. "
+        "Fix scratches, improve clarity, sharpen details, and produce natural realistic colors."
     )
     NEGATIVE_PROMPT = "blurry, low quality, distorted, artifacts, text, watermark, duplicate"
 
@@ -268,7 +266,8 @@ class HFInferenceProvider(AIProvider):
         self.timeout = 180
 
     def _is_prompt_driven_model(self, model_id: str) -> bool:
-        return "stable-diffusion" in model_id.lower()
+        lowered = model_id.lower()
+        return any(keyword in lowered for keyword in ("stable-diffusion", "flux", "kontext", "relighting"))
 
     async def _run_model(self, model_id: str, input_path: str, colorize: bool) -> bytes:
         from huggingface_hub import InferenceClient
@@ -278,9 +277,8 @@ class HFInferenceProvider(AIProvider):
         def _invoke() -> bytes:
             client = InferenceClient(provider="hf-inference", token=self.api_token, timeout=self.timeout)
 
-            call_kwargs: dict = {"image": input_path, "model": model_id}
+            call_kwargs: dict = {"image": input_path, "model": model_id, "prompt": prompt}
             if self._is_prompt_driven_model(model_id):
-                call_kwargs["prompt"] = prompt
                 call_kwargs["negative_prompt"] = self.NEGATIVE_PROMPT
 
             image = client.image_to_image(**call_kwargs)
