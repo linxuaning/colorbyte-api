@@ -44,4 +44,16 @@ services:
       # Database path (WARNING: ephemeral on free tier - upgrade to paid for persistence)
       - key: DATABASE_PATH
         value: data/artimagehub.db
+      # Durable payment metrics store
+      - key: METRICS_DATABASE_URL
+        fromDatabase:
+          name: colorbyte-metrics
+          property: connectionString
     healthCheckPath: /health
+
+databases:
+  - name: colorbyte-metrics
+    plan: free
+    region: oregon
+    databaseName: colorbyte_metrics
+    user: colorbyte_metrics_user

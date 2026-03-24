@@ -60,6 +60,7 @@ class Settings(BaseSettings):
 
     # Database
     database_path: str = "data/artimagehub.db"
+    metrics_database_url: str = ""
 
     # CORS
     frontend_url: str = "http://localhost:3000"

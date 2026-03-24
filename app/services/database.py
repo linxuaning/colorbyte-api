@@ -23,6 +23,78 @@ def _get_db_path() -> str:
     return _db_path
 
 
+def _get_metrics_database_url() -> str:
+    return get_settings().metrics_database_url.strip()
+
+
+def _use_metrics_postgres() -> bool:
+    return bool(_get_metrics_database_url())
+
+
+def _connect_metrics_postgres():
+    from psycopg import connect
+    from psycopg.rows import dict_row
+
+    return connect(
+        _get_metrics_database_url(),
+        connect_timeout=5,
+        row_factory=dict_row,
+    )
+
+
+def _init_metrics_postgres():
+    with _connect_metrics_postgres() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_initiations (
+                    order_id TEXT PRIMARY KEY,
+                    payment_provider TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_payment_initiations_created_at
+                    ON payment_initiations(created_at);
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_payment_initiations_provider_created_at
+                    ON payment_initiations(payment_provider, created_at);
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_successes (
+                    success_key TEXT PRIMARY KEY,
+                    capture_id TEXT,
+                    order_id TEXT,
+                    payment_provider TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    completed_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_payment_successes_completed_at
+                    ON payment_successes(completed_at);
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_payment_successes_provider_completed_at
+                    ON payment_successes(payment_provider, completed_at);
+                """
+            )
+        conn.commit()
+    logger.info("Metrics Postgres initialized")
+
+
 def init_db():
     """Create tables if they don't exist."""
     path = _get_db_path()
@@ -116,6 +188,12 @@ def init_db():
                 ON payment_successes(payment_provider, completed_at);
         """)
     logger.info("Database initialized at %s", path)
+
+    if _use_metrics_postgres():
+        try:
+            _init_metrics_postgres()
+        except Exception:
+            logger.warning("Metrics Postgres initialization failed", exc_info=True)
 
 
 @contextmanager
@@ -415,6 +493,21 @@ def record_payment_initiation(
 ):
     """Persist a server-side payment initiation event for exact-window counting."""
     now = datetime.now(timezone.utc).isoformat()
+    if _use_metrics_postgres():
+        with _connect_metrics_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO payment_initiations
+                    (order_id, payment_provider, email, created_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (order_id) DO NOTHING
+                    """,
+                    (order_id, payment_provider, email.lower().strip(), now),
+                )
+            conn.commit()
+        return
+
     with get_db() as conn:
         conn.execute(
             """
@@ -431,6 +524,35 @@ def get_payment_initiation_metrics(hours: int = 24) -> dict:
     now = datetime.now(timezone.utc)
     start = now.timestamp() - max(1, hours) * 3600
     start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+
+    if _use_metrics_postgres():
+        with _connect_metrics_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM payment_initiations WHERE created_at >= %s",
+                    (start_iso,),
+                )
+                total_row = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT payment_provider, COUNT(*) AS cnt
+                    FROM payment_initiations
+                    WHERE created_at >= %s
+                    GROUP BY payment_provider
+                    ORDER BY cnt DESC
+                    """,
+                    (start_iso,),
+                )
+                provider_rows = cur.fetchall()
+
+        return {
+            "count": int(total_row["cnt"]) if total_row else 0,
+            "by_provider": {
+                row["payment_provider"]: int(row["cnt"]) for row in provider_rows
+            },
+            "window_hours": max(1, hours),
+            "generated_at": now.isoformat(),
+        }
 
     with get_db() as conn:
         total_row = conn.execute(
@@ -472,6 +594,28 @@ def record_payment_success(
         raise ValueError("record_payment_success requires capture_id or order_id")
 
     occurred_at = completed_at or datetime.now(timezone.utc).isoformat()
+    if _use_metrics_postgres():
+        with _connect_metrics_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO payment_successes
+                    (success_key, capture_id, order_id, payment_provider, email, completed_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (success_key) DO NOTHING
+                    """,
+                    (
+                        success_key,
+                        capture_id,
+                        order_id,
+                        payment_provider,
+                        email.lower().strip(),
+                        occurred_at,
+                    ),
+                )
+            conn.commit()
+        return
+
     with get_db() as conn:
         conn.execute(
             """
@@ -495,6 +639,35 @@ def get_payment_success_metrics(hours: int = 24) -> dict:
     now = datetime.now(timezone.utc)
     start = now.timestamp() - max(1, hours) * 3600
     start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+
+    if _use_metrics_postgres():
+        with _connect_metrics_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM payment_successes WHERE completed_at >= %s",
+                    (start_iso,),
+                )
+                total_row = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT payment_provider, COUNT(*) AS cnt
+                    FROM payment_successes
+                    WHERE completed_at >= %s
+                    GROUP BY payment_provider
+                    ORDER BY cnt DESC
+                    """,
+                    (start_iso,),
+                )
+                provider_rows = cur.fetchall()
+
+        return {
+            "count": int(total_row["cnt"]) if total_row else 0,
+            "by_provider": {
+                row["payment_provider"]: int(row["cnt"]) for row in provider_rows
+            },
+            "window_hours": max(1, hours),
+            "generated_at": now.isoformat(),
+        }
 
     with get_db() as conn:
         total_row = conn.execute(
