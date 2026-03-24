@@ -23,6 +23,7 @@ class ProcessingCompleteMetricsResponse(BaseModel):
 class PaymentInitiationMetricsResponse(BaseModel):
     count: int
     by_provider: dict[str, int]
+    storage_backend: str
     window_hours: int
     generated_at: str
 
@@ -30,6 +31,7 @@ class PaymentInitiationMetricsResponse(BaseModel):
 class PaymentSuccessMetricsResponse(BaseModel):
     count: int
     by_provider: dict[str, int]
+    storage_backend: str
     window_hours: int
     generated_at: str
 

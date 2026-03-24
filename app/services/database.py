@@ -31,6 +31,10 @@ def _use_metrics_postgres() -> bool:
     return bool(_get_metrics_database_url())
 
 
+def get_payment_metrics_storage_backend() -> str:
+    return "postgres" if _use_metrics_postgres() else "sqlite"
+
+
 def _connect_metrics_postgres():
     from psycopg import connect
     from psycopg.rows import dict_row
@@ -550,6 +554,7 @@ def get_payment_initiation_metrics(hours: int = 24) -> dict:
             "by_provider": {
                 row["payment_provider"]: int(row["cnt"]) for row in provider_rows
             },
+            "storage_backend": get_payment_metrics_storage_backend(),
             "window_hours": max(1, hours),
             "generated_at": now.isoformat(),
         }
@@ -575,6 +580,7 @@ def get_payment_initiation_metrics(hours: int = 24) -> dict:
         "by_provider": {
             row["payment_provider"]: int(row["cnt"]) for row in provider_rows
         },
+        "storage_backend": get_payment_metrics_storage_backend(),
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),
     }
@@ -665,6 +671,7 @@ def get_payment_success_metrics(hours: int = 24) -> dict:
             "by_provider": {
                 row["payment_provider"]: int(row["cnt"]) for row in provider_rows
             },
+            "storage_backend": get_payment_metrics_storage_backend(),
             "window_hours": max(1, hours),
             "generated_at": now.isoformat(),
         }
@@ -690,6 +697,7 @@ def get_payment_success_metrics(hours: int = 24) -> dict:
         "by_provider": {
             row["payment_provider"]: int(row["cnt"]) for row in provider_rows
         },
+        "storage_backend": get_payment_metrics_storage_backend(),
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),
     }
