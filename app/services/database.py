@@ -101,6 +101,19 @@ def init_db():
                 ON payment_initiations(created_at);
             CREATE INDEX IF NOT EXISTS idx_payment_initiations_provider_created_at
                 ON payment_initiations(payment_provider, created_at);
+
+            CREATE TABLE IF NOT EXISTS payment_successes (
+                success_key TEXT PRIMARY KEY,
+                capture_id TEXT,
+                order_id TEXT,
+                payment_provider TEXT NOT NULL,
+                email TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_payment_successes_completed_at
+                ON payment_successes(completed_at);
+            CREATE INDEX IF NOT EXISTS idx_payment_successes_provider_completed_at
+                ON payment_successes(payment_provider, completed_at);
         """)
     logger.info("Database initialized at %s", path)
 
@@ -429,6 +442,70 @@ def get_payment_initiation_metrics(hours: int = 24) -> dict:
             SELECT payment_provider, COUNT(*) AS cnt
             FROM payment_initiations
             WHERE created_at >= ?
+            GROUP BY payment_provider
+            ORDER BY cnt DESC
+            """,
+            (start_iso,),
+        ).fetchall()
+
+    return {
+        "count": int(total_row["cnt"]) if total_row else 0,
+        "by_provider": {
+            row["payment_provider"]: int(row["cnt"]) for row in provider_rows
+        },
+        "window_hours": max(1, hours),
+        "generated_at": now.isoformat(),
+    }
+
+
+def record_payment_success(
+    *,
+    order_id: str | None = None,
+    capture_id: str | None = None,
+    email: str,
+    payment_provider: str = "paypal",
+    completed_at: str | None = None,
+):
+    """Persist a server-side payment success event for exact-window counting."""
+    success_key = capture_id or (f"order:{order_id}" if order_id else None)
+    if success_key is None:
+        raise ValueError("record_payment_success requires capture_id or order_id")
+
+    occurred_at = completed_at or datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO payment_successes
+            (success_key, capture_id, order_id, payment_provider, email, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                success_key,
+                capture_id,
+                order_id,
+                payment_provider,
+                email.lower().strip(),
+                occurred_at,
+            ),
+        )
+
+
+def get_payment_success_metrics(hours: int = 24) -> dict:
+    """Return payment success count and provider split in trailing N hours."""
+    now = datetime.now(timezone.utc)
+    start = now.timestamp() - max(1, hours) * 3600
+    start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+
+    with get_db() as conn:
+        total_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM payment_successes WHERE completed_at >= ?",
+            (start_iso,),
+        ).fetchone()
+        provider_rows = conn.execute(
+            """
+            SELECT payment_provider, COUNT(*) AS cnt
+            FROM payment_successes
+            WHERE completed_at >= ?
             GROUP BY payment_provider
             ORDER BY cnt DESC
             """,

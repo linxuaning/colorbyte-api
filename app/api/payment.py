@@ -24,6 +24,7 @@ from app.services.database import (
     is_event_processed,
     mark_event_processed,
     record_payment_initiation,
+    record_payment_success,
     record_paypal_capture,
     save_paypal_checkout_email,
 )
@@ -891,6 +892,22 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
                         current_period_end=period_end.isoformat(),
                     )
 
+                try:
+                    record_payment_success(
+                        order_id=request.order_id,
+                        capture_id=result.get("capture_id"),
+                        email=activation_email,
+                        payment_provider="paypal",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Payment success metric record failed: order_id=%s capture_id=%s email=%s",
+                        request.order_id,
+                        result.get("capture_id"),
+                        activation_email,
+                        exc_info=True,
+                    )
+
                 logger.info(
                     "PayPal payment captured & Pro activated: order_id=%s activation_email=%s payer_email=%s request_email=%s",
                     request.order_id,
@@ -1033,6 +1050,22 @@ def _handle_paypal_capture_completed(event_data: dict):
         current_period_start=now.isoformat(),
         current_period_end=period_end.isoformat(),
     )
+
+    try:
+        record_payment_success(
+            order_id=order_id,
+            capture_id=capture_id,
+            email=activation_email,
+            payment_provider="paypal",
+        )
+    except Exception:
+        logger.warning(
+            "Payment success metric record failed in webhook: order_id=%s capture_id=%s email=%s",
+            order_id,
+            capture_id,
+            activation_email,
+            exc_info=True,
+        )
 
     logger.info(
         "PayPal webhook activated Pro: activation_email=%s payer_email=%s order_id=%s capture_id=%s",
