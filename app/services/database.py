@@ -90,6 +90,17 @@ def init_db():
                 ON paypal_checkout_context(checkout_email);
             CREATE INDEX IF NOT EXISTS idx_paypal_capture_id
                 ON paypal_checkout_context(capture_id);
+
+            CREATE TABLE IF NOT EXISTS payment_initiations (
+                order_id TEXT PRIMARY KEY,
+                payment_provider TEXT NOT NULL,
+                email TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_payment_initiations_created_at
+                ON payment_initiations(created_at);
+            CREATE INDEX IF NOT EXISTS idx_payment_initiations_provider_created_at
+                ON payment_initiations(payment_provider, created_at);
         """)
     logger.info("Database initialized at %s", path)
 
@@ -379,6 +390,56 @@ def get_processing_complete_metrics(hours: int = 24) -> dict:
     return {
         "count": int(total_row["cnt"]) if total_row else 0,
         "by_mode": {row["mode"]: int(row["cnt"]) for row in mode_rows},
+        "window_hours": max(1, hours),
+        "generated_at": now.isoformat(),
+    }
+
+
+def record_payment_initiation(
+    order_id: str,
+    email: str,
+    payment_provider: str = "paypal",
+):
+    """Persist a server-side payment initiation event for exact-window counting."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO payment_initiations
+            (order_id, payment_provider, email, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (order_id, payment_provider, email.lower().strip(), now),
+        )
+
+
+def get_payment_initiation_metrics(hours: int = 24) -> dict:
+    """Return payment initiation count and provider split in trailing N hours."""
+    now = datetime.now(timezone.utc)
+    start = now.timestamp() - max(1, hours) * 3600
+    start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+
+    with get_db() as conn:
+        total_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM payment_initiations WHERE created_at >= ?",
+            (start_iso,),
+        ).fetchone()
+        provider_rows = conn.execute(
+            """
+            SELECT payment_provider, COUNT(*) AS cnt
+            FROM payment_initiations
+            WHERE created_at >= ?
+            GROUP BY payment_provider
+            ORDER BY cnt DESC
+            """,
+            (start_iso,),
+        ).fetchall()
+
+    return {
+        "count": int(total_row["cnt"]) if total_row else 0,
+        "by_provider": {
+            row["payment_provider"]: int(row["cnt"]) for row in provider_rows
+        },
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),
     }

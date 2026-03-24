@@ -23,6 +23,7 @@ from app.services.database import (
     cancel_subscription_db,
     is_event_processed,
     mark_event_processed,
+    record_payment_initiation,
     record_paypal_capture,
     save_paypal_checkout_email,
 )
@@ -787,7 +788,7 @@ class PayPalCapturePaymentResponse(BaseModel):
 @router.post("/payment/paypal-create-order", response_model=PayPalCreateOrderResponse)
 async def create_paypal_order(request: PayPalCreateOrderRequest):
     """
-    Create a PayPal order for $4.99 Lifetime Pro access.
+    Create a PayPal order for $4.99 original-quality download access.
 
     Frontend will call this, then redirect user to PayPal for approval.
     """
@@ -800,16 +801,30 @@ async def create_paypal_order(request: PayPalCreateOrderRequest):
         result = create_order(
             amount=amount,
             currency=currency,
-            description=f"ArtImageHub Pro Lifetime - {request.email}",
+            description=f"ArtImageHub Original Download Access - {request.email}",
         )
+
+        save_paypal_checkout_email(result["order_id"], request.email)
+
+        try:
+            record_payment_initiation(
+                order_id=result["order_id"],
+                email=request.email,
+                payment_provider="paypal",
+            )
+        except Exception:
+            logger.warning(
+                "Payment initiation metric record failed: order_id=%s email=%s",
+                result["order_id"],
+                request.email,
+                exc_info=True,
+            )
 
         logger.info(
             "PayPal order created: order_id=%s email=%s",
             result["order_id"],
             request.email,
         )
-
-        save_paypal_checkout_email(result["order_id"], request.email)
 
         return PayPalCreateOrderResponse(
             order_id=result["order_id"],
