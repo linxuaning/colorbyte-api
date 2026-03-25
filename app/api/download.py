@@ -1,6 +1,6 @@
 """
 Download and preview API endpoints.
-Processed results can be previewed online, but Pro access is required for file export.
+Processed results remain tied to a paid email. Original-quality export requires paid access.
 """
 import logging
 import tempfile
@@ -126,7 +126,7 @@ async def download_result(
     if not limit_check["is_subscriber"]:
         raise HTTPException(
             status_code=402,
-            detail="Pro payment required to download this photo. Preview remains available online.",
+            detail="Paid download access is required for this photo. Use the same paid email that unlocked upload and processing.",
         )
 
     if quality != "original":

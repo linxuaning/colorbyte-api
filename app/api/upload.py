@@ -1,6 +1,6 @@
 """
 Upload API endpoint.
-Handles image upload, validation, and kicks off processing.
+Handles image upload and kicks off processing for the pay-first workflow.
 """
 import asyncio
 
@@ -11,7 +11,7 @@ from app.services.storage import save_upload
 from app.services.task_store import create_task, update_task, TaskStatus
 from app.services.ai_service import get_ai_service
 from app.services.storage import RESULT_DIR
-from app.services.database import record_processing_complete
+from app.services.database import is_user_active, record_processing_complete
 
 router = APIRouter()
 
@@ -31,9 +31,21 @@ async def upload_image(
     """
     Upload an image for AI restoration.
     Accepts JPG, PNG, WEBP up to 20MB.
-    Returns a task_id to poll for status.
+    Upload and processing are only available after payment with the same email.
     """
-    _ = email
+    normalized_email = email.strip().lower()
+
+    if not normalized_email:
+        raise HTTPException(
+            status_code=402,
+            detail="Paid access is required before upload and processing. Complete checkout first, then return with the same email.",
+        )
+
+    if not is_user_active(normalized_email):
+        raise HTTPException(
+            status_code=402,
+            detail="Paid access is required before upload and processing. Complete checkout with this email, then return to start.",
+        )
 
     # Validate file type
     allowed_types = ["image/jpeg", "image/png", "image/webp"]
