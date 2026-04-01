@@ -28,6 +28,10 @@ class Task:
     result_path: Optional[str] = None
     error: Optional[str] = None
     colorize: bool = False
+    landing_page: Optional[str] = None
+    cta_slot: Optional[str] = None
+    entry_variant: Optional[str] = None
+    checkout_source: Optional[str] = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -35,13 +39,25 @@ class Task:
 _tasks: dict[str, Task] = {}
 
 
-def create_task(file_id: str, upload_path: str, colorize: bool = False) -> Task:
+def create_task(
+    file_id: str,
+    upload_path: str,
+    colorize: bool = False,
+    landing_page: str | None = None,
+    cta_slot: str | None = None,
+    entry_variant: str | None = None,
+    checkout_source: str | None = None,
+) -> Task:
     task_id = uuid.uuid4().hex[:12]
     task = Task(
         id=task_id,
         file_id=file_id,
         upload_path=upload_path,
         colorize=colorize,
+        landing_page=landing_page,
+        cta_slot=cta_slot,
+        entry_variant=entry_variant,
+        checkout_source=checkout_source,
     )
     _tasks[task_id] = task
     return task

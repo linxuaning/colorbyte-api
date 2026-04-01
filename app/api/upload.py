@@ -27,6 +27,10 @@ async def upload_image(
     file: UploadFile = File(...),
     colorize: bool = Form(False),
     email: str = Form(""),
+    landing_page: str = Form(""),
+    cta_slot: str = Form(""),
+    entry_variant: str = Form(""),
+    checkout_source: str = Form(""),
 ):
     """
     Upload an image for AI restoration.
@@ -67,7 +71,15 @@ async def upload_image(
     file_id, upload_path = await save_upload(content, file.content_type)
 
     # Create task
-    task = create_task(file_id=file_id, upload_path=upload_path, colorize=colorize)
+    task = create_task(
+        file_id=file_id,
+        upload_path=upload_path,
+        colorize=colorize,
+        landing_page=landing_page.strip() or None,
+        cta_slot=cta_slot.strip() or None,
+        entry_variant=entry_variant.strip() or None,
+        checkout_source=checkout_source.strip() or None,
+    )
 
     # Start background processing
     asyncio.create_task(_process_task(task.id))
@@ -109,7 +121,14 @@ async def _process_task(task_id: str):
 
         if result.success:
             mode = "colorize" if task.colorize else "restore"
-            record_processing_complete(task_id=task_id, mode=mode)
+            record_processing_complete(
+                task_id=task_id,
+                mode=mode,
+                landing_page=task.landing_page,
+                cta_slot=task.cta_slot,
+                entry_variant=task.entry_variant,
+                checkout_source=task.checkout_source,
+            )
             update_task(
                 task_id,
                 status=TaskStatus.COMPLETED,

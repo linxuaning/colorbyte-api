@@ -761,6 +761,10 @@ def _handle_bmc_donation(data: dict):
 class PayPalCreateOrderRequest(BaseModel):
     """Request to create PayPal order."""
     email: EmailStr
+    landing_page: str | None = None
+    cta_slot: str | None = None
+    entry_variant: str | None = None
+    checkout_source: str | None = None
 
 
 class PayPalCreateOrderResponse(BaseModel):
@@ -812,6 +816,10 @@ async def create_paypal_order(request: PayPalCreateOrderRequest):
                 order_id=result["order_id"],
                 email=request.email,
                 payment_provider="paypal",
+                landing_page=request.landing_page,
+                cta_slot=request.cta_slot,
+                entry_variant=request.entry_variant,
+                checkout_source=request.checkout_source,
             )
         except Exception:
             logger.warning(

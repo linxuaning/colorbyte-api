@@ -13,6 +13,12 @@ from app.config import get_settings
 logger = logging.getLogger("artimagehub.db")
 
 _db_path: str | None = None
+_ATTRIBUTION_COLUMNS = {
+    "landing_page": "TEXT",
+    "cta_slot": "TEXT",
+    "entry_variant": "TEXT",
+    "checkout_source": "TEXT",
+}
 
 
 def _get_db_path() -> str:
@@ -21,6 +27,15 @@ def _get_db_path() -> str:
         _db_path = get_settings().database_path
         Path(_db_path).parent.mkdir(parents=True, exist_ok=True)
     return _db_path
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]):
+    existing = {
+        row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, column_type in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
 
 
 def _get_metrics_database_url() -> str:
@@ -149,6 +164,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS processing_events (
                 task_id TEXT PRIMARY KEY,
                 mode TEXT NOT NULL,
+                landing_page TEXT,
+                cta_slot TEXT,
+                entry_variant TEXT,
+                checkout_source TEXT,
                 completed_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_processing_events_completed_at
@@ -171,6 +190,10 @@ def init_db():
                 order_id TEXT PRIMARY KEY,
                 payment_provider TEXT NOT NULL,
                 email TEXT NOT NULL,
+                landing_page TEXT,
+                cta_slot TEXT,
+                entry_variant TEXT,
+                checkout_source TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_payment_initiations_created_at
@@ -191,6 +214,8 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_payment_successes_provider_completed_at
                 ON payment_successes(payment_provider, completed_at);
         """)
+        _ensure_columns(conn, "processing_events", _ATTRIBUTION_COLUMNS)
+        _ensure_columns(conn, "payment_initiations", _ATTRIBUTION_COLUMNS)
     logger.info("Database initialized at %s", path)
 
     if _use_metrics_postgres():
@@ -450,21 +475,53 @@ def check_download_limit(ip: str, email: str | None = None) -> dict:
     return {"allowed": remaining > 0, "remaining": remaining, "is_subscriber": False}
 
 
-def record_processing_complete(task_id: str, mode: str):
+def _normalize_attr(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _metrics_window(hours: int) -> tuple[datetime, str]:
+    window_hours = max(1, hours)
+    now = datetime.now(timezone.utc)
+    start = now.timestamp() - window_hours * 3600
+    start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+    return now, start_iso
+
+
+def record_processing_complete(
+    task_id: str,
+    mode: str,
+    landing_page: str | None = None,
+    cta_slot: str | None = None,
+    entry_variant: str | None = None,
+    checkout_source: str | None = None,
+):
     """Persist a processing completion event for 24h metric aggregation."""
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO processing_events (task_id, mode, completed_at) VALUES (?, ?, ?)",
-            (task_id, mode, now),
+            """
+            INSERT OR REPLACE INTO processing_events
+            (task_id, mode, landing_page, cta_slot, entry_variant, checkout_source, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                mode,
+                _normalize_attr(landing_page),
+                _normalize_attr(cta_slot),
+                _normalize_attr(entry_variant),
+                _normalize_attr(checkout_source),
+                now,
+            ),
         )
 
 
 def get_processing_complete_metrics(hours: int = 24) -> dict:
     """Return completion count and mode split in the trailing N hours."""
-    now = datetime.now(timezone.utc)
-    start = now.timestamp() - max(1, hours) * 3600
-    start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+    now, start_iso = _metrics_window(hours)
 
     with get_db() as conn:
         total_row = conn.execute(
@@ -494,6 +551,10 @@ def record_payment_initiation(
     order_id: str,
     email: str,
     payment_provider: str = "paypal",
+    landing_page: str | None = None,
+    cta_slot: str | None = None,
+    entry_variant: str | None = None,
+    checkout_source: str | None = None,
 ):
     """Persist a server-side payment initiation event for exact-window counting."""
     now = datetime.now(timezone.utc).isoformat()
@@ -515,19 +576,35 @@ def record_payment_initiation(
     with get_db() as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO payment_initiations
-            (order_id, payment_provider, email, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO payment_initiations
+            (
+                order_id,
+                payment_provider,
+                email,
+                landing_page,
+                cta_slot,
+                entry_variant,
+                checkout_source,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (order_id, payment_provider, email.lower().strip(), now),
+            (
+                order_id,
+                payment_provider,
+                email.lower().strip(),
+                _normalize_attr(landing_page),
+                _normalize_attr(cta_slot),
+                _normalize_attr(entry_variant),
+                _normalize_attr(checkout_source),
+                now,
+            ),
         )
 
 
 def get_payment_initiation_metrics(hours: int = 24) -> dict:
     """Return payment initiation count and provider split in trailing N hours."""
-    now = datetime.now(timezone.utc)
-    start = now.timestamp() - max(1, hours) * 3600
-    start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
+    now, start_iso = _metrics_window(hours)
 
     if _use_metrics_postgres():
         with _connect_metrics_postgres() as conn:
@@ -579,6 +656,110 @@ def get_payment_initiation_metrics(hours: int = 24) -> dict:
         "count": int(total_row["cnt"]) if total_row else 0,
         "by_provider": {
             row["payment_provider"]: int(row["cnt"]) for row in provider_rows
+        },
+        "storage_backend": get_payment_metrics_storage_backend(),
+        "window_hours": max(1, hours),
+        "generated_at": now.isoformat(),
+    }
+
+
+def get_exact_funnel_tuple_metrics(
+    landing_page: str,
+    cta_slot: str,
+    entry_variant: str,
+    checkout_source: str,
+    hours: int = 24,
+) -> dict:
+    """Return exact payment/processing counts for one funnel tuple."""
+    if _use_metrics_postgres():
+        raise RuntimeError(
+            "Exact funnel tuple metrics currently require sqlite metrics backend"
+        )
+
+    now, start_iso = _metrics_window(hours)
+    normalized_tuple = {
+        "landing_page": _normalize_attr(landing_page),
+        "cta_slot": _normalize_attr(cta_slot),
+        "entry_variant": _normalize_attr(entry_variant),
+        "checkout_source": _normalize_attr(checkout_source),
+    }
+
+    if not all(normalized_tuple.values()):
+        raise ValueError("Exact funnel tuple metrics require all 4 attribution fields")
+
+    tuple_params = (
+        start_iso,
+        normalized_tuple["landing_page"],
+        normalized_tuple["cta_slot"],
+        normalized_tuple["entry_variant"],
+        normalized_tuple["checkout_source"],
+    )
+
+    with get_db() as conn:
+        payment_row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM payment_initiations
+            WHERE created_at >= ?
+              AND landing_page = ?
+              AND cta_slot = ?
+              AND entry_variant = ?
+              AND checkout_source = ?
+            """,
+            tuple_params,
+        ).fetchone()
+        payment_provider_rows = conn.execute(
+            """
+            SELECT payment_provider, COUNT(*) AS cnt
+            FROM payment_initiations
+            WHERE created_at >= ?
+              AND landing_page = ?
+              AND cta_slot = ?
+              AND entry_variant = ?
+              AND checkout_source = ?
+            GROUP BY payment_provider
+            ORDER BY cnt DESC
+            """,
+            tuple_params,
+        ).fetchall()
+        processing_row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM processing_events
+            WHERE completed_at >= ?
+              AND landing_page = ?
+              AND cta_slot = ?
+              AND entry_variant = ?
+              AND checkout_source = ?
+            """,
+            tuple_params,
+        ).fetchone()
+        processing_mode_rows = conn.execute(
+            """
+            SELECT mode, COUNT(*) AS cnt
+            FROM processing_events
+            WHERE completed_at >= ?
+              AND landing_page = ?
+              AND cta_slot = ?
+              AND entry_variant = ?
+              AND checkout_source = ?
+            GROUP BY mode
+            ORDER BY cnt DESC
+            """,
+            tuple_params,
+        ).fetchall()
+
+    return {
+        **normalized_tuple,
+        "payment_initiations": int(payment_row["cnt"]) if payment_row else 0,
+        "payment_by_provider": {
+            row["payment_provider"]: int(row["cnt"])
+            for row in payment_provider_rows
+        },
+        "processing_completions": int(processing_row["cnt"]) if processing_row else 0,
+        "processing_by_mode": {
+            row["mode"]: int(row["cnt"])
+            for row in processing_mode_rows
         },
         "storage_backend": get_payment_metrics_storage_backend(),
         "window_hours": max(1, hours),
