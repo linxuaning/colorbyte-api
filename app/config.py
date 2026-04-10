@@ -72,6 +72,7 @@ class Settings(BaseSettings):
 
     # Database
     database_path: str = "data/artimagehub.db"
+    metrics_database_url: str = ""
 
     # CORS
     frontend_url: str = "http://localhost:3000"
@@ -85,3 +86,18 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+
+def get_effective_ai_provider(
+    settings: Settings | None = None,
+) -> Literal["huggingface", "hf_inference", "replicate", "nero", "mock"]:
+    """Auto-switch to Replicate when token exists and provider is still default huggingface."""
+    settings = settings or get_settings()
+
+    if settings.ai_provider == "mock":
+        return "mock"
+
+    if settings.ai_provider == "huggingface" and settings.replicate_api_token:
+        return "replicate"
+
+    return settings.ai_provider
