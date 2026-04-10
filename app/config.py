@@ -1,9 +1,9 @@
 """
 Application configuration
 """
+from pydantic_settings import BaseSettings
 from functools import lru_cache
 from typing import Literal
-from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -31,7 +31,11 @@ class Settings(BaseSettings):
     hf_token: str = ""
     # Comma-separated model fallback order. Keep overrideable because
     # serverless image models can change availability without code changes.
-    hf_inference_models: str = "black-forest-labs/FLUX.1-Kontext-dev"
+    hf_inference_models: str = (
+        "stabilityai/stable-diffusion-x4-upscaler,"
+        "caidas/swin2SR-classical-sr-x2-64,"
+        "caidas/swin2SR-lightweight-x2-64"
+    )
 
     # Storage (Cloudflare R2 - future)
     r2_account_id: str = ""
@@ -58,9 +62,16 @@ class Settings(BaseSettings):
     paypal_webhook_id: str = ""  # PayPal Webhook ID for signature verification
     paypal_price_usd: float = 4.99  # One-time Pro Lifetime price
 
+    # Dodo Payments
+    dodo_payments_api_key: str = ""  # Dodo Payments API key
+    dodo_payments_webhook_key: str = ""  # Dodo webhook signing key
+    dodo_payments_environment: Literal["test_mode", "live_mode"] = "live_mode"
+    dodo_payments_product_id: str = ""  # Product ID used for one-time checkout
+    dodo_payments_price_usd: float = 4.99  # One-time Pro Lifetime price
+    dodo_payments_currency: str = "USD"
+
     # Database
     database_path: str = "data/artimagehub.db"
-    metrics_database_url: str = ""
 
     # CORS
     frontend_url: str = "http://localhost:3000"
@@ -74,18 +85,3 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
-
-
-def get_effective_ai_provider(
-    settings: Settings | None = None,
-) -> Literal["huggingface", "hf_inference", "replicate", "nero", "mock"]:
-    """Prefer Replicate automatically when a token is present and AI_PROVIDER is unset/defaulted."""
-    settings = settings or get_settings()
-
-    if settings.ai_provider == "mock":
-        return "mock"
-
-    if settings.ai_provider == "huggingface" and settings.replicate_api_token:
-        return "replicate"
-
-    return settings.ai_provider

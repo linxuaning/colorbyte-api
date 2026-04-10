@@ -1,13 +1,13 @@
 """
 Payment API endpoints.
-LemonSqueezy integration for subscription with 7-day free trial.
-MVP: $9.9/month, email-based (no user accounts/passwords).
+Supports legacy subscription flows plus Dodo/PayPal original-download unlocks.
 """
 import json
 import logging
 import hmac
 import hashlib
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -18,15 +18,11 @@ from app.services.database import (
     upsert_subscription,
     get_subscription,
     get_subscription_by_customer,
-    get_paypal_checkout_email,
     is_user_active,
     cancel_subscription_db,
     is_event_processed,
     mark_event_processed,
     record_payment_initiation,
-    record_payment_success,
-    record_paypal_capture,
-    save_paypal_checkout_email,
 )
 
 logger = logging.getLogger("artimagehub.payment")
@@ -754,6 +750,237 @@ def _handle_bmc_donation(data: dict):
 
 
 # ============================================================================
+# Dodo Payments Integration (Primary)
+# ============================================================================
+
+
+class DodoCreateCheckoutRequest(BaseModel):
+    """Request to create a Dodo checkout session."""
+    email: EmailStr
+    resume_task_id: str | None = None
+    landing_page: str | None = None
+    cta_slot: str | None = None
+    entry_variant: str | None = None
+    checkout_source: str | None = None
+
+
+class DodoCreateCheckoutResponse(BaseModel):
+    """Response from creating Dodo checkout session."""
+    session_id: str
+    checkout_url: str
+    amount: str
+    currency: str
+
+
+@router.post("/payment/dodo-create-checkout", response_model=DodoCreateCheckoutResponse)
+async def create_dodo_checkout(request: DodoCreateCheckoutRequest):
+    """
+    Create a hosted Dodo checkout session for one-time paid access.
+
+    Frontend redirects users to `checkout_url` returned by this endpoint.
+    """
+    from app.services.dodo_payments import create_checkout_session
+
+    settings = get_settings()
+    amount = f"{settings.dodo_payments_price_usd:.2f}"
+    currency = settings.dodo_payments_currency
+    frontend_base = settings.frontend_url.rstrip("/")
+
+    success_params: dict[str, str] = {
+        "email": request.email,
+    }
+    cancel_params: dict[str, str] = {}
+    metadata: dict[str, str] = {
+        "checkout_email": request.email,
+    }
+
+    if request.resume_task_id:
+        success_params["resume_task_id"] = request.resume_task_id
+        cancel_params["resume_task_id"] = request.resume_task_id
+        metadata["resume_task_id"] = request.resume_task_id
+    if request.landing_page:
+        success_params["landing_page"] = request.landing_page
+        cancel_params["landing_page"] = request.landing_page
+        metadata["landing_page"] = request.landing_page
+    if request.cta_slot:
+        success_params["cta_slot"] = request.cta_slot
+        cancel_params["cta_slot"] = request.cta_slot
+        metadata["cta_slot"] = request.cta_slot
+    if request.entry_variant:
+        success_params["entry_variant"] = request.entry_variant
+        cancel_params["entry_variant"] = request.entry_variant
+        metadata["entry_variant"] = request.entry_variant
+    if request.checkout_source:
+        success_params["checkout_source"] = request.checkout_source
+        cancel_params["checkout_source"] = request.checkout_source
+        metadata["checkout_source"] = request.checkout_source
+
+    return_url = f"{frontend_base}/payment/success?{urlencode(success_params)}"
+    cancel_url = (
+        f"{frontend_base}/payment/cancel?{urlencode(cancel_params)}"
+        if cancel_params
+        else f"{frontend_base}/payment/cancel"
+    )
+
+    try:
+        result = create_checkout_session(
+            email=request.email,
+            return_url=return_url,
+            cancel_url=cancel_url,
+            metadata=metadata,
+        )
+
+        record_payment_initiation(
+            order_id=result["session_id"],
+            email=request.email,
+            payment_provider="dodo",
+            landing_page=request.landing_page,
+            cta_slot=request.cta_slot,
+            entry_variant=request.entry_variant,
+            checkout_source=request.checkout_source,
+        )
+
+        logger.info(
+            "Dodo checkout session created & initiation recorded: session_id=%s email=%s",
+            result["session_id"],
+            request.email,
+        )
+
+        return DodoCreateCheckoutResponse(
+            session_id=result["session_id"],
+            checkout_url=result["checkout_url"],
+            amount=amount,
+            currency=currency,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error("Failed to create Dodo checkout: %s", error_msg, exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to create checkout: {error_msg}",
+        )
+
+
+@router.post("/payment/dodo-webhook")
+async def dodo_webhook(request: Request):
+    """
+    Handle Dodo webhook events.
+
+    Events we care about:
+    - payment.succeeded
+    - payment.failed
+    """
+    from app.services.dodo_payments import unwrap_webhook_event
+
+    payload = await request.body()
+    headers = {
+        "webhook-id": request.headers.get("webhook-id", ""),
+        "webhook-signature": request.headers.get("webhook-signature", ""),
+        "webhook-timestamp": request.headers.get("webhook-timestamp", ""),
+    }
+
+    try:
+        event = unwrap_webhook_event(payload, headers)
+    except Exception as e:
+        logger.error("Dodo webhook signature verification failed: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        event_type = str(event.get("type", ""))
+        event_data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+        event_id = (
+            str(event.get("id", "")).strip()
+            or headers.get("webhook-id", "").strip()
+            or f"{event_type}:{event_data.get('payment_id', 'unknown')}"
+        )
+
+        logger.info("Dodo webhook received: event_type=%s event_id=%s", event_type, event_id)
+
+        if event_id and is_event_processed(event_id):
+            logger.info("Dodo webhook already processed: %s", event_id)
+            return {"status": "ok", "message": "already processed"}
+
+        if event_type == "payment.succeeded":
+            _handle_dodo_payment_succeeded(event_data)
+        elif event_type == "payment.failed":
+            _handle_dodo_payment_failed(event_data)
+        else:
+            logger.info("Dodo webhook ignored: %s", event_type)
+
+        if event_id:
+            mark_event_processed(event_id, event_type or "unknown")
+
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error("Dodo webhook processing error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="Webhook processing failed")
+
+
+def _handle_dodo_payment_succeeded(event_data: dict):
+    """Handle payment.succeeded webhook event."""
+    from datetime import timedelta
+
+    customer = event_data.get("customer", {}) if isinstance(event_data, dict) else {}
+    metadata = event_data.get("metadata", {}) if isinstance(event_data, dict) else {}
+    payment_id = str(event_data.get("payment_id", "")).strip()
+
+    payer_email = str(customer.get("email", "")).strip().lower()
+    checkout_email = str(metadata.get("checkout_email", "")).strip().lower()
+
+    primary_email = payer_email or checkout_email
+    if not primary_email:
+        logger.warning(
+            "Dodo payment.succeeded ignored: no customer email (payment_id=%s)",
+            payment_id or "unknown",
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    period_end = now + timedelta(days=36500)  # 100 years
+
+    upsert_subscription(
+        email=primary_email,
+        payment_provider="dodo",
+        status="active",
+        current_period_start=now.isoformat(),
+        current_period_end=period_end.isoformat(),
+    )
+
+    if checkout_email and payer_email and checkout_email != payer_email:
+        upsert_subscription(
+            email=checkout_email,
+            payment_provider="dodo",
+            status="active",
+            current_period_start=now.isoformat(),
+            current_period_end=period_end.isoformat(),
+        )
+        logger.info(
+            "Dodo Pro activated for both emails: payer=%s checkout=%s payment_id=%s",
+            payer_email,
+            checkout_email,
+            payment_id or "unknown",
+        )
+
+    logger.info(
+        "Dodo payment succeeded & Pro activated: payment_id=%s email=%s",
+        payment_id or "unknown",
+        primary_email,
+    )
+
+
+def _handle_dodo_payment_failed(event_data: dict):
+    """Handle payment.failed webhook event."""
+    payment_id = str(event_data.get("payment_id", "")).strip()
+    customer = event_data.get("customer", {}) if isinstance(event_data, dict) else {}
+    payer_email = str(customer.get("email", "")).strip().lower()
+    logger.warning(
+        "Dodo payment failed: payment_id=%s email=%s",
+        payment_id or "unknown",
+        payer_email or "unknown",
+    )
+
+
+# ============================================================================
 # PayPal Integration
 # ============================================================================
 
@@ -809,28 +1036,18 @@ async def create_paypal_order(request: PayPalCreateOrderRequest):
             description=f"ArtImageHub Original Download Access - {request.email}",
         )
 
-        save_paypal_checkout_email(result["order_id"], request.email)
-
-        try:
-            record_payment_initiation(
-                order_id=result["order_id"],
-                email=request.email,
-                payment_provider="paypal",
-                landing_page=request.landing_page,
-                cta_slot=request.cta_slot,
-                entry_variant=request.entry_variant,
-                checkout_source=request.checkout_source,
-            )
-        except Exception:
-            logger.warning(
-                "Payment initiation metric record failed: order_id=%s email=%s",
-                result["order_id"],
-                request.email,
-                exc_info=True,
-            )
+        record_payment_initiation(
+            order_id=result["order_id"],
+            email=request.email,
+            payment_provider="paypal",
+            landing_page=request.landing_page,
+            cta_slot=request.cta_slot,
+            entry_variant=request.entry_variant,
+            checkout_source=request.checkout_source,
+        )
 
         logger.info(
-            "PayPal order created: order_id=%s email=%s",
+            "PayPal order created & initiation recorded: order_id=%s email=%s",
             result["order_id"],
             request.email,
         )
@@ -864,23 +1081,34 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
 
         if result["status"] == "COMPLETED":
             payer_email = result.get("payer_email")
-            checkout_email = get_paypal_checkout_email(request.order_id)
-            request_email = request.email.lower().strip() if request.email else None
-            activation_email = checkout_email or payer_email or request_email
+            checkout_email = request.email.lower().strip() if request.email else None
+            now = datetime.now(timezone.utc)
+            period_end = now + timedelta(days=36500)  # 100 years
 
-            if activation_email:
-                # Activate Pro Lifetime access
-                now = datetime.now(timezone.utc)
-                period_end = now + timedelta(days=36500)  # 100 years
-
-                record_paypal_capture(
+            activated_email = payer_email or checkout_email
+            if not activated_email:
+                logger.error(
+                    "PayPal capture succeeded but no email available: order_id=%s",
                     request.order_id,
-                    capture_id=result.get("capture_id"),
-                    payer_email=payer_email,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Payment succeeded but could not determine activation email",
                 )
 
+            upsert_subscription(
+                email=activated_email,
+                payment_provider="paypal",
+                paypal_order_id=request.order_id,
+                paypal_payer_id=result.get("payer_id"),
+                status="active",
+                current_period_start=now.isoformat(),
+                current_period_end=period_end.isoformat(),
+            )
+
+            if checkout_email and payer_email and checkout_email != payer_email:
                 upsert_subscription(
-                    email=activation_email,
+                    email=checkout_email,
                     payment_provider="paypal",
                     paypal_order_id=request.order_id,
                     paypal_payer_id=result.get("payer_id"),
@@ -888,58 +1116,24 @@ async def capture_paypal_payment(request: PayPalCapturePaymentRequest):
                     current_period_start=now.isoformat(),
                     current_period_end=period_end.isoformat(),
                 )
-
-                if checkout_email and payer_email and checkout_email != payer_email:
-                    upsert_subscription(
-                        email=payer_email,
-                        payment_provider="paypal",
-                        paypal_order_id=request.order_id,
-                        paypal_payer_id=result.get("payer_id"),
-                        status="active",
-                        current_period_start=now.isoformat(),
-                        current_period_end=period_end.isoformat(),
-                    )
-
-                try:
-                    record_payment_success(
-                        order_id=request.order_id,
-                        capture_id=result.get("capture_id"),
-                        email=activation_email,
-                        payment_provider="paypal",
-                    )
-                except Exception:
-                    logger.warning(
-                        "Payment success metric record failed: order_id=%s capture_id=%s email=%s",
-                        request.order_id,
-                        result.get("capture_id"),
-                        activation_email,
-                        exc_info=True,
-                    )
-
                 logger.info(
-                    "PayPal payment captured & Pro activated: order_id=%s activation_email=%s payer_email=%s request_email=%s",
-                    request.order_id,
-                    activation_email,
-                    payer_email,
-                    request_email,
+                    "PayPal Pro activated for both emails: payer=%s checkout=%s order_id=%s",
+                    payer_email, checkout_email, request.order_id,
                 )
 
-                return PayPalCapturePaymentResponse(
-                    success=True,
-                    email=activation_email,
-                    status="active",
-                    captured_amount=result.get("captured_amount"),
-                    captured_currency=result.get("captured_currency"),
-                )
-            else:
-                logger.error(
-                    "PayPal capture succeeded but no activation email: order_id=%s",
-                    request.order_id,
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail="Payment succeeded but could not resolve the activation email",
-                )
+            logger.info(
+                "PayPal payment captured & Pro activated: order_id=%s email=%s",
+                request.order_id,
+                activated_email,
+            )
+
+            return PayPalCapturePaymentResponse(
+                success=True,
+                email=activated_email,
+                status="active",
+                captured_amount=result.get("captured_amount"),
+                captured_currency=result.get("captured_currency"),
+            )
         else:
             logger.warning(
                 "PayPal capture incomplete: order_id=%s status=%s",
@@ -1032,56 +1226,26 @@ def _handle_paypal_capture_completed(event_data: dict):
     payer_email = resource.get("payer", {}).get("email_address")
     payer_id = resource.get("payer", {}).get("payer_id")
     capture_id = resource.get("id")
-    order_id = resource.get("supplementary_data", {}).get("related_ids", {}).get("order_id")
-    activation_email = get_paypal_checkout_email(order_id) if order_id else None
 
-    if not activation_email and not payer_email:
-        logger.warning("PayPal capture completed but no activation email: capture_id=%s", capture_id)
+    if not payer_email:
+        logger.warning("PayPal capture completed but no payer email: %s", capture_id)
         return
-
-    activation_email = activation_email or payer_email
-    paypal_order_id = order_id or capture_id
 
     # Activate Pro Lifetime
     now = datetime.now(timezone.utc)
     period_end = now + timedelta(days=36500)  # 100 years
 
-    if order_id:
-        record_paypal_capture(order_id, capture_id=capture_id, payer_email=payer_email)
-
     upsert_subscription(
-        email=activation_email,
+        email=payer_email,
         payment_provider="paypal",
-        paypal_order_id=paypal_order_id,
+        paypal_order_id=capture_id,
         paypal_payer_id=payer_id,
         status="active",
         current_period_start=now.isoformat(),
         current_period_end=period_end.isoformat(),
     )
 
-    try:
-        record_payment_success(
-            order_id=order_id,
-            capture_id=capture_id,
-            email=activation_email,
-            payment_provider="paypal",
-        )
-    except Exception:
-        logger.warning(
-            "Payment success metric record failed in webhook: order_id=%s capture_id=%s email=%s",
-            order_id,
-            capture_id,
-            activation_email,
-            exc_info=True,
-        )
-
-    logger.info(
-        "PayPal webhook activated Pro: activation_email=%s payer_email=%s order_id=%s capture_id=%s",
-        activation_email,
-        payer_email,
-        order_id,
-        capture_id,
-    )
+    logger.info("PayPal webhook activated Pro: email=%s capture_id=%s", payer_email, capture_id)
 
 
 def _handle_paypal_refund(event_data: dict):

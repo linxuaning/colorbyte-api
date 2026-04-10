@@ -13,13 +13,27 @@ services:
       # AI Provider: replicate for production
       - key: AI_PROVIDER
         value: replicate
-      # Frontend URL for CORS and PayPal return URLs
+      # Frontend URL for CORS and checkout return URLs
       - key: FRONTEND_URL
         value: https://www.artimagehub.com
       # Replicate AI (required when AI_PROVIDER=replicate)
       - key: REPLICATE_API_TOKEN
         sync: false  # Set in Render dashboard (sensitive)
-      # PayPal Payment (primary payment provider)
+      # Dodo Payments (primary one-time checkout provider)
+      - key: DODO_PAYMENTS_API_KEY
+        sync: false  # Set in Render dashboard (sensitive)
+      - key: DODO_PAYMENTS_WEBHOOK_KEY
+        sync: false  # Set in Render dashboard (sensitive)
+      - key: DODO_PAYMENTS_ENVIRONMENT
+        value: live_mode
+      - key: DODO_PAYMENTS_PRODUCT_ID
+        sync: false  # Set in Render dashboard (sensitive)
+      - key: DODO_PAYMENTS_PRICE_USD
+        value: "4.99"
+      - key: DODO_PAYMENTS_CURRENCY
+        value: USD
+
+      # PayPal Payment (legacy fallback)
       - key: PAYPAL_CLIENT_ID
         sync: false  # Set in Render dashboard (sensitive)
       - key: PAYPAL_CLIENT_SECRET
@@ -44,16 +58,4 @@ services:
       # Database path (WARNING: ephemeral on free tier - upgrade to paid for persistence)
       - key: DATABASE_PATH
         value: data/artimagehub.db
-      # Durable payment metrics store
-      - key: METRICS_DATABASE_URL
-        fromDatabase:
-          name: colorbyte-metrics
-          property: connectionString
     healthCheckPath: /health
-
-databases:
-  - name: colorbyte-metrics
-    plan: free
-    region: oregon
-    databaseName: colorbyte_metrics
-    user: colorbyte_metrics_user
