@@ -1259,3 +1259,30 @@ def _handle_paypal_refund(event_data: dict):
     # TODO: Implement refund handling if needed
     # - Deactivate user's Pro access
     # - Update subscription status to 'refunded'
+
+
+class AdminSetSubscriberRequest(BaseModel):
+    email: str
+    admin_token: str
+
+
+@router.post("/payment/admin-set-subscriber")
+async def admin_set_subscriber(req: AdminSetSubscriberRequest):
+    """Admin endpoint: grant lifetime subscriber status to an email."""
+    from datetime import timedelta
+    settings = get_settings()
+    expected = settings.dodo_webhook_secret or ""
+    if not expected or not hmac.compare_digest(req.admin_token.encode(), expected.encode()):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    email = req.email.strip().lower()
+    now = datetime.now(timezone.utc)
+    upsert_subscription(
+        email=email,
+        payment_provider="admin",
+        status="active",
+        current_period_start=now.isoformat(),
+        current_period_end=(now + timedelta(days=36500)).isoformat(),
+    )
+    logger.info("Admin granted lifetime access: email=%s", email)
+    return {"status": "ok", "email": email, "access": "lifetime"}
