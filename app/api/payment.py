@@ -6,7 +6,6 @@ import json
 import logging
 import hmac
 import hashlib
-import os
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
@@ -1288,21 +1287,3 @@ async def admin_set_subscriber(req: AdminSetSubscriberRequest):
     logger.info("Admin granted lifetime access: email=%s", email)
     return {"status": "ok", "email": email, "access": "lifetime"}
 
-
-@router.post("/admin/activate-test-account")
-async def admin_activate_test_account(email: str, secret: str):
-    """One-time: activate a test account without needing Dodo webhook key."""
-    _secret = os.getenv("ADMIN_SECRET", "cb-setup-xK9mPq3rTv2026")
-    if not secret or secret != _secret:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    from datetime import timedelta
-    now = datetime.now(timezone.utc)
-    upsert_subscription(
-        email=email.strip().lower(),
-        payment_provider="admin",
-        status="active",
-        current_period_start=now.isoformat(),
-        current_period_end=(now + timedelta(days=36500)).isoformat(),
-    )
-    logger.info("Test account activated: email=%s", email)
-    return {"ok": True, "email": email}
