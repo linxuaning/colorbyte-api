@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     dodo_payments_price_usd: float = 4.99  # One-time Pro Lifetime price
     dodo_payments_currency: str = "USD"
 
+    # Alert Email (payment failure notifications)
+    alert_email_to: str = "linxuaning98@gmail.com"
+    resend_api_key: str = ""  # Resend API key (preferred over SMTP when set)
+    resend_from_email: str = "alerts@artimagehub.com"  # Sender address (must be verified in Resend)
+    alert_smtp_host: str = "smtp.gmail.com"
+    alert_smtp_port: int = 587
+    alert_smtp_user: str = ""   # Gmail address used to send alerts
+    alert_smtp_password: str = ""  # Gmail App Password (16 chars)
+
     # Database
     database_path: str = "data/artimagehub.db"
     metrics_database_url: str = ""
