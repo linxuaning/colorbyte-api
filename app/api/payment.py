@@ -1271,7 +1271,7 @@ async def admin_set_subscriber(req: AdminSetSubscriberRequest):
     """Admin endpoint: grant lifetime subscriber status to an email."""
     from datetime import timedelta
     settings = get_settings()
-    expected = settings.dodo_webhook_secret or ""
+    expected = settings.dodo_payments_webhook_key or ""
     if not expected or not hmac.compare_digest(req.admin_token.encode(), expected.encode()):
         raise HTTPException(status_code=403, detail="Forbidden")
 
