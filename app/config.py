@@ -18,8 +18,15 @@ class Settings(BaseSettings):
     # - "hf_inference": Hugging Face HTTP inference API
     # - "replicate": Replicate API
     # - "nero": Nero AI task API
+    # - "local": local GFPGAN + Real-ESRGAN (no API key required)
     # - "mock": local no-op provider
-    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "mock"] = "huggingface"
+    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock"] = "huggingface"
+
+    # Local GFPGAN/Real-ESRGAN (only needed when ai_provider=local)
+    local_python: str = ""       # path to gfpgan-env Python, e.g. /path/to/gfpgan-env/bin/python
+    local_models_dir: str = ""   # directory containing GFPGANv1.4.pth and RealESRGAN_x2plus.pth
+    local_inference_script: str = ""  # path to gfpgan_inference.py (auto-detected if empty)
+    local_scale: int = 2         # upscale factor
 
     # Replicate AI (only needed when ai_provider=replicate)
     replicate_api_token: str = ""
@@ -79,6 +86,9 @@ class Settings(BaseSettings):
     alert_smtp_user: str = ""   # Gmail address used to send alerts
     alert_smtp_password: str = ""  # Gmail App Password (16 chars)
 
+    # Admin
+    admin_secret: str = ""  # Set ADMIN_SECRET env var to enable /api/admin/* endpoints
+
     # Database
     database_path: str = "data/artimagehub.db"
     metrics_database_url: str = ""
@@ -99,7 +109,7 @@ def get_settings() -> Settings:
 
 def get_effective_ai_provider(
     settings: Settings | None = None,
-) -> Literal["huggingface", "hf_inference", "replicate", "nero", "mock"]:
+) -> Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock"]:
     """Auto-switch to Replicate when token exists and provider is still default huggingface."""
     settings = settings or get_settings()
 
