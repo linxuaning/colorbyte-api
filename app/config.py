@@ -20,13 +20,16 @@ class Settings(BaseSettings):
     # - "nero": Nero AI task API
     # - "local": local GFPGAN + Real-ESRGAN (no API key required)
     # - "mock": local no-op provider
-    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock"] = "huggingface"
+    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock", "photofix"] = "huggingface"
 
     # Local GFPGAN/Real-ESRGAN (only needed when ai_provider=local)
     local_python: str = ""       # path to gfpgan-env Python, e.g. /path/to/gfpgan-env/bin/python
     local_models_dir: str = ""   # directory containing GFPGANv1.4.pth and RealESRGAN_x2plus.pth
     local_inference_script: str = ""  # path to gfpgan_inference.py (auto-detected if empty)
     local_scale: int = 2         # upscale factor
+
+    # PhotoFix backend (only needed when ai_provider=photofix)
+    photofix_api_url: str = "https://backend.artimagehub.com"
 
     # Replicate AI (only needed when ai_provider=replicate)
     replicate_api_token: str = ""
@@ -109,7 +112,7 @@ def get_settings() -> Settings:
 
 def get_effective_ai_provider(
     settings: Settings | None = None,
-) -> Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock"]:
+) -> Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock", "photofix"]:
     """Auto-switch to Replicate when token exists and provider is still default huggingface."""
     settings = settings or get_settings()
 

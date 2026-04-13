@@ -26,7 +26,8 @@ ProgressCallback = Optional[Callable[[str, int], Awaitable[None]]]
 class AIProvider(ABC):
     @abstractmethod
     async def process_photo(
-        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
+        email: str = "",
     ) -> ProcessingResult:
         ...
 
@@ -35,7 +36,8 @@ class MockProvider(AIProvider):
     """Returns original image after simulated delay. For testing UI flow."""
 
     async def process_photo(
-        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
+        email: str = "",
     ) -> ProcessingResult:
         stages = [
             ("Analyzing image...", 20),
@@ -847,6 +849,227 @@ class NeroAIProvider(AIProvider):
             return ProcessingResult(success=False, error=str(exc))
 
 
+class LocalGFPGANProvider(AIProvider):
+    """Local GFPGAN + Real-ESRGAN provider — no API key required.
+
+    Runs inference in a subprocess using a dedicated Python env that has
+    gfpgan/realesrgan installed (separate from the backend's venv to avoid
+    heavy ML dependency conflicts).
+    """
+
+    def __init__(self, python_path: str, models_dir: str, inference_script: str, scale: int = 2):
+        self.python_path = python_path
+        self.models_dir = models_dir
+        self.inference_script = inference_script
+        self.scale = scale
+
+    async def process_photo(
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+    ) -> ProcessingResult:
+        import asyncio
+        import logging
+
+        logger = logging.getLogger("artimagehub.local_gfpgan")
+
+        stages = [
+            ("Loading models...", 10),
+            ("Enhancing faces (GFPGAN)...", 30),
+            ("Upscaling (Real-ESRGAN)...", 70),
+            ("Generating result...", 90),
+        ]
+
+        try:
+            for stage, progress in stages[:2]:
+                if progress_callback:
+                    await progress_callback(stage, progress)
+
+            cmd = [
+                self.python_path,
+                self.inference_script,
+                "--input", input_path,
+                "--output", output_path,
+                "--models-dir", self.models_dir,
+                "--scale", str(self.scale),
+            ]
+
+            logger.info("Running local GFPGAN: %s", " ".join(cmd))
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            if progress_callback:
+                await progress_callback("Restoring photo locally...", 50)
+
+            stdout, stderr = await proc.communicate()
+            stdout_text = stdout.decode().strip()
+            stderr_text = stderr.decode().strip()
+
+            if stderr_text:
+                for line in stderr_text.splitlines():
+                    if line.startswith("[info]") or line.startswith("[warn]"):
+                        logger.info("gfpgan: %s", line)
+
+            last_line = stdout_text.splitlines()[-1].strip() if stdout_text else ""
+            if proc.returncode != 0 or last_line != "SUCCESS":
+                error_lines = [l for l in stdout_text.splitlines() if l.startswith("ERROR")]
+                error_detail = error_lines[-1] if error_lines else (stderr_text.splitlines()[-1] if stderr_text else "unknown")
+                raise RuntimeError(f"Local GFPGAN failed (exit {proc.returncode}): {error_detail}")
+
+            if progress_callback:
+                await progress_callback("Complete", 100)
+
+            return ProcessingResult(success=True, output_path=output_path)
+
+        except Exception as e:
+            logger.error("Local GFPGAN processing failed: %s", e)
+            return ProcessingResult(success=False, error=str(e))
+
+
+class PhotoFixProvider(AIProvider):
+    """Delegates photo restoration to the PhotoFix backend at backend.artimagehub.com.
+
+    Flow:
+      1. Register email as subscriber (admin-set-subscriber).
+      2. POST /api/upload with the image file + email → remote task_id.
+      3. Poll GET /api/tasks/{task_id} every 2s (max 5 min) until completed/failed.
+      4. GET /api/download/{task_id} and write bytes to output_path.
+    """
+
+    POLL_INTERVAL = 2      # seconds between polls
+    MAX_POLL_TIME = 300    # 5 minutes max
+
+    def __init__(self, api_url: str):
+        self.api_url = api_url.rstrip("/")
+
+    async def process_photo(
+        self,
+        input_path: str,
+        output_path: str,
+        colorize: bool,
+        progress_callback: ProgressCallback,
+        email: str = "",
+    ) -> ProcessingResult:
+        import logging
+        import httpx
+
+        logger = logging.getLogger("artimagehub.photofix")
+
+        if not self.api_url:
+            return ProcessingResult(success=False, error="PHOTOFIX_API_URL is not configured.")
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=10.0, read=60.0, write=60.0),
+                follow_redirects=True,
+            ) as http:
+                # Step 1: register email as subscriber so upload gate passes
+                if email:
+                    try:
+                        await http.post(
+                            f"{self.api_url}/api/payment/admin-set-subscriber",
+                            json={"email": email, "subscribed": True},
+                        )
+                        logger.info("PhotoFix: registered subscriber email=%s", email)
+                    except Exception as exc:
+                        logger.warning("PhotoFix: admin-set-subscriber failed (continuing): %s", exc)
+
+                # Step 2: upload image
+                if progress_callback:
+                    await progress_callback("Uploading to PhotoFix...", 10)
+
+                with open(input_path, "rb") as fh:
+                    content = fh.read()
+
+                import mimetypes
+                mime = mimetypes.guess_type(input_path)[0] or "image/jpeg"
+                filename = Path(input_path).name
+
+                upload_resp = await http.post(
+                    f"{self.api_url}/api/upload",
+                    data={"email": email or ""},
+                    files={"file": (filename, content, mime)},
+                    timeout=httpx.Timeout(120.0, connect=10.0),
+                )
+                if not upload_resp.is_success:
+                    detail = ""
+                    try:
+                        detail = upload_resp.json().get("detail", "")
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"PhotoFix upload failed ({upload_resp.status_code}): {detail or upload_resp.text[:200]}"
+                    )
+
+                remote_task_id = upload_resp.json()["task_id"]
+                logger.info("PhotoFix: upload OK, remote_task_id=%s", remote_task_id)
+
+                # Step 3: poll until completed or failed
+                if progress_callback:
+                    await progress_callback("Processing (PhotoFix)...", 20)
+
+                elapsed = 0.0
+                last_progress = 20
+                while elapsed < self.MAX_POLL_TIME:
+                    await asyncio.sleep(self.POLL_INTERVAL)
+                    elapsed += self.POLL_INTERVAL
+
+                    status_resp = await http.get(
+                        f"{self.api_url}/api/tasks/{remote_task_id}",
+                        timeout=httpx.Timeout(30.0),
+                    )
+                    status_resp.raise_for_status()
+                    status_data = status_resp.json()
+
+                    remote_status = status_data.get("status", "")
+                    remote_progress = status_data.get("progress", 0)
+                    remote_message = status_data.get("message", "")
+
+                    # Map remote progress (0-100) to local range 20-90
+                    local_progress = 20 + int(remote_progress * 0.7)
+                    if local_progress > last_progress:
+                        last_progress = local_progress
+                        if progress_callback:
+                            await progress_callback(remote_message or "Processing...", local_progress)
+
+                    logger.debug(
+                        "PhotoFix poll: status=%s progress=%s elapsed=%.0fs",
+                        remote_status, remote_progress, elapsed,
+                    )
+
+                    if remote_status == "completed":
+                        break
+                    elif remote_status == "failed":
+                        raise RuntimeError(
+                            f"PhotoFix processing failed: {remote_message or 'unknown error'}"
+                        )
+                else:
+                    raise RuntimeError("PhotoFix processing timed out after 5 minutes.")
+
+                # Step 4: download result
+                if progress_callback:
+                    await progress_callback("Downloading result...", 95)
+
+                download_resp = await http.get(
+                    f"{self.api_url}/api/download/{remote_task_id}",
+                    timeout=httpx.Timeout(120.0, connect=10.0),
+                )
+                download_resp.raise_for_status()
+                Path(output_path).write_bytes(download_resp.content)
+
+                if progress_callback:
+                    await progress_callback("Complete", 100)
+
+                logger.info("PhotoFix: done, output saved to %s", output_path)
+                return ProcessingResult(success=True, output_path=output_path)
+
+        except Exception as exc:
+            logger.error("PhotoFix processing failed: %s", exc)
+            return ProcessingResult(success=False, error=str(exc))
+
+
 class AIService:
     """Delegates to the configured AI provider."""
 
@@ -854,8 +1077,41 @@ class AIService:
         settings = get_settings()
         provider = get_effective_ai_provider(settings)
 
-        if provider == "replicate":
+        if provider == "local":
+            import os
+
+            python_path = settings.local_python
+            models_dir = settings.local_models_dir
+            inference_script = settings.local_inference_script
+
+            # Auto-detect script location relative to this file: ../../scripts/gfpgan_inference.py
+            if not inference_script:
+                here = Path(__file__).resolve()
+                inference_script = str(here.parent.parent.parent.parent / "scripts" / "gfpgan_inference.py")
+
+            if not python_path or not os.path.exists(python_path):
+                raise RuntimeError(
+                    "LOCAL_PYTHON must be set to the gfpgan-env Python path when ai_provider=local. "
+                    f"Got: {python_path!r}"
+                )
+            if not models_dir or not os.path.exists(models_dir):
+                raise RuntimeError(
+                    "LOCAL_MODELS_DIR must be set to the directory with .pth files when ai_provider=local. "
+                    f"Got: {models_dir!r}"
+                )
+            if not os.path.exists(inference_script):
+                raise RuntimeError(f"Inference script not found: {inference_script!r}")
+
+            self._provider: AIProvider = LocalGFPGANProvider(
+                python_path=python_path,
+                models_dir=models_dir,
+                inference_script=inference_script,
+                scale=settings.local_scale,
+            )
+        elif provider == "replicate":
             self._provider: AIProvider = ReplicateProvider(settings.replicate_api_token)
+        elif provider == "photofix":
+            self._provider = PhotoFixProvider(settings.photofix_api_url)
         elif provider == "nero":
             self._provider = NeroAIProvider(settings.nero_api_key)
         elif provider == "hf_inference":
@@ -876,9 +1132,10 @@ class AIService:
         output_path: str,
         colorize: bool = False,
         progress_callback: ProgressCallback = None,
+        email: str = "",
     ) -> ProcessingResult:
         return await self._provider.process_photo(
-            input_path, output_path, colorize, progress_callback
+            input_path, output_path, colorize, progress_callback, email=email,
         )
 
 

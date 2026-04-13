@@ -853,8 +853,16 @@ async def create_dodo_checkout(request: DodoCreateCheckoutRequest):
             currency=currency,
         )
     except Exception as e:
+        from app.services.alert_email import send_payment_failure_alert
+
         error_msg = str(e)
         logger.error("Failed to create Dodo checkout: %s", error_msg, exc_info=True)
+        send_payment_failure_alert(
+            alert_type="checkout_create_failed",
+            customer_email=request.email,
+            error_msg=error_msg,
+            extra={"provider": "dodo"},
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Failed to create checkout: {error_msg}",
@@ -970,13 +978,26 @@ def _handle_dodo_payment_succeeded(event_data: dict):
 
 def _handle_dodo_payment_failed(event_data: dict):
     """Handle payment.failed webhook event."""
+    from app.services.alert_email import send_payment_failure_alert
+
     payment_id = str(event_data.get("payment_id", "")).strip()
     customer = event_data.get("customer", {}) if isinstance(event_data, dict) else {}
     payer_email = str(customer.get("email", "")).strip().lower()
+    error_msg = str(event_data.get("error_message") or event_data.get("failure_reason") or "").strip()
+
     logger.warning(
-        "Dodo payment failed: payment_id=%s email=%s",
+        "Dodo payment failed: payment_id=%s email=%s error=%s",
         payment_id or "unknown",
         payer_email or "unknown",
+        error_msg or "-",
+    )
+
+    send_payment_failure_alert(
+        alert_type="payment_failed_webhook",
+        payment_id=payment_id or None,
+        customer_email=payer_email or None,
+        error_msg=error_msg or "Dodo payment.failed event received",
+        extra={"provider": "dodo"},
     )
 
 

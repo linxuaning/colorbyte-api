@@ -75,6 +75,7 @@ async def upload_image(
         file_id=file_id,
         upload_path=upload_path,
         colorize=colorize,
+        email=normalized_email,
         landing_page=landing_page.strip() or None,
         cta_slot=cta_slot.strip() or None,
         entry_variant=entry_variant.strip() or None,
@@ -117,6 +118,7 @@ async def _process_task(task_id: str):
             output_path=result_path,
             colorize=task.colorize,
             progress_callback=on_progress,
+            email=task.email,
         )
 
         if result.success:

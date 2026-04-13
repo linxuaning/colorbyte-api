@@ -10,14 +10,16 @@ services:
       # App
       - key: DEBUG
         value: "false"
-      # AI Provider: replicate for production
+      # AI Provider: photofix delegates to backend.artimagehub.com
       - key: AI_PROVIDER
-        value: replicate
+        value: photofix
+      - key: PHOTOFIX_API_URL
+        value: https://backend.artimagehub.com
       # Frontend URL for CORS and checkout return URLs
       - key: FRONTEND_URL
         value: https://www.artimagehub.com
-      # Replicate AI (required when AI_PROVIDER=replicate)
-      - key: REPLICATE_API_TOKEN
+      # Alert email (payment failure notifications via Resend)
+      - key: RESEND_API_KEY
         sync: false  # Set in Render dashboard (sensitive)
       # Dodo Payments (primary one-time checkout provider)
       - key: DODO_PAYMENTS_API_KEY

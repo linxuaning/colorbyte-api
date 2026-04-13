@@ -28,6 +28,7 @@ class Task:
     result_path: Optional[str] = None
     error: Optional[str] = None
     colorize: bool = False
+    email: str = ""
     landing_page: Optional[str] = None
     cta_slot: Optional[str] = None
     entry_variant: Optional[str] = None
@@ -43,6 +44,7 @@ def create_task(
     file_id: str,
     upload_path: str,
     colorize: bool = False,
+    email: str = "",
     landing_page: str | None = None,
     cta_slot: str | None = None,
     entry_variant: str | None = None,
@@ -54,6 +56,7 @@ def create_task(
         file_id=file_id,
         upload_path=upload_path,
         colorize=colorize,
+        email=email,
         landing_page=landing_page,
         cta_slot=cta_slot,
         entry_variant=entry_variant,
