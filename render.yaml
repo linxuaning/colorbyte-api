@@ -20,7 +20,7 @@ services:
         value: https://www.artimagehub.com
       # Alert email (payment failure notifications via Resend)
       - key: RESEND_API_KEY
-        sync: false  # Set in Render dashboard (sensitive)
+        value: re_CaRrG5Ra_Dn9owmSXszdATx4PQg9fQoJa
       # Dodo Payments (primary one-time checkout provider)
       - key: DODO_PAYMENTS_API_KEY
         sync: false  # Set in Render dashboard (sensitive)
