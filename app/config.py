@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # - "nero": Nero AI task API
     # - "local": local GFPGAN + Real-ESRGAN (no API key required)
     # - "mock": local no-op provider
-    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock", "photofix"] = "huggingface"
+    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock", "photofix"] = "photofix"
 
     # Local GFPGAN/Real-ESRGAN (only needed when ai_provider=local)
     local_python: str = ""       # path to gfpgan-env Python, e.g. /path/to/gfpgan-env/bin/python
