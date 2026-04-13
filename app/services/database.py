@@ -114,6 +114,18 @@ def _init_metrics_postgres():
     logger.info("Metrics Postgres initialized")
 
 
+def _seed_owner_access():
+    """Grant the configured owner email paid access if not already active."""
+    from app.config import get_settings
+    owner_email = get_settings().alert_email_to
+    if not owner_email:
+        return
+    sub = get_subscription(owner_email)
+    if sub is None or sub["status"] not in ("active", "trialing", "on_trial"):
+        upsert_subscription(owner_email, payment_provider="seed", status="active")
+        logger.info("Owner access seeded: %s", owner_email)
+
+
 def init_db():
     """Create tables if they don't exist."""
     path = _get_db_path()
@@ -223,6 +235,8 @@ def init_db():
             _init_metrics_postgres()
         except Exception:
             logger.warning("Metrics Postgres initialization failed", exc_info=True)
+
+    _seed_owner_access()
 
 
 @contextmanager
