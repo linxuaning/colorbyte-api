@@ -202,7 +202,8 @@ class HuggingFaceProvider(AIProvider):
         raise RuntimeError("DeOldify unavailable")
 
     async def process_photo(
-        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
+        email: str = "",
     ) -> ProcessingResult:
         try:
             # Step 1: Face restoration (tries CodeFormer → multi-model → GFPGAN)
@@ -293,7 +294,8 @@ class HFInferenceProvider(AIProvider):
         return await asyncio.to_thread(_invoke)
 
     async def process_photo(
-        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
+        email: str = "",
     ) -> ProcessingResult:
         import logging
 
@@ -502,7 +504,8 @@ class ReplicateProvider(AIProvider):
         return result_url
 
     async def process_photo(
-        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
+        email: str = "",
     ) -> ProcessingResult:
         import httpx
         import logging
@@ -773,7 +776,8 @@ class NeroAIProvider(AIProvider):
         raise RuntimeError(f"Nero task {task_id} timed out after {self.MAX_POLLS * self.POLL_INTERVAL_SECONDS}s")
 
     async def process_photo(
-        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
+        email: str = "",
     ) -> ProcessingResult:
         import httpx
         import logging
@@ -864,7 +868,8 @@ class LocalGFPGANProvider(AIProvider):
         self.scale = scale
 
     async def process_photo(
-        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
+        email: str = "",
     ) -> ProcessingResult:
         import asyncio
         import logging
