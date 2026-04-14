@@ -72,6 +72,8 @@ class HuggingFaceProvider(AIProvider):
     RESTORE_SPACES: list[tuple[str, str]] = [
         # CodeFormer: image, bg_enhance, face_upsample, upscale, fidelity_weight
         ("sczhou/CodeFormer", "codeformer"),
+        ("jeff86/CodeFormer", "codeformer"),
+        ("PERCY001/CodeFormer", "codeformer"),
         # Multi-model spaces (avans06 forks) — use GFPGAN model within them
         ("avans06/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel"),
         ("titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel"),
@@ -80,6 +82,9 @@ class HuggingFaceProvider(AIProvider):
         ("nightfury/Image_Face_Upscale_Restoration-GFPGAN", "gfpgan"),
         ("leonelhs/GFPGAN", "gfpgan"),
         ("akhaliq/GFPGAN", "gfpgan"),
+        ("clem/Image_Face_Upscale_Restoration-GFPGAN", "gfpgan"),
+        ("Algoworks/Image_Face_Upscale_Restoration-GFPGAN_pub", "gfpgan"),
+        ("randomtable/Image-Restoration-GFPGAN", "gfpgan"),
     ]
 
     DEOLDIFY_SPACES = [
@@ -206,6 +211,9 @@ class HuggingFaceProvider(AIProvider):
         email: str = "",
     ) -> ProcessingResult:
         try:
+            import logging
+            logger = logging.getLogger("artimagehub.hf")
+
             # Step 1: Face restoration (tries CodeFormer → multi-model → GFPGAN)
             if progress_callback:
                 await progress_callback("Starting face restoration...", 10)
@@ -241,7 +249,12 @@ class HuggingFaceProvider(AIProvider):
             return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as e:
-            return ProcessingResult(success=False, error=str(e))
+            # All HF Spaces failed — fall back to PIL-based basic enhancement so
+            # the funnel never returns a hard error to a paying customer.
+            logger.warning("All HF Spaces failed (%s); applying PIL enhance fallback", e)
+            return await PILEnhanceProvider().process_photo(
+                input_path, output_path, colorize, progress_callback, email=email
+            )
 
 
 class HFInferenceProvider(AIProvider):
@@ -931,6 +944,57 @@ class LocalGFPGANProvider(AIProvider):
         except Exception as e:
             logger.error("Local GFPGAN processing failed: %s", e)
             return ProcessingResult(success=False, error=str(e))
+
+
+class PILEnhanceProvider(AIProvider):
+    """Last-resort fallback using only PIL for basic image enhancement.
+
+    No external API needed. Applies sharpening, contrast boost, and upscaling.
+    Not AI-based, but ensures the funnel never returns a hard error.
+    """
+
+    async def process_photo(
+        self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
+        email: str = "",
+    ) -> ProcessingResult:
+        import logging
+        logger = logging.getLogger("artimagehub.pil_enhance")
+
+        try:
+            from PIL import Image, ImageEnhance, ImageFilter
+
+            if progress_callback:
+                await progress_callback("Enhancing image...", 30)
+
+            def _enhance() -> None:
+                img = Image.open(input_path).convert("RGB")
+
+                # Upscale 2x with Lanczos
+                w, h = img.size
+                img = img.resize((w * 2, h * 2), Image.LANCZOS)
+
+                # Sharpen
+                img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=150, threshold=3))
+
+                # Contrast boost
+                img = ImageEnhance.Contrast(img).enhance(1.3)
+
+                # Brightness slight lift
+                img = ImageEnhance.Brightness(img).enhance(1.05)
+
+                img.save(output_path, "JPEG", quality=95)
+
+            await asyncio.to_thread(_enhance)
+
+            if progress_callback:
+                await progress_callback("Complete", 100)
+
+            logger.info("PIL enhance fallback succeeded")
+            return ProcessingResult(success=True, output_path=output_path)
+
+        except Exception as exc:
+            logger.error("PIL enhance failed: %s", exc)
+            return ProcessingResult(success=False, error=str(exc))
 
 
 class PhotoFixProvider(AIProvider):
