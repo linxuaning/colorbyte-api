@@ -1081,6 +1081,7 @@ class AIService:
     def __init__(self):
         settings = get_settings()
         provider = get_effective_ai_provider(settings)
+        self._fallback_provider: AIProvider | None = None
 
         if provider == "local":
             import logging
@@ -1123,6 +1124,8 @@ class AIService:
             self._provider: AIProvider = ReplicateProvider(settings.replicate_api_token)
         elif provider == "photofix":
             self._provider = PhotoFixProvider(settings.photofix_api_url, settings.internal_api_key)
+            # Auto-fallback: if photofix backend is down or returning errors, use HF Spaces
+            self._fallback_provider: AIProvider | None = HuggingFaceProvider()
         elif provider == "nero":
             self._provider = NeroAIProvider(settings.nero_api_key)
         elif provider == "hf_inference":
@@ -1145,9 +1148,18 @@ class AIService:
         progress_callback: ProgressCallback = None,
         email: str = "",
     ) -> ProcessingResult:
-        return await self._provider.process_photo(
+        import logging
+        result = await self._provider.process_photo(
             input_path, output_path, colorize, progress_callback, email=email,
         )
+        if not result.success and self._fallback_provider is not None:
+            logging.getLogger("artimagehub.ai").warning(
+                "Primary provider failed (%s), retrying with HuggingFace fallback", result.error
+            )
+            result = await self._fallback_provider.process_photo(
+                input_path, output_path, colorize, progress_callback, email=email,
+            )
+        return result
 
 
 _service: AIService | None = None
