@@ -941,8 +941,9 @@ class PhotoFixProvider(AIProvider):
     POLL_INTERVAL = 2      # seconds between polls
     MAX_POLL_TIME = 300    # 5 minutes max
 
-    def __init__(self, api_url: str):
+    def __init__(self, api_url: str, internal_api_key: str = ""):
         self.api_url = api_url.rstrip("/")
+        self.internal_api_key = internal_api_key
 
     async def process_photo(
         self,
@@ -987,9 +988,13 @@ class PhotoFixProvider(AIProvider):
                 mime = mimetypes.guess_type(input_path)[0] or "image/jpeg"
                 filename = Path(input_path).name
 
+                upload_data: dict = {"email": email or ""}
+                if self.internal_api_key:
+                    upload_data["internal_key"] = self.internal_api_key
+
                 upload_resp = await http.post(
                     f"{self.api_url}/api/upload",
-                    data={"email": email or ""},
+                    data=upload_data,
                     files={"file": (filename, content, mime)},
                     timeout=httpx.Timeout(120.0, connect=10.0),
                 )
@@ -1078,6 +1083,7 @@ class AIService:
         provider = get_effective_ai_provider(settings)
 
         if provider == "local":
+            import logging
             import os
 
             python_path = settings.local_python
@@ -1089,18 +1095,23 @@ class AIService:
                 here = Path(__file__).resolve()
                 inference_script = str(here.parent.parent.parent.parent / "scripts" / "gfpgan_inference.py")
 
-            if not python_path or not os.path.exists(python_path):
-                raise RuntimeError(
-                    "LOCAL_PYTHON must be set to the gfpgan-env Python path when ai_provider=local. "
-                    f"Got: {python_path!r}"
+            _local_ok = (
+                python_path
+                and os.path.exists(python_path)
+                and models_dir
+                and os.path.exists(models_dir)
+                and os.path.exists(inference_script)
+            )
+
+            if not _local_ok:
+                # Local GFPGAN not configured — fall back to free HuggingFace Spaces
+                logging.getLogger("artimagehub.ai").warning(
+                    "AI_PROVIDER=local but local environment is not ready "
+                    "(LOCAL_PYTHON=%r, LOCAL_MODELS_DIR=%r) — falling back to huggingface",
+                    python_path, models_dir,
                 )
-            if not models_dir or not os.path.exists(models_dir):
-                raise RuntimeError(
-                    "LOCAL_MODELS_DIR must be set to the directory with .pth files when ai_provider=local. "
-                    f"Got: {models_dir!r}"
-                )
-            if not os.path.exists(inference_script):
-                raise RuntimeError(f"Inference script not found: {inference_script!r}")
+                self._provider: AIProvider = HuggingFaceProvider()
+                return
 
             self._provider: AIProvider = LocalGFPGANProvider(
                 python_path=python_path,
@@ -1111,7 +1122,7 @@ class AIService:
         elif provider == "replicate":
             self._provider: AIProvider = ReplicateProvider(settings.replicate_api_token)
         elif provider == "photofix":
-            self._provider = PhotoFixProvider(settings.photofix_api_url)
+            self._provider = PhotoFixProvider(settings.photofix_api_url, settings.internal_api_key)
         elif provider == "nero":
             self._provider = NeroAIProvider(settings.nero_api_key)
         elif provider == "hf_inference":

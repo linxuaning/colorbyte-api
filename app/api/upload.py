@@ -31,25 +31,32 @@ async def upload_image(
     cta_slot: str = Form(""),
     entry_variant: str = Form(""),
     checkout_source: str = Form(""),
+    internal_key: str = Form(""),
 ):
     """
     Upload an image for AI restoration.
     Accepts JPG, PNG, WEBP up to 20MB.
     Upload and processing are only available after payment with the same email.
+    Internal service-to-service calls may pass internal_key to bypass the payment check.
     """
+    from app.config import get_settings
+    settings = get_settings()
+    is_internal = bool(internal_key and internal_key == settings.internal_api_key)
+
     normalized_email = email.strip().lower()
 
-    if not normalized_email:
-        raise HTTPException(
-            status_code=402,
-            detail="Paid access is required before upload and processing. Complete checkout first, then return with the same email.",
-        )
+    if not is_internal:
+        if not normalized_email:
+            raise HTTPException(
+                status_code=402,
+                detail="Paid access is required before upload and processing. Complete checkout first, then return with the same email.",
+            )
 
-    if not is_user_active(normalized_email):
-        raise HTTPException(
-            status_code=402,
-            detail="Paid access is required before upload and processing. Complete checkout with this email, then return to start.",
-        )
+        if not is_user_active(normalized_email):
+            raise HTTPException(
+                status_code=402,
+                detail="Paid access is required before upload and processing. Complete checkout with this email, then return to start.",
+            )
 
     # Validate file type
     allowed_types = ["image/jpeg", "image/png", "image/webp"]

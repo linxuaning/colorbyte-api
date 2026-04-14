@@ -30,6 +30,8 @@ class Settings(BaseSettings):
 
     # PhotoFix backend (only needed when ai_provider=photofix)
     photofix_api_url: str = "https://backend.artimagehub.com"
+    # Internal API key for service-to-service calls (bypasses payment check)
+    internal_api_key: str = "artimagehub-internal-2026"
 
     # Replicate AI (only needed when ai_provider=replicate)
     replicate_api_token: str = ""
