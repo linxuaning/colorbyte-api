@@ -10,11 +10,9 @@ services:
       # App
       - key: DEBUG
         value: "false"
-      # AI Provider: photofix delegates to backend.artimagehub.com
+      # AI Provider: huggingface uses HF Spaces directly (no external backend dependency)
       - key: AI_PROVIDER
-        value: photofix
-      - key: PHOTOFIX_API_URL
-        value: https://backend.artimagehub.com
+        value: huggingface
       # Frontend URL for CORS and checkout return URLs
       - key: FRONTEND_URL
         value: https://www.artimagehub.com
