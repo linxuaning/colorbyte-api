@@ -12,6 +12,7 @@ from app.services.task_store import create_task, update_task, TaskStatus
 from app.services.ai_service import get_ai_service
 from app.services.storage import RESULT_DIR
 from app.services.database import is_user_active, record_processing_complete
+from app.services.alert_email import send_payment_failure_alert
 
 router = APIRouter()
 
@@ -154,6 +155,12 @@ async def _process_task(task_id: str):
                 error=result.error or "Processing failed",
             )
             logger.warning("Task %s failed: %s", task_id, result.error)
+            send_payment_failure_alert(
+                alert_type="processing_failed",
+                customer_email=task.email,
+                error_msg=result.error or "Processing failed",
+                extra={"task_id": task_id},
+            )
     except Exception as exc:
         logger.exception("Task %s crashed: %s", task_id, exc)
         update_task(
@@ -161,4 +168,10 @@ async def _process_task(task_id: str):
             status=TaskStatus.FAILED,
             stage="Failed",
             error=f"Unexpected error: {exc}",
+        )
+        send_payment_failure_alert(
+            alert_type="processing_failed",
+            customer_email=task.email,
+            error_msg=str(exc),
+            extra={"task_id": task_id},
         )
