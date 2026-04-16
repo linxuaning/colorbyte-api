@@ -52,7 +52,7 @@ from app.services.storage import save_upload
 from app.services.task_store import create_task, update_task, TaskStatus
 from app.services.ai_service import get_ai_service
 from app.services.storage import RESULT_DIR
-from app.services.database import is_user_active, record_processing_complete
+from app.services.database import record_processing_complete
 from app.services.alert_email import send_payment_failure_alert
 
 router = APIRouter()
@@ -77,28 +77,10 @@ async def upload_image(
 ):
     """
     Upload an image for AI restoration.
-    Accepts JPG, PNG, WEBP up to 20MB.
-    Upload and processing are only available after payment with the same email.
-    Internal service-to-service calls may pass internal_key to bypass the payment check.
+    Accepts JPG, PNG, WEBP up to 20MB. Upload is free — payment is required
+    only to download the full-resolution result.
     """
-    from app.config import get_settings
-    settings = get_settings()
-    is_internal = bool(internal_key and internal_key == settings.internal_api_key)
-
     normalized_email = email.strip().lower()
-
-    if not is_internal:
-        if not normalized_email:
-            raise HTTPException(
-                status_code=402,
-                detail="Paid access is required before upload and processing. Complete checkout first, then return with the same email.",
-            )
-
-        if not is_user_active(normalized_email):
-            raise HTTPException(
-                status_code=402,
-                detail="Paid access is required before upload and processing. Complete checkout with this email, then return to start.",
-            )
 
     # Validate file type
     allowed_types = ["image/jpeg", "image/png", "image/webp"]
