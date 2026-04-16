@@ -1,12 +1,21 @@
 """
-In-memory task store for MVP.
-Tracks photo processing tasks and their status.
+File-backed task store.
+Tasks are persisted to tasks/{task_id}.json so they survive Render OOM restarts.
+In-memory dict is the hot path; disk is the source of truth on startup.
 """
+import json
 import uuid
 import time
+import logging
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("artimagehub.task_store")
+
+TASK_DIR = Path("tasks")
+TASK_DIR.mkdir(exist_ok=True)
 
 
 class TaskStatus(str, Enum):
@@ -36,8 +45,50 @@ class Task:
     created_at: float = field(default_factory=time.time)
 
 
-# In-memory store
+# In-memory hot cache
 _tasks: dict[str, Task] = {}
+
+
+def _task_path(task_id: str) -> Path:
+    return TASK_DIR / f"{task_id}.json"
+
+
+def _save_task(task: Task) -> None:
+    try:
+        data = asdict(task)
+        _task_path(task.id).write_text(json.dumps(data))
+    except Exception as exc:
+        logger.warning("task_store: failed to persist task %s: %s", task.id, exc)
+
+
+def _load_task_from_disk(task_id: str) -> Optional[Task]:
+    path = _task_path(task_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        data["status"] = TaskStatus(data["status"])
+        return Task(**data)
+    except Exception as exc:
+        logger.warning("task_store: failed to load task %s from disk: %s", task_id, exc)
+        return None
+
+
+def _boot_load() -> None:
+    """Load all persisted tasks into memory on startup."""
+    loaded = 0
+    for p in TASK_DIR.glob("*.json"):
+        task_id = p.stem
+        task = _load_task_from_disk(task_id)
+        if task is not None:
+            _tasks[task_id] = task
+            loaded += 1
+    if loaded:
+        logger.info("task_store: restored %d tasks from disk", loaded)
+
+
+# Run on import
+_boot_load()
 
 
 def create_task(
@@ -63,11 +114,19 @@ def create_task(
         checkout_source=checkout_source,
     )
     _tasks[task_id] = task
+    _save_task(task)
     return task
 
 
 def get_task(task_id: str) -> Task | None:
-    return _tasks.get(task_id)
+    task = _tasks.get(task_id)
+    if task is not None:
+        return task
+    # Hot cache miss — try disk (handles cold restarts)
+    task = _load_task_from_disk(task_id)
+    if task is not None:
+        _tasks[task_id] = task
+    return task
 
 
 def update_task(
@@ -78,7 +137,7 @@ def update_task(
     result_path: str | None = None,
     error: str | None = None,
 ) -> Task | None:
-    task = _tasks.get(task_id)
+    task = get_task(task_id)
     if task is None:
         return None
     if status is not None:
@@ -91,6 +150,7 @@ def update_task(
         task.result_path = result_path
     if error is not None:
         task.error = error
+    _save_task(task)
     return task
 
 

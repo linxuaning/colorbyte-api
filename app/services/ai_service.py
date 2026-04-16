@@ -867,18 +867,21 @@ class NeroAIProvider(AIProvider):
 
 
 class LocalGFPGANProvider(AIProvider):
-    """Local GFPGAN + Real-ESRGAN provider — no API key required.
+    """Local CodeFormer/GFPGAN + Real-ESRGAN + DDColor provider — no API key required.
 
     Runs inference in a subprocess using a dedicated Python env that has
-    gfpgan/realesrgan installed (separate from the backend's venv to avoid
+    gfpgan/realesrgan/ddcolor installed (separate from the backend's venv to avoid
     heavy ML dependency conflicts).
     """
 
-    def __init__(self, python_path: str, models_dir: str, inference_script: str, scale: int = 2):
+    def __init__(self, python_path: str, models_dir: str, inference_script: str,
+                 scale: int = 2, face_model: str = "codeformer", fidelity: float = 0.7):
         self.python_path = python_path
         self.models_dir = models_dir
         self.inference_script = inference_script
         self.scale = scale
+        self.face_model = face_model
+        self.fidelity = fidelity
 
     async def process_photo(
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
@@ -887,19 +890,13 @@ class LocalGFPGANProvider(AIProvider):
         import asyncio
         import logging
 
-        logger = logging.getLogger("artimagehub.local_gfpgan")
+        logger = logging.getLogger("artimagehub.local_restore")
 
-        stages = [
-            ("Loading models...", 10),
-            ("Enhancing faces (GFPGAN)...", 30),
-            ("Upscaling (Real-ESRGAN)...", 70),
-            ("Generating result...", 90),
-        ]
+        face_label = "CodeFormer" if self.face_model == "codeformer" else "GFPGAN"
 
         try:
-            for stage, progress in stages[:2]:
-                if progress_callback:
-                    await progress_callback(stage, progress)
+            if progress_callback:
+                await progress_callback("Loading models...", 10)
 
             cmd = [
                 self.python_path,
@@ -907,19 +904,32 @@ class LocalGFPGANProvider(AIProvider):
                 "--input", input_path,
                 "--output", output_path,
                 "--models-dir", self.models_dir,
+                "--face-model", self.face_model,
+                "--fidelity", str(self.fidelity),
                 "--scale", str(self.scale),
             ]
+            if colorize:
+                cmd.append("--colorize")
 
-            logger.info("Running local GFPGAN: %s", " ".join(cmd))
+            # Set PYTHONPATH so the script can find CodeFormer's custom modules
+            env = os.environ.copy()
+            codeformer_dir = os.path.join(os.path.dirname(self.models_dir), "CodeFormer")
+            env["PYTHONPATH"] = codeformer_dir + ":" + env.get("PYTHONPATH", "")
+
+            logger.info("Running local restore: %s", " ".join(cmd))
+
+            if progress_callback:
+                await progress_callback(f"Restoring faces ({face_label})...", 25)
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
 
             if progress_callback:
-                await progress_callback("Restoring photo locally...", 50)
+                await progress_callback(f"Upscaling (Real-ESRGAN)...", 50)
 
             stdout, stderr = await proc.communicate()
             stdout_text = stdout.decode().strip()
@@ -928,13 +938,13 @@ class LocalGFPGANProvider(AIProvider):
             if stderr_text:
                 for line in stderr_text.splitlines():
                     if line.startswith("[info]") or line.startswith("[warn]"):
-                        logger.info("gfpgan: %s", line)
+                        logger.info("restore: %s", line)
 
             last_line = stdout_text.splitlines()[-1].strip() if stdout_text else ""
             if proc.returncode != 0 or last_line != "SUCCESS":
                 error_lines = [l for l in stdout_text.splitlines() if l.startswith("ERROR")]
                 error_detail = error_lines[-1] if error_lines else (stderr_text.splitlines()[-1] if stderr_text else "unknown")
-                raise RuntimeError(f"Local GFPGAN failed (exit {proc.returncode}): {error_detail}")
+                raise RuntimeError(f"Local restore failed (exit {proc.returncode}): {error_detail}")
 
             if progress_callback:
                 await progress_callback("Complete", 100)
@@ -942,7 +952,7 @@ class LocalGFPGANProvider(AIProvider):
             return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as e:
-            logger.error("Local GFPGAN processing failed: %s", e)
+            logger.error("Local restore processing failed: %s", e)
             return ProcessingResult(success=False, error=str(e))
 
 
@@ -1046,12 +1056,9 @@ class PhotoFixProvider(AIProvider):
                     except Exception as exc:
                         logger.warning("PhotoFix: admin-set-subscriber failed (continuing): %s", exc)
 
-                # Step 2: upload image
+                # Step 2: upload image (stream from disk to avoid loading full file in memory)
                 if progress_callback:
                     await progress_callback("Uploading to PhotoFix...", 10)
-
-                with open(input_path, "rb") as fh:
-                    content = fh.read()
 
                 import mimetypes
                 mime = mimetypes.guess_type(input_path)[0] or "image/jpeg"
@@ -1061,12 +1068,13 @@ class PhotoFixProvider(AIProvider):
                 if self.internal_api_key:
                     upload_data["internal_key"] = self.internal_api_key
 
-                upload_resp = await http.post(
-                    f"{self.api_url}/api/upload",
-                    data=upload_data,
-                    files={"file": (filename, content, mime)},
-                    timeout=httpx.Timeout(120.0, connect=10.0),
-                )
+                with open(input_path, "rb") as fh:
+                    upload_resp = await http.post(
+                        f"{self.api_url}/api/upload",
+                        data=upload_data,
+                        files={"file": (filename, fh, mime)},
+                        timeout=httpx.Timeout(120.0, connect=10.0),
+                    )
                 if not upload_resp.is_success:
                     detail = ""
                     try:
@@ -1122,16 +1130,19 @@ class PhotoFixProvider(AIProvider):
                 else:
                     raise RuntimeError("PhotoFix processing timed out after 5 minutes.")
 
-                # Step 4: download result
+                # Step 4: stream result to disk (avoid holding full image in memory)
                 if progress_callback:
                     await progress_callback("Downloading result...", 95)
 
-                download_resp = await http.get(
+                async with http.stream(
+                    "GET",
                     f"{self.api_url}/api/download/{remote_task_id}",
                     timeout=httpx.Timeout(120.0, connect=10.0),
-                )
-                download_resp.raise_for_status()
-                Path(output_path).write_bytes(download_resp.content)
+                ) as download_resp:
+                    download_resp.raise_for_status()
+                    with open(output_path, "wb") as out_fh:
+                        async for chunk in download_resp.aiter_bytes(chunk_size=65536):
+                            out_fh.write(chunk)
 
                 if progress_callback:
                     await progress_callback("Complete", 100)
@@ -1160,10 +1171,10 @@ class AIService:
             models_dir = settings.local_models_dir
             inference_script = settings.local_inference_script
 
-            # Auto-detect script location relative to this file: ../../scripts/gfpgan_inference.py
+            # Auto-detect script location relative to this file: ../../scripts/codeformer_pipeline.py
             if not inference_script:
                 here = Path(__file__).resolve()
-                inference_script = str(here.parent.parent.parent.parent / "scripts" / "gfpgan_inference.py")
+                inference_script = str(here.parent.parent.parent.parent / "scripts" / "codeformer_pipeline.py")
 
             _local_ok = (
                 python_path
@@ -1188,6 +1199,8 @@ class AIService:
                 models_dir=models_dir,
                 inference_script=inference_script,
                 scale=settings.local_scale,
+                face_model=settings.local_face_model,
+                fidelity=settings.local_fidelity,
             )
         elif provider == "replicate":
             self._provider: AIProvider = ReplicateProvider(settings.replicate_api_token)

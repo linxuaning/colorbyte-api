@@ -58,13 +58,7 @@ def _create_preview(source_path: str, task_id: str) -> str:
     # Resize to fit within 1280x720 while keeping aspect ratio
     img.thumbnail((MAX_FREE_WIDTH, MAX_FREE_HEIGHT), Image.LANCZOS)
 
-    # Add watermark
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
     watermark_text = "ArtImageHub.com"
-
-    # Try to use a reasonable font size relative to image
     font_size = max(16, img.width // 25)
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
@@ -74,30 +68,34 @@ def _create_preview(source_path: str, task_id: str) -> str:
         except (OSError, IOError):
             font = ImageFont.load_default()
 
-    # Get text bounding box
+    # Draw watermark directly on an RGBA copy, then flatten to RGB
+    # This keeps peak memory to 2 image objects instead of 4
+    img_rgba = img.convert("RGBA")
+    del img  # free the RGB copy immediately
+
+    overlay = Image.new("RGBA", img_rgba.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
     bbox = draw.textbbox((0, 0), watermark_text, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-
-    # Position: bottom-right with padding
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
     padding = 15
-    x = img.width - text_width - padding
-    y = img.height - text_height - padding
-
-    # Semi-transparent white text with dark shadow for readability
+    x = img_rgba.width - text_w - padding
+    y = img_rgba.height - text_h - padding
     draw.text((x + 1, y + 1), watermark_text, fill=(0, 0, 0, 100), font=font)
     draw.text((x, y), watermark_text, fill=(255, 255, 255, 150), font=font)
 
-    # Composite watermark onto image
-    img_rgba = img.convert("RGBA")
-    img_rgba = Image.alpha_composite(img_rgba, overlay)
-    img_final = img_rgba.convert("RGB")
+    composited = Image.alpha_composite(img_rgba, overlay)
+    del img_rgba
+    del overlay
 
-    # Save to temp file
+    img_final = composited.convert("RGB")
+    del composited
+
     temp_dir = Path(tempfile.gettempdir()) / "artimagehub_previews"
     temp_dir.mkdir(exist_ok=True)
     preview_path = str(temp_dir / f"{task_id}_720p.jpg")
     img_final.save(preview_path, "JPEG", quality=85)
+    del img_final
 
     return preview_path
 

@@ -3,9 +3,50 @@ Upload API endpoint.
 Handles image upload and kicks off processing for the pay-first workflow.
 """
 import asyncio
+import io
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form
+from PIL import Image as PILImage
 from pydantic import BaseModel
+
+# Cap longest edge to reduce Render free-tier memory pressure
+_MAX_INPUT_LONG_EDGE = 1200   # cap uploaded input before AI processing
+_MAX_RESULT_LONG_EDGE = 1600  # cap AI result before saving (upscalers can 4× the size)
+
+
+def _resize_if_needed(content: bytes) -> bytes:
+    """Resize image so longest edge ≤ _MAX_INPUT_LONG_EDGE, re-encode as JPEG 85%.
+    Returns original bytes unchanged on any error."""
+    try:
+        img = PILImage.open(io.BytesIO(content))
+        w, h = img.size
+        if max(w, h) <= _MAX_INPUT_LONG_EDGE:
+            return content
+        scale = _MAX_INPUT_LONG_EDGE / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+    except Exception:
+        return content
+
+
+def _cap_result_image(path: str) -> None:
+    """Cap result image longest edge ≤ _MAX_RESULT_LONG_EDGE in-place. No-op on error."""
+    try:
+        img = PILImage.open(path)
+        w, h = img.size
+        if max(w, h) <= _MAX_RESULT_LONG_EDGE:
+            return
+        scale = _MAX_RESULT_LONG_EDGE / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        img.save(path, format="JPEG", quality=85)
+    except Exception:
+        pass
 
 from app.services.storage import save_upload
 from app.services.task_store import create_task, update_task, TaskStatus
@@ -75,6 +116,9 @@ async def upload_image(
     if len(content) < 100:
         raise HTTPException(status_code=400, detail="File too small or corrupt.")
 
+    # Resize to reduce memory pressure on Render free tier
+    content = _resize_if_needed(content)
+
     # Save to local storage
     file_id, upload_path = await save_upload(content, file.content_type)
 
@@ -130,6 +174,9 @@ async def _process_task(task_id: str):
         )
 
         if result.success:
+            # Cap result image size to prevent OOM on download/preview serving
+            _cap_result_image(result.output_path)
+
             mode = "colorize" if task.colorize else "restore"
             record_processing_complete(
                 task_id=task_id,
