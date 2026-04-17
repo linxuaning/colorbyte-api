@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """Audit HuggingFace Spaces used by the AI pipeline.
 
-Checks each Space's runtime state and API endpoints. Intended to run on a
-schedule (GitHub Actions cron) so we catch upstream breakage before a paying
-user hits "Something went wrong".
+Runs on a schedule (GitHub Actions cron) to catch upstream breakage before a
+paying user hits "Something went wrong".
+
+Spaces tracked here are a hand-maintained mirror of the list in
+`app/services/ai_service.py` (HuggingFaceProvider.RESTORE_SPACES / DEOLDIFY_SPACES
+/ ESRGAN_SPACES). Keeping them in sync is deliberate — the audit must be
+runnable in minimal environments (CI, ops box) with ONLY gradio_client
+installed, no backend Python deps.
+
+If the production code changes its Space list, update SPACES below.
 
 Exit codes:
-  0 = all critical spaces healthy
-  1 = at least one critical space is broken (will fire alert email if configured)
-
-A "critical" space is one in RESTORE_SPACES[0] (the primary face-restorer).
-Secondary spaces + colorization spaces are monitored but non-critical.
+  0 = primary restore Space healthy
+  1 = primary restore Space is broken (fires alert email if RESEND_API_KEY set)
 
 Env:
   RESEND_API_KEY    — if set, send alert email on critical failure
-  ALERT_EMAIL_TO    — recipient (default: creator)
+  ALERT_EMAIL_TO    — recipient (default: linxuaning98@gmail.com)
   ALERT_EMAIL_FROM  — sender (default: onboarding@resend.dev)
-
-Run:
-  python3 photofix/backend/scripts/hf-spaces-audit.py
 """
 from __future__ import annotations
 
@@ -27,15 +28,31 @@ import os
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-BACKEND_ROOT = REPO_ROOT / "photofix" / "backend"
-sys.path.insert(0, str(BACKEND_ROOT))
+# Mirror of app.services.ai_service.HuggingFaceProvider.*_SPACES (audited 2026-04-17).
+# When ai_service.py changes, update these tuples.
+RESTORE_SPACES = [
+    # (space_id, space_type, api_endpoint)
+    ("sczhou/CodeFormer", "codeformer_v2", "/inference"),
+    ("PERCY001/CodeFormer", "codeformer_v2", "/predict"),
+    ("avans06/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
+    ("titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
+]
 
-STATE_PATH = BACKEND_ROOT / "docs" / "hf-spaces-audit.json"
+COLORIZE_SPACES = [
+    ("ialhashim/Colorizer", "single_arg"),
+]
+
+ESRGAN_SPACES = [
+    ("Fabrice-TIERCELIN/RealESRGAN", "size_modifier"),
+    ("guetLzy/Real-ESRGAN-Demo", "enhance_full"),
+    ("doevent/Face-Real-ESRGAN", "single_arg"),
+]
+
+# State file — written to CI artifact dir when run in GH Actions, else local.
+STATE_PATH = Path(os.environ.get("HF_AUDIT_STATE_PATH", "hf-spaces-audit.json"))
 
 
-def probe_space(space_id: str) -> dict:
-    """Connect to a Space and capture endpoints + health."""
+def probe(space_id: str) -> dict:
     from gradio_client import Client
     try:
         client = Client(space_id, verbose=False)
@@ -50,57 +67,44 @@ def probe_space(space_id: str) -> dict:
 
 
 def main() -> int:
-    # Discover the list of Spaces from the running code so the audit stays in
-    # sync with whatever the provider imports today.
-    from app.services.ai_service import HuggingFaceProvider
-
-    restore = list(HuggingFaceProvider.RESTORE_SPACES)
-    colorize = list(HuggingFaceProvider.DEOLDIFY_SPACES)
-    esrgan = list(HuggingFaceProvider.ESRGAN_SPACES)
-
-    report: dict = {
-        "restore": [],
-        "colorize": [],
-        "esrgan": [],
-        "critical_failed": False,
-    }
+    report: dict = {"restore": [], "colorize": [], "esrgan": [], "critical_failed": False}
 
     print("== RESTORE ==")
-    for i, entry in enumerate(restore):
-        sid = entry[0] if isinstance(entry, tuple) else str(entry)
-        r = probe_space(sid)
+    for i, entry in enumerate(RESTORE_SPACES):
+        sid = entry[0]
+        r = probe(sid)
         r["space_id"] = sid
         r["critical"] = i == 0
         report["restore"].append(r)
-        marker = "✓" if r["status"] == "ok" else "✗"
-        print(f"  {marker} {sid:<80} {r.get('endpoints') or r.get('error_type')}")
+        marker = "OK" if r["status"] == "ok" else "FAIL"
+        print(f"  [{marker}] {sid:<70} {r.get('endpoints') or r.get('error_type')}")
         if i == 0 and r["status"] != "ok":
             report["critical_failed"] = True
 
     print("\n== COLORIZE ==")
-    for entry in colorize:
-        sid = entry[0] if isinstance(entry, tuple) else str(entry)
-        r = probe_space(sid)
+    for entry in COLORIZE_SPACES:
+        sid = entry[0]
+        r = probe(sid)
         r["space_id"] = sid
         report["colorize"].append(r)
-        marker = "✓" if r["status"] == "ok" else "✗"
-        print(f"  {marker} {sid:<80} {r.get('endpoints') or r.get('error_type')}")
+        marker = "OK" if r["status"] == "ok" else "FAIL"
+        print(f"  [{marker}] {sid:<70} {r.get('endpoints') or r.get('error_type')}")
 
     print("\n== ESRGAN ==")
-    for sid in esrgan:
-        r = probe_space(sid)
+    for entry in ESRGAN_SPACES:
+        sid = entry[0]
+        r = probe(sid)
         r["space_id"] = sid
         report["esrgan"].append(r)
-        marker = "✓" if r["status"] == "ok" else "✗"
-        print(f"  {marker} {sid:<80} {r.get('endpoints') or r.get('error_type')}")
+        marker = "OK" if r["status"] == "ok" else "FAIL"
+        print(f"  [{marker}] {sid:<70} {r.get('endpoints') or r.get('error_type')}")
 
-    # Write state
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"\nState → {STATE_PATH.relative_to(REPO_ROOT)}")
+    print(f"\nState -> {STATE_PATH}")
 
     if report["critical_failed"]:
-        print("\n⚠ CRITICAL Space failed. Sending alert if configured…")
+        print("\nCRITICAL Space failed. Sending alert if configured...")
         send_alert(report)
         return 1
     return 0
@@ -122,23 +126,25 @@ def send_alert(report: dict) -> None:
         "<h2>HF Spaces audit — critical failure</h2>",
         "<p>Primary face-restoration Space is down. Users will hit slow/failed processing.</p>",
         "<h3>Failed restore Spaces</h3><ul>",
-        *[f"<li>{r['space_id']} — {r.get('error_type', 'unknown')}: "
-          f"{(r.get('error') or '')[:200]}</li>" for r in failed_restore],
-        "</ul>",
     ]
-    if failed_colorize:
-        lines += ["<h3>Failed colorize Spaces</h3><ul>"]
-        lines += [
+    for r in failed_restore:
+        lines.append(
             f"<li>{r['space_id']} — {r.get('error_type', 'unknown')}: "
             f"{(r.get('error') or '')[:200]}</li>"
-            for r in failed_colorize
-        ]
+        )
+    lines.append("</ul>")
+    if failed_colorize:
+        lines.append("<h3>Failed colorize Spaces</h3><ul>")
+        for r in failed_colorize:
+            lines.append(
+                f"<li>{r['space_id']} — {r.get('error_type', 'unknown')}: "
+                f"{(r.get('error') or '')[:200]}</li>"
+            )
         lines.append("</ul>")
-
     lines.append(
         "<p>Next steps: update signatures in "
-        "<code>photofix/backend/app/services/ai_service.py</code> "
-        "or switch AI_PROVIDER to Replicate.</p>"
+        "<code>photofix/backend/app/services/ai_service.py</code> and the "
+        "mirror list in <code>scripts/hf-spaces-audit.py</code>.</p>"
     )
 
     import urllib.request
@@ -151,10 +157,7 @@ def send_alert(report: dict) -> None:
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=body,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         method="POST",
     )
     try:
