@@ -67,70 +67,91 @@ class HuggingFaceProvider(AIProvider):
     If CodeFormer succeeds, skip separate ESRGAN step (it already upscales).
     """
 
-    # Each entry: (space_id, call_fn, includes_upscale)
-    # call_fn takes (handle_file(path),) and returns predict args
-    RESTORE_SPACES: list[tuple[str, str]] = [
-        # CodeFormer: image, bg_enhance, face_upsample, upscale, fidelity_weight
-        ("sczhou/CodeFormer", "codeformer"),
-        ("jeff86/CodeFormer", "codeformer"),
-        ("PERCY001/CodeFormer", "codeformer"),
-        # Multi-model spaces (avans06 forks) — use GFPGAN model within them
-        ("avans06/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel"),
-        ("titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel"),
-        # GFPGAN-only spaces
-        ("Xintao/GFPGAN", "gfpgan"),
-        ("nightfury/Image_Face_Upscale_Restoration-GFPGAN", "gfpgan"),
-        ("leonelhs/GFPGAN", "gfpgan"),
-        ("akhaliq/GFPGAN", "gfpgan"),
-        ("clem/Image_Face_Upscale_Restoration-GFPGAN", "gfpgan"),
-        ("Algoworks/Image_Face_Upscale_Restoration-GFPGAN_pub", "gfpgan"),
-        ("randomtable/Image-Restoration-GFPGAN", "gfpgan"),
+    # Each entry: (space_id, space_type, api_endpoint)
+    # Audited 2026-04-17: most GFPGAN-only spaces are dead (RUNTIME_ERROR) and the
+    # CodeFormer / multimodel APIs added a required `face_align` parameter.
+    RESTORE_SPACES: list[tuple[str, str, str]] = [
+        # CodeFormer v2: (image, face_align, bg_enhance, face_upsample, upscale, fidelity)
+        ("sczhou/CodeFormer", "codeformer_v2", "/inference"),
+        ("PERCY001/CodeFormer", "codeformer_v2", "/predict"),
+        # Multi-model spaces (gallery-based /inference API)
+        ("avans06/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
+        ("titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
     ]
 
     DEOLDIFY_SPACES = [
         "jantic/DeOldify",
     ]
 
-    async def _try_space(self, space_id: str, space_type: str, input_path: str) -> tuple[str, bool]:
+    async def _try_space(
+        self, space_id: str, space_type: str, input_path: str, api_endpoint: str = "/predict"
+    ) -> tuple[str, bool]:
         """Try a single Space. Returns (output_path, includes_upscale)."""
         from gradio_client import Client, handle_file
 
         client = Client(space_id, verbose=False)
         img = handle_file(input_path)
 
-        if space_type == "codeformer":
-            # CodeFormer: image, bg_enhance, face_upsample, upscale_factor, codeformer_fidelity
+        if space_type == "codeformer_v2":
+            # Current CodeFormer signature (audited 2026-04-17):
+            # predict(image, face_align, background_enhance, face_upsample, upscale, codeformer_fidelity)
             result = await asyncio.to_thread(
                 client.predict,
                 img,
+                True,    # face_align
                 True,    # background_enhance
                 True,    # face_upsample
-                2,       # rescaling_factor
+                2,       # upscale
                 0.7,     # codeformer_fidelity (0=quality, 1=fidelity)
-                api_name="/predict",
+                api_name=api_endpoint,
             )
+            # sczhou/CodeFormer returns (output, markdown), PERCY001 returns output only
+            if isinstance(result, tuple):
+                result = result[0]
+            # Output may be a dict with path/url (new gradio) or raw path string
+            if isinstance(result, dict):
+                result = result.get("path") or result.get("url") or str(result)
             return str(result), True  # CodeFormer includes upscale
 
-        elif space_type == "multimodel":
-            # avans06 multi-model: image, model_name, rescale
+        elif space_type == "multimodel_v2":
+            # avans06/titanito multi-model: gallery-based /inference
+            # Signature: (gallery, face_restoration, upscale_model, scale, face_detection,
+            #             threshold, center_only, output_with_name, [save_as_png])
+            gallery = [{"image": img}]
+            args = [
+                gallery,
+                "GFPGANv1.4.pth",                          # face_restoration
+                "SRVGG, realesr-general-x4v3.pth",         # upscale_model
+                2,                                          # scale
+                "retinaface_resnet50",                     # face_detection
+                10,                                         # threshold
+                False,                                      # center_only
+                False,                                      # output_with_model_name
+            ]
+            # avans06 variant also requires save_as_png; titanito does not
+            if space_id.startswith("avans06/"):
+                args.append(False)
             result = await asyncio.to_thread(
-                client.predict,
-                img,
-                "CodeFormer",  # model selection
-                2,             # rescale factor
-                api_name="/predict",
+                client.predict, *args, api_name=api_endpoint
             )
+            # Returns (gallery_output, download_file); grab first gallery entry
+            if isinstance(result, tuple):
+                result = result[0]
+            if isinstance(result, list) and result:
+                first = result[0]
+                if isinstance(first, dict):
+                    inner = first.get("image", first)
+                    if isinstance(inner, dict):
+                        result = inner.get("path") or inner.get("url") or ""
+                    else:
+                        result = inner
+                else:
+                    result = first
+            elif isinstance(result, dict):
+                result = result.get("path") or result.get("url") or str(result)
+            if not result:
+                raise RuntimeError("multimodel returned empty output")
             return str(result), True  # includes upscale
-
-        else:  # gfpgan
-            result = await asyncio.to_thread(
-                client.predict,
-                img,
-                "v1.4",  # version
-                2,        # rescaling_factor
-                api_name="/predict",
-            )
-            return str(result), False  # GFPGAN alone doesn't super-resolve well
 
     async def _restore_face(self, input_path: str, progress_callback: ProgressCallback) -> tuple[str, bool]:
         """Try face restoration Spaces with fallback. Returns (path, did_upscale)."""
@@ -138,14 +159,16 @@ class HuggingFaceProvider(AIProvider):
         logger = logging.getLogger("artimagehub.hf")
         errors = []
 
-        for space_id, space_type in self.RESTORE_SPACES:
+        for space_id, space_type, api_endpoint in self.RESTORE_SPACES:
             try:
-                logger.info("Trying %s (%s)...", space_id, space_type)
+                logger.info("Trying %s (%s %s)...", space_id, space_type, api_endpoint)
                 if progress_callback:
                     short_name = space_id.split("/")[-1][:20]
                     await progress_callback(f"Restoring faces ({short_name})...", 20)
 
-                result_path, includes_upscale = await self._try_space(space_id, space_type, input_path)
+                result_path, includes_upscale = await self._try_space(
+                    space_id, space_type, input_path, api_endpoint
+                )
                 logger.info("Succeeded with: %s", space_id)
                 return result_path, includes_upscale
             except Exception as e:
