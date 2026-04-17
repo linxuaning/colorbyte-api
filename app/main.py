@@ -51,6 +51,17 @@ async def root():
     return {"message": "ArtImageHub API", "version": "0.1.0"}
 
 
+@app.get("/version")
+async def version():
+    """Return the git commit currently running. Set RENDER_GIT_COMMIT in render.yaml."""
+    import os
+    return {
+        "git_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "git_branch": os.environ.get("RENDER_GIT_BRANCH", "unknown"),
+        "service": os.environ.get("RENDER_SERVICE_NAME", "unknown"),
+    }
+
+
 @app.get("/health")
 async def health_check():
     from app.config import get_settings, get_effective_ai_provider
