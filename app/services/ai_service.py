@@ -182,27 +182,54 @@ class HuggingFaceProvider(AIProvider):
 
         raise RuntimeError(f"All face restoration Spaces failed: {'; '.join(errors[-3:])}")
 
+    # Real-ESRGAN alternatives (audited 2026-04-17). doevent/Face-Real-ESRGAN is
+    # frequently down; Fabrice-TIERCELIN and guetLzy are more reliable.
+    # Each entry: (space_id, call_style)
+    ESRGAN_SPACES: list[tuple[str, str]] = [
+        ("Fabrice-TIERCELIN/RealESRGAN", "size_modifier"),
+        ("guetLzy/Real-ESRGAN-Demo", "enhance_full"),
+        ("doevent/Face-Real-ESRGAN", "single_arg"),  # legacy, keep as final fallback
+    ]
+
     async def _call_esrgan(self, input_path: str) -> str:
         """Try Real-ESRGAN for super resolution."""
         import logging
         from gradio_client import Client, handle_file
 
         logger = logging.getLogger("artimagehub.hf")
-        spaces = ["doevent/Face-Real-ESRGAN"]
 
-        for space in spaces:
+        for space_id, call_style in self.ESRGAN_SPACES:
             try:
-                logger.info("Trying ESRGAN: %s", space)
-                client = Client(space, verbose=False)
-                result = await asyncio.to_thread(
-                    client.predict,
-                    handle_file(input_path),
-                    api_name="/predict",
-                )
-                logger.info("ESRGAN succeeded with: %s", space)
-                return str(result)
+                logger.info("Trying ESRGAN: %s (%s)", space_id, call_style)
+                client = Client(space_id, verbose=False)
+                img = handle_file(input_path)
+                if call_style == "size_modifier":
+                    result = await asyncio.to_thread(
+                        client.predict, img, "2", api_name="/predict"
+                    )
+                elif call_style == "enhance_full":
+                    # (input_image, model_name, outscale, face_enhance)
+                    result = await asyncio.to_thread(
+                        client.predict,
+                        img,
+                        "RealESRGAN_x2plus",
+                        2,
+                        False,
+                        api_name="/enhance",
+                    )
+                else:  # legacy single_arg
+                    result = await asyncio.to_thread(
+                        client.predict, img, api_name="/predict"
+                    )
+                if isinstance(result, tuple):
+                    result = result[0]
+                if isinstance(result, dict):
+                    result = result.get("path") or result.get("url") or str(result)
+                if result:
+                    logger.info("ESRGAN succeeded with: %s", space_id)
+                    return str(result)
             except Exception as e:
-                logger.warning("ESRGAN %s failed: %s", space, e)
+                logger.warning("ESRGAN %s failed: %s", space_id, str(e)[:200])
                 continue
 
         raise RuntimeError("Real-ESRGAN unavailable")

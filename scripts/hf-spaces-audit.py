@@ -56,7 +56,7 @@ def main() -> int:
 
     restore = list(HuggingFaceProvider.RESTORE_SPACES)
     colorize = list(HuggingFaceProvider.DEOLDIFY_SPACES)
-    esrgan = ["doevent/Face-Real-ESRGAN"]  # hardcoded in _call_esrgan
+    esrgan = list(HuggingFaceProvider.ESRGAN_SPACES)
 
     report: dict = {
         "restore": [],
