@@ -1,18 +1,45 @@
 name: Keep Render alive
 
+# GitHub Actions free tier drops cron slots unpredictably (observed 14 runs/day
+# vs expected 144 for */10). Run every 3 minutes with 3 staggered schedules so
+# we have ~60 attempts/hour; even with 70% drop we still hit every 5 min,
+# well under Render's 15-min idle-sleep threshold.
 on:
   schedule:
-    - cron: '*/10 * * * *'  # every 10 minutes
-  workflow_dispatch:         # allow manual trigger
+    - cron: '*/3 * * * *'          # 0, 3, 6, 9, ...
+    - cron: '1-59/3 * * * *'       # 1, 4, 7, 10, ...
+    - cron: '2-59/3 * * * *'       # 2, 5, 8, 11, ...
+  workflow_dispatch:
+
+concurrency:
+  group: render-keepalive
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
     steps:
-      - name: Ping health endpoint
+      - name: Warm /health
         run: |
-          curl -sf https://colorbyte-api.onrender.com/health \
-            -o /dev/null \
-            --max-time 30 \
-            && echo "OK" \
-            || echo "WARN: health check returned non-2xx (service may be cold-starting)"
+          echo "::group::/health"
+          time curl -sS https://colorbyte-api.onrender.com/health \
+            --max-time 45 -o /dev/null -w "http=%{http_code} total=%{time_total}s\n" \
+            || echo "WARN: /health non-2xx"
+          echo "::endgroup::"
+
+      - name: Warm /api/payment/subscription (same code path the frontend hits on page load)
+        run: |
+          echo "::group::subscription"
+          time curl -sS "https://colorbyte-api.onrender.com/api/payment/subscription/keepalive@artimagehub.com" \
+            --max-time 45 -o /dev/null -w "http=%{http_code} total=%{time_total}s\n" \
+            || echo "WARN: subscription non-2xx"
+          echo "::endgroup::"
+
+      - name: Warm /api/metrics/processing-complete (read path)
+        run: |
+          echo "::group::metrics"
+          time curl -sS "https://colorbyte-api.onrender.com/api/metrics/processing-complete?hours=168" \
+            --max-time 45 -o /dev/null -w "http=%{http_code} total=%{time_total}s\n" \
+            || echo "WARN: metrics non-2xx"
+          echo "::endgroup::"
