@@ -51,6 +51,16 @@ def _create_preview(source_path: str, task_id: str) -> str:
     """Create a 720p preview with watermark. Returns path to temp file."""
     img = Image.open(source_path)
 
+    # Memory safety on Render free: tell the JPEG decoder to subsample during
+    # decode for large AI outputs (e.g. 4000px upscaler results). Without this,
+    # loading the full raster for a 6000px JPEG can exceed 500MB. draft() is a
+    # hint — PIL picks the closest power-of-2 subsampling factor. Only affects
+    # JPEGs; no-op for PNG/WEBP.
+    try:
+        img.draft("RGB", (MAX_FREE_WIDTH * 2, MAX_FREE_HEIGHT * 2))
+    except Exception:
+        pass
+
     # Convert to RGB if needed (handles RGBA, P mode, etc.)
     if img.mode != "RGB":
         img = img.convert("RGB")

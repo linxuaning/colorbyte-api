@@ -174,8 +174,10 @@ async def _process_task(task_id: str):
         )
 
         if result.success:
-            # Cap result image size to prevent OOM on download/preview serving
-            _cap_result_image(result.output_path)
+            # Do NOT cap the AI output. The paid "HD Original" download must
+            # serve the true AI output, not a 1600px JPEG q85 reread. Memory
+            # safety on Render free during preview generation is handled in
+            # download._create_preview via PIL.Image.draft() subsampling.
 
             mode = "colorize" if task.colorize else "restore"
             record_processing_complete(
