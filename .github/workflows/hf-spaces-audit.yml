@@ -1,0 +1,22 @@
+name: HF Spaces audit
+
+on:
+  schedule:
+    - cron: '15 * * * *'   # every hour at :15
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install gradio_client
+        run: pip install gradio_client
+      - name: Run audit
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: python scripts/hf-spaces-audit.py

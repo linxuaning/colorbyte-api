@@ -79,8 +79,11 @@ class HuggingFaceProvider(AIProvider):
         ("titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
     ]
 
-    DEOLDIFY_SPACES = [
-        "jantic/DeOldify",
+    # Colorization Spaces — jantic/DeOldify was deleted from HF; audited alternatives 2026-04-17.
+    # Each entry: (space_id, call_style). call_style distinguishes the old DeOldify signature
+    # (image + render_factor) from the simpler single-arg ialhashim/Colorizer.
+    DEOLDIFY_SPACES: list[tuple[str, str]] = [
+        ("ialhashim/Colorizer", "single_arg"),
     ]
 
     async def _try_space(
@@ -211,23 +214,34 @@ class HuggingFaceProvider(AIProvider):
 
         logger = logging.getLogger("artimagehub.hf")
 
-        for space in self.DEOLDIFY_SPACES:
+        for space_id, call_style in self.DEOLDIFY_SPACES:
             try:
-                logger.info("Trying DeOldify: %s", space)
-                client = Client(space, verbose=False)
-                result = await asyncio.to_thread(
-                    client.predict,
-                    handle_file(input_path),
-                    10,
-                    api_name="/predict",
-                )
-                logger.info("DeOldify succeeded with: %s", space)
+                logger.info("Trying colorizer: %s (%s)", space_id, call_style)
+                client = Client(space_id, verbose=False)
+                if call_style == "single_arg":
+                    result = await asyncio.to_thread(
+                        client.predict,
+                        handle_file(input_path),
+                        api_name="/predict",
+                    )
+                else:  # classic DeOldify signature
+                    result = await asyncio.to_thread(
+                        client.predict,
+                        handle_file(input_path),
+                        10,
+                        api_name="/predict",
+                    )
+                if isinstance(result, tuple):
+                    result = result[0]
+                if isinstance(result, dict):
+                    result = result.get("path") or result.get("url") or str(result)
+                logger.info("Colorizer succeeded: %s", space_id)
                 return str(result)
             except Exception as e:
-                logger.warning("DeOldify %s failed: %s", space, e)
+                logger.warning("Colorizer %s failed: %s", space_id, e)
                 continue
 
-        raise RuntimeError("DeOldify unavailable")
+        raise RuntimeError("No colorization Space available")
 
     async def process_photo(
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
@@ -255,7 +269,7 @@ class HuggingFaceProvider(AIProvider):
             # Step 3: Colorization (optional)
             if colorize:
                 if progress_callback:
-                    await progress_callback("Colorizing (DeOldify)...", 80)
+                    await progress_callback("Colorizing...", 80)
                 try:
                     current_path = await self._call_deoldify(current_path)
                 except Exception:

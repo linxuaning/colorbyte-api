@@ -1,0 +1,61 @@
+{
+  "restore": [
+    {
+      "status": "ok",
+      "endpoints": [
+        "/inference"
+      ],
+      "space_id": "sczhou/CodeFormer",
+      "critical": true
+    },
+    {
+      "status": "ok",
+      "endpoints": [
+        "/predict"
+      ],
+      "space_id": "PERCY001/CodeFormer",
+      "critical": false
+    },
+    {
+      "status": "ok",
+      "endpoints": [
+        "/get_selection_from_gallery",
+        "/limit_gallery",
+        "/inference"
+      ],
+      "space_id": "avans06/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN",
+      "critical": false
+    },
+    {
+      "status": "ok",
+      "endpoints": [
+        "/append_gallery",
+        "/extend_gallery",
+        "/get_selection_from_gallery",
+        "/limit_gallery",
+        "/remove_image_from_gallery",
+        "/inference"
+      ],
+      "space_id": "titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN",
+      "critical": false
+    }
+  ],
+  "colorize": [
+    {
+      "status": "ok",
+      "endpoints": [
+        "/predict"
+      ],
+      "space_id": "ialhashim/Colorizer"
+    }
+  ],
+  "esrgan": [
+    {
+      "status": "fail",
+      "error_type": "ValueError",
+      "error": "The current space is in the invalid state: PAUSED. Please contact the owner to fix this.",
+      "space_id": "doevent/Face-Real-ESRGAN"
+    }
+  ],
+  "critical_failed": false
+}
