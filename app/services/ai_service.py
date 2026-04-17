@@ -86,6 +86,12 @@ class HuggingFaceProvider(AIProvider):
         ("ialhashim/Colorizer", "single_arg"),
     ]
 
+    # Hard ceiling on how long any single HF Space may block. HF free-tier
+    # queues can take 5-10+ min during peak; blocking the task that long
+    # leaves paying users staring at a stuck progress bar. Fall through to
+    # the next Space instead.
+    _SPACE_PREDICT_TIMEOUT_S = 90
+
     async def _try_space(
         self, space_id: str, space_type: str, input_path: str, api_endpoint: str = "/predict"
     ) -> tuple[str, bool]:
@@ -98,15 +104,18 @@ class HuggingFaceProvider(AIProvider):
         if space_type == "codeformer_v2":
             # Current CodeFormer signature (audited 2026-04-17):
             # predict(image, face_align, background_enhance, face_upsample, upscale, codeformer_fidelity)
-            result = await asyncio.to_thread(
-                client.predict,
-                img,
-                True,    # face_align
-                True,    # background_enhance
-                True,    # face_upsample
-                2,       # upscale
-                0.7,     # codeformer_fidelity (0=quality, 1=fidelity)
-                api_name=api_endpoint,
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.predict,
+                    img,
+                    True,    # face_align
+                    True,    # background_enhance
+                    True,    # face_upsample
+                    2,       # upscale
+                    0.7,     # codeformer_fidelity (0=quality, 1=fidelity)
+                    api_name=api_endpoint,
+                ),
+                timeout=self._SPACE_PREDICT_TIMEOUT_S,
             )
             # sczhou/CodeFormer returns (output, markdown), PERCY001 returns output only
             if isinstance(result, tuple):
@@ -134,8 +143,9 @@ class HuggingFaceProvider(AIProvider):
             # avans06 variant also requires save_as_png; titanito does not
             if space_id.startswith("avans06/"):
                 args.append(False)
-            result = await asyncio.to_thread(
-                client.predict, *args, api_name=api_endpoint
+            result = await asyncio.wait_for(
+                asyncio.to_thread(client.predict, *args, api_name=api_endpoint),
+                timeout=self._SPACE_PREDICT_TIMEOUT_S,
             )
             # Returns (gallery_output, download_file); grab first gallery entry
             if isinstance(result, tuple):
@@ -174,6 +184,13 @@ class HuggingFaceProvider(AIProvider):
                 )
                 logger.info("Succeeded with: %s", space_id)
                 return result_path, includes_upscale
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "%s timed out after %ss — queue likely full, trying next Space",
+                    space_id, self._SPACE_PREDICT_TIMEOUT_S,
+                )
+                errors.append(f"{space_id.split('/')[-1]}: timeout {self._SPACE_PREDICT_TIMEOUT_S}s")
+                continue
             except Exception as e:
                 err_msg = str(e)
                 logger.warning("%s failed: %s", space_id, err_msg[:200])
@@ -204,22 +221,27 @@ class HuggingFaceProvider(AIProvider):
                 client = Client(space_id, verbose=False)
                 img = handle_file(input_path)
                 if call_style == "size_modifier":
-                    result = await asyncio.to_thread(
-                        client.predict, img, "2", api_name="/predict"
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(client.predict, img, "2", api_name="/predict"),
+                        timeout=self._SPACE_PREDICT_TIMEOUT_S,
                     )
                 elif call_style == "enhance_full":
                     # (input_image, model_name, outscale, face_enhance)
-                    result = await asyncio.to_thread(
-                        client.predict,
-                        img,
-                        "RealESRGAN_x2plus",
-                        2,
-                        False,
-                        api_name="/enhance",
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            client.predict,
+                            img,
+                            "RealESRGAN_x2plus",
+                            2,
+                            False,
+                            api_name="/enhance",
+                        ),
+                        timeout=self._SPACE_PREDICT_TIMEOUT_S,
                     )
                 else:  # legacy single_arg
-                    result = await asyncio.to_thread(
-                        client.predict, img, api_name="/predict"
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(client.predict, img, api_name="/predict"),
+                        timeout=self._SPACE_PREDICT_TIMEOUT_S,
                     )
                 if isinstance(result, tuple):
                     result = result[0]
@@ -246,17 +268,23 @@ class HuggingFaceProvider(AIProvider):
                 logger.info("Trying colorizer: %s (%s)", space_id, call_style)
                 client = Client(space_id, verbose=False)
                 if call_style == "single_arg":
-                    result = await asyncio.to_thread(
-                        client.predict,
-                        handle_file(input_path),
-                        api_name="/predict",
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            client.predict,
+                            handle_file(input_path),
+                            api_name="/predict",
+                        ),
+                        timeout=self._SPACE_PREDICT_TIMEOUT_S,
                     )
                 else:  # classic DeOldify signature
-                    result = await asyncio.to_thread(
-                        client.predict,
-                        handle_file(input_path),
-                        10,
-                        api_name="/predict",
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            client.predict,
+                            handle_file(input_path),
+                            10,
+                            api_name="/predict",
+                        ),
+                        timeout=self._SPACE_PREDICT_TIMEOUT_S,
                     )
                 if isinstance(result, tuple):
                     result = result[0]
