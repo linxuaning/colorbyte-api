@@ -92,24 +92,37 @@ def create_checkout_session(
         "customer": {"email": email},
         "billing_currency": settings.dodo_payments_currency,
         "return_url": return_url,
+        "minimal_address": True,
+        "feature_flags": {
+            "allow_phone_number_collection": False,
+            "allow_tax_id": False,
+            "allow_discount_code": False,
+            "allow_currency_selection": False,
+        },
     }
     if cancel_url:
         payload["cancel_url"] = cancel_url
     if metadata:
         payload["metadata"] = metadata
 
-    try:
-        response = client.checkout_sessions.create(**payload)
-    except TypeError as exc:
-        # Some SDK versions may not expose cancel_url yet.
-        if "cancel_url" in payload:
-            payload.pop("cancel_url", None)
-            logger.warning(
-                "Dodo SDK rejected cancel_url, retrying checkout session without cancel_url"
-            )
+    # Progressive fallback: strip newest params first if SDK version doesn't support them.
+    fallback_keys = ("minimal_address", "feature_flags", "cancel_url")
+    while True:
+        try:
             response = client.checkout_sessions.create(**payload)
-        else:
-            raise exc
+            break
+        except TypeError as exc:
+            dropped = None
+            for key in fallback_keys:
+                if key in payload:
+                    payload.pop(key)
+                    dropped = key
+                    break
+            if dropped is None:
+                raise exc
+            logger.warning(
+                "Dodo SDK rejected %s, retrying checkout session without it", dropped
+            )
 
     data = _as_dict(response)
     session_id = data.get("session_id") or data.get("id")
