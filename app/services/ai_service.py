@@ -1156,7 +1156,10 @@ class PhotoFixProvider(AIProvider):
                 mime = mimetypes.guess_type(input_path)[0] or "image/jpeg"
                 filename = Path(input_path).name
 
-                upload_data: dict = {"email": email or ""}
+                upload_data: dict = {
+                    "email": email or "",
+                    "colorize": "true" if colorize else "false",
+                }
                 if self.internal_api_key:
                     upload_data["internal_key"] = self.internal_api_key
 
