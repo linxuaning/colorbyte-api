@@ -1226,9 +1226,20 @@ class PhotoFixProvider(AIProvider):
                 if progress_callback:
                     await progress_callback("Downloading result...", 95)
 
+                # Backend gates download on is_user_active(email) and returns 402
+                # otherwise. Pass internal_key (service-to-service bypass) plus
+                # email + quality=original per backend's documented contract.
+                # Without this we silently fall back to the broken HF chain.
+                download_params: dict[str, str] = {"quality": "original"}
+                if email:
+                    download_params["email"] = email
+                if self.internal_api_key:
+                    download_params["internal_key"] = self.internal_api_key
+
                 async with http.stream(
                     "GET",
                     f"{self.api_url}/api/download/{remote_task_id}",
+                    params=download_params,
                     timeout=httpx.Timeout(120.0, connect=10.0),
                 ) as download_resp:
                     download_resp.raise_for_status()
