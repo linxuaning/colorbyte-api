@@ -1105,12 +1105,12 @@ class PhotoFixProvider(AIProvider):
     Flow:
       1. Register email as subscriber (admin-set-subscriber).
       2. POST /api/upload with the image file + email → remote task_id.
-      3. Poll GET /api/tasks/{task_id} every 2s (max 8 min) until completed/failed.
+      3. Poll GET /api/tasks/{task_id} every 2s (max 20 min) until completed/failed.
       4. GET /api/download/{task_id} and write bytes to output_path.
     """
 
     POLL_INTERVAL = 2      # seconds between polls
-    MAX_POLL_TIME = 480    # 8 minutes max — backend agent says 600x400 input ≈ 3-5 min CPU; need headroom for larger images and warm-up
+    MAX_POLL_TIME = 1200   # 20 minutes max — observed real input at 432s/48% (~15 min projected); backend agent's 3-5 min spec was for 600x400, larger user inputs run longer
 
     def __init__(self, api_url: str, internal_api_key: str = ""):
         self.api_url = api_url.rstrip("/")
