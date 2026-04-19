@@ -1,0 +1,31 @@
+name: Daily metrics email
+
+# Daily snapshot of paid orders, checkout attempts, restorations, and
+# webhook health. Lands in inbox at 08:00 Beijing (00:00 UTC) every day so
+# founder has yesterday's numbers without asking.
+
+on:
+  schedule:
+    - cron: "0 0 * * *"            # 00:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: daily-metrics
+  cancel-in-progress: false
+
+jobs:
+  email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Send daily metrics email
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          METRICS_BASE: "https://colorbyte-api.onrender.com"
+          ALERT_TO: "linxuaning98@gmail.com"
+        run: python3 scripts/daily-metrics.py
