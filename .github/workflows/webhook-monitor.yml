@@ -1,0 +1,31 @@
+name: Webhook health monitor
+
+# Watches the Dodo payment webhook endpoint and emails an alert when it sees
+# 401s, 5xx, or known error patterns. Born from the 4/15-4/19 incident where
+# missing `dodopayments[webhooks]` extra silently dropped 16 paid-order
+# webhooks for 4 days and nothing alerted.
+
+on:
+  schedule:
+    - cron: "0 * * * *"          # hourly (top of hour)
+  workflow_dispatch:
+
+concurrency:
+  group: webhook-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run webhook monitor
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          LOOKBACK_MINUTES: "65"
+        run: python3 scripts/webhook-monitor.py
