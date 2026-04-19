@@ -15,5 +15,5 @@ dependencies = [
     "replicate>=1.0.7",
     "Pillow>=10.0.0",
     "uvicorn>=0.40.0",
-    "dodopayments>=1.94.0",
+    "dodopayments[webhooks]>=1.94.0",
 ]
