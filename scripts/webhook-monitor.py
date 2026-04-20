@@ -24,7 +24,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 ALERT_TO = "linxuaning98@gmail.com"
-ALERT_FROM = "alerts@artimagehub.com"
+ALERT_FROM = "support@artimagehub.com"  # support@ is verified in Resend; alerts@ is not (was causing 403)
 WEBHOOK_PATH = "/api/payment/dodo-webhook"
 
 # Patterns that indicate something is wrong with webhook delivery.
@@ -59,7 +59,9 @@ def fetch_recent_logs(api_key: str, owner: str, service: str, lookback_minutes: 
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
     with urllib.request.urlopen(req, timeout=30) as r:
         body = json.loads(r.read())
-    return body.get("logs", [])
+    # Render sometimes returns {"logs": null} when no lines match the filter
+    # in the window. Default None → [] to survive empty windows.
+    return body.get("logs") or []
 
 
 def classify(logs: list[dict]) -> dict:

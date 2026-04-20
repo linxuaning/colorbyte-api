@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 METRICS_BASE = os.environ.get("METRICS_BASE", "https://colorbyte-api.onrender.com").rstrip("/")
 ALERT_TO = os.environ.get("ALERT_TO", "linxuaning98@gmail.com")
-ALERT_FROM = os.environ.get("ALERT_FROM", "alerts@artimagehub.com")
+ALERT_FROM = os.environ.get("ALERT_FROM", "support@artimagehub.com")  # alerts@ isn't verified in Resend → 403
 DASHBOARD_HINT = "https://artimagehub.com"
 
 
@@ -83,7 +83,7 @@ def fetch_webhook_health() -> dict:
     except Exception as e:
         return {"available": False, "error": str(e)}
     counts = {"ok_200": 0, "fail_401": 0, "fail_5xx": 0}
-    for entry in body.get("logs", []):
+    for entry in (body.get("logs") or []):
         msg = entry.get("message", "")
         if "/api/payment/dodo-webhook" in msg:
             if " 200 OK" in msg:
