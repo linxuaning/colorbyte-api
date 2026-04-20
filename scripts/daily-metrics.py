@@ -161,12 +161,23 @@ def send_email(api_key: str, subject: str, body: str) -> None:
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            # Cloudflare (in front of api.resend.com) returns 1010 to the default
+            # Python-urllib/x.y User-Agent. Sending a branded UA unblocks it.
+            "User-Agent": "artimagehub-monitor/1.0",
+        },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        out = json.loads(r.read())
-    print(f"sent — id={out.get('id')}")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            out = json.loads(r.read())
+        print(f"sent — id={out.get('id')}")
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")[:500]
+        print(f"[fatal] Resend returned HTTP {e.code}: {body_text}", file=sys.stderr)
+        raise
 
 
 def main() -> int:

@@ -132,6 +132,9 @@ def send_alert(api_key: str, report: dict, lookback_minutes: int) -> None:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            # Cloudflare (in front of api.resend.com) 1010-blocks the default
+            # Python-urllib/x.y User-Agent. Branded UA unblocks it.
+            "User-Agent": "artimagehub-monitor/1.0",
         },
         method="POST",
     )
