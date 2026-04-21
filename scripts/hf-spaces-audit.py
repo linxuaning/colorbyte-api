@@ -19,7 +19,8 @@ Exit codes:
 Env:
   RESEND_API_KEY    — if set, send alert email on critical failure
   ALERT_EMAIL_TO    — recipient (default: linxuaning98@gmail.com)
-  ALERT_EMAIL_FROM  — sender (default: onboarding@resend.dev)
+  ALERT_EMAIL_FROM  — sender (default: support@artimagehub.com, the only
+                      artimagehub.com address verified in Resend)
 """
 from __future__ import annotations
 
@@ -117,7 +118,7 @@ def send_alert(report: dict) -> None:
         return
 
     to = os.environ.get("ALERT_EMAIL_TO", "linxuaning98@gmail.com")
-    sender = os.environ.get("ALERT_EMAIL_FROM", "onboarding@resend.dev")
+    sender = os.environ.get("ALERT_EMAIL_FROM", "support@artimagehub.com")
 
     failed_restore = [r for r in report["restore"] if r["status"] != "ok"]
     failed_colorize = [r for r in report["colorize"] if r["status"] != "ok"]
@@ -148,6 +149,7 @@ def send_alert(report: dict) -> None:
     )
 
     import urllib.request
+    import urllib.error
     body = json.dumps({
         "from": sender,
         "to": [to],
@@ -157,12 +159,19 @@ def send_alert(report: dict) -> None:
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "artimagehub-monitor/1.0",
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             print(f"Alert email sent: HTTP {r.status}")
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")[:500]
+        print(f"Alert email FAILED: HTTP {e.code}: {body_text}")
     except Exception as e:
         print(f"Alert email FAILED: {e}")
 
