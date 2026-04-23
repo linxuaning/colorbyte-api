@@ -138,6 +138,9 @@ def send_alert(api_key: str, report: dict, lookback_minutes: int) -> None:
         },
         method="POST",
     )
+    # Surface alert body BEFORE POST so transient Resend timeouts (~10% rate observed 4/22-4/23)
+    # still leave the alert content (counts + sample log lines) visible in GH Actions log for triage.
+    print(f"[alert body] subject={payload['subject']!r}\n{body}\n[/alert body]", flush=True)
     with urllib.request.urlopen(req, timeout=20) as r:
         out = json.loads(r.read())
     print(f"[alert] sent — id={out.get('id')}")
