@@ -1,9 +1,16 @@
 """
-SQLite database for subscriptions.
-MVP: email-based subscription system, no user accounts/passwords.
+Subscription / metrics persistence.
+
+Two modes:
+  - PG configured (DATABASE_URL set): reads go to Postgres only; writes
+    fan out to sqlite (best-effort backup) + Postgres (authoritative for reads).
+    Rollback path: unset DATABASE_URL + redeploy → falls back to sqlite-only.
+  - PG not configured: pure sqlite (original local-dev mode).
 """
 import sqlite3
 import logging
+import time
+import threading
 from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -19,6 +26,67 @@ _ATTRIBUTION_COLUMNS = {
     "entry_variant": "TEXT",
     "checkout_source": "TEXT",
 }
+
+# --- Dual-write observability ---
+# Tracks recent dual-write outcomes for /health success-ratio reporting.
+# Single-worker free tier; lock keeps trim+append atomic under the GIL.
+_DUAL_WRITE_OBS_WINDOW_SECONDS = 60
+_dual_write_lock = threading.Lock()
+_dual_write_events: list[tuple[float, str, bool, bool]] = []  # (monotonic_ts, op, sqlite_ok, pg_ok)
+
+
+def _record_obs(op: str, sqlite_ok: bool, pg_ok: bool) -> None:
+    """Log a dual-write outcome and append to the rolling window for /health."""
+    now = time.monotonic()
+    cutoff = now - _DUAL_WRITE_OBS_WINDOW_SECONDS
+    with _dual_write_lock:
+        _dual_write_events[:] = [e for e in _dual_write_events if e[0] >= cutoff]
+        _dual_write_events.append((now, op, sqlite_ok, pg_ok))
+    logger.info("dual_write op=%s sqlite_ok=%s pg_ok=%s", op, sqlite_ok, pg_ok)
+
+
+def get_dual_write_health() -> dict:
+    """Return last-60s dual-write success ratios for /health."""
+    now = time.monotonic()
+    cutoff = now - _DUAL_WRITE_OBS_WINDOW_SECONDS
+    with _dual_write_lock:
+        recent = [e for e in _dual_write_events if e[0] >= cutoff]
+    total = len(recent)
+    if total == 0:
+        return {
+            "window_seconds": _DUAL_WRITE_OBS_WINDOW_SECONDS,
+            "samples": 0,
+            "sqlite_ok_rate": None,
+            "pg_ok_rate": None,
+        }
+    sqlite_ok = sum(1 for _, _, s, _ in recent if s)
+    pg_ok = sum(1 for _, _, _, p in recent if p)
+    return {
+        "window_seconds": _DUAL_WRITE_OBS_WINDOW_SECONDS,
+        "samples": total,
+        "sqlite_ok_rate": round(sqlite_ok / total, 3),
+        "pg_ok_rate": round(pg_ok / total, 3),
+    }
+
+
+def _row_to_dict(row) -> dict:
+    """Normalize psycopg dict_row / sqlite Row to a plain dict with ISO-8601 strings.
+
+    PG returns native datetime / date / bool; sqlite returns TEXT/INTEGER. Callers
+    expect string timestamps + 0/1 booleans (legacy sqlite shape), so coerce here.
+    """
+    if row is None:
+        return None
+    out = dict(row)
+    for k, v in list(out.items()):
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+        elif hasattr(v, "isoformat") and not isinstance(v, (int, float, str, bytes)):
+            # date objects, etc.
+            out[k] = v.isoformat()
+        elif isinstance(v, bool):
+            out[k] = 1 if v else 0
+    return out
 
 
 def _get_db_path() -> str:
@@ -367,6 +435,12 @@ def get_db():
 
 def is_event_processed(event_id: str) -> bool:
     """Check if a webhook event has already been processed (idempotency)."""
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM webhook_events WHERE event_id = %s", (event_id,))
+                return cur.fetchone() is not None
+
     with get_db() as conn:
         row = conn.execute(
             "SELECT 1 FROM webhook_events WHERE event_id = ?", (event_id,)
@@ -375,13 +449,41 @@ def is_event_processed(event_id: str) -> bool:
 
 
 def mark_event_processed(event_id: str, event_type: str):
-    """Record that a webhook event has been processed."""
+    """Record that a webhook event has been processed (dual-write)."""
     now = datetime.now(timezone.utc).isoformat()
-    with get_db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO webhook_events (event_id, event_type, processed_at) VALUES (?, ?, ?)",
-            (event_id, event_type, now),
-        )
+    sqlite_ok = False
+    pg_ok = not _use_postgres()  # if PG not configured, treat as N/A
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO webhook_events (event_id, event_type, processed_at) VALUES (?, ?, ?)",
+                (event_id, event_type, now),
+            )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write mark_event_processed sqlite failed event_id=%s", event_id)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO webhook_events (event_id, event_type, processed_at)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (event_id) DO NOTHING
+                        """,
+                        (event_id, event_type, now),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write mark_event_processed pg failed event_id=%s", event_id)
+
+    _record_obs("mark_event_processed", sqlite_ok, pg_ok)
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for mark_event_processed event_id={event_id}")
 
 
 def upsert_subscription(
@@ -400,55 +502,117 @@ def upsert_subscription(
     current_period_end: str | None = None,
     cancel_at_period_end: bool = False,
 ):
-    """Create or update a subscription record."""
+    """Create or update a subscription record (dual-write)."""
     now = datetime.now(timezone.utc).isoformat()
     email = email.lower().strip()
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
 
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO subscriptions
-               (email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
-                bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
-                trial_start, trial_end, current_period_start, current_period_end,
-                cancel_at_period_end, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(email) DO UPDATE SET
-                   payment_provider = ?,
-                   lemonsqueezy_customer_id = COALESCE(?, lemonsqueezy_customer_id),
-                   lemonsqueezy_subscription_id = COALESCE(?, lemonsqueezy_subscription_id),
-                   bmc_supporter_id = COALESCE(?, bmc_supporter_id),
-                   bmc_membership_id = COALESCE(?, bmc_membership_id),
-                   paypal_order_id = COALESCE(?, paypal_order_id),
-                   paypal_payer_id = COALESCE(?, paypal_payer_id),
-                   status = ?,
-                   trial_start = COALESCE(?, trial_start),
-                   trial_end = COALESCE(?, trial_end),
-                   current_period_start = COALESCE(?, current_period_start),
-                   current_period_end = COALESCE(?, current_period_end),
-                   cancel_at_period_end = ?,
-                   updated_at = ?""",
-            (
-                email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
-                bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
-                trial_start, trial_end, current_period_start, current_period_end,
-                1 if cancel_at_period_end else 0, now, now,
-                # ON CONFLICT params:
-                payment_provider,
-                lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
-                bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
-                trial_start, trial_end, current_period_start, current_period_end,
-                1 if cancel_at_period_end else 0, now,
-            ),
-        )
-    logger.info("Subscription upserted: %s provider=%s status=%s", email, payment_provider, status)
+    sqlite_params = (
+        email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
+        bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
+        trial_start, trial_end, current_period_start, current_period_end,
+        1 if cancel_at_period_end else 0, now, now,
+        # ON CONFLICT params:
+        payment_provider,
+        lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
+        bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
+        trial_start, trial_end, current_period_start, current_period_end,
+        1 if cancel_at_period_end else 0, now,
+    )
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """INSERT INTO subscriptions
+                   (email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
+                    bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
+                    trial_start, trial_end, current_period_start, current_period_end,
+                    cancel_at_period_end, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(email) DO UPDATE SET
+                       payment_provider = ?,
+                       lemonsqueezy_customer_id = COALESCE(?, lemonsqueezy_customer_id),
+                       lemonsqueezy_subscription_id = COALESCE(?, lemonsqueezy_subscription_id),
+                       bmc_supporter_id = COALESCE(?, bmc_supporter_id),
+                       bmc_membership_id = COALESCE(?, bmc_membership_id),
+                       paypal_order_id = COALESCE(?, paypal_order_id),
+                       paypal_payer_id = COALESCE(?, paypal_payer_id),
+                       status = ?,
+                       trial_start = COALESCE(?, trial_start),
+                       trial_end = COALESCE(?, trial_end),
+                       current_period_start = COALESCE(?, current_period_start),
+                       current_period_end = COALESCE(?, current_period_end),
+                       cancel_at_period_end = ?,
+                       updated_at = ?""",
+                sqlite_params,
+            )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write upsert_subscription sqlite failed email=%s", email)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO subscriptions
+                            (email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
+                             bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
+                             trial_start, trial_end, current_period_start, current_period_end,
+                             cancel_at_period_end, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (email) DO UPDATE SET
+                            payment_provider = EXCLUDED.payment_provider,
+                            lemonsqueezy_customer_id = COALESCE(EXCLUDED.lemonsqueezy_customer_id, subscriptions.lemonsqueezy_customer_id),
+                            lemonsqueezy_subscription_id = COALESCE(EXCLUDED.lemonsqueezy_subscription_id, subscriptions.lemonsqueezy_subscription_id),
+                            bmc_supporter_id = COALESCE(EXCLUDED.bmc_supporter_id, subscriptions.bmc_supporter_id),
+                            bmc_membership_id = COALESCE(EXCLUDED.bmc_membership_id, subscriptions.bmc_membership_id),
+                            paypal_order_id = COALESCE(EXCLUDED.paypal_order_id, subscriptions.paypal_order_id),
+                            paypal_payer_id = COALESCE(EXCLUDED.paypal_payer_id, subscriptions.paypal_payer_id),
+                            status = EXCLUDED.status,
+                            trial_start = COALESCE(EXCLUDED.trial_start, subscriptions.trial_start),
+                            trial_end = COALESCE(EXCLUDED.trial_end, subscriptions.trial_end),
+                            current_period_start = COALESCE(EXCLUDED.current_period_start, subscriptions.current_period_start),
+                            current_period_end = COALESCE(EXCLUDED.current_period_end, subscriptions.current_period_end),
+                            cancel_at_period_end = EXCLUDED.cancel_at_period_end,
+                            updated_at = EXCLUDED.updated_at
+                        """,
+                        (
+                            email, payment_provider, lemonsqueezy_customer_id, lemonsqueezy_subscription_id,
+                            bmc_supporter_id, bmc_membership_id, paypal_order_id, paypal_payer_id, status,
+                            trial_start, trial_end, current_period_start, current_period_end,
+                            bool(cancel_at_period_end), now, now,
+                        ),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write upsert_subscription pg failed email=%s", email)
+
+    _record_obs("upsert_subscription", sqlite_ok, pg_ok)
+    logger.info(
+        "Subscription upserted: %s provider=%s status=%s sqlite_ok=%s pg_ok=%s",
+        email, payment_provider, status, sqlite_ok, pg_ok,
+    )
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for upsert_subscription email={email}")
 
 
 def get_subscription(email: str) -> dict | None:
-    """Get subscription info for an email. Returns dict or None."""
+    """Get subscription info for an email. PG-only when configured; sqlite fallback for dev."""
+    normalized = email.lower().strip()
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM subscriptions WHERE email = %s", (normalized,))
+                row = cur.fetchone()
+        return _row_to_dict(row)
+
     with get_db() as conn:
         row = conn.execute(
-            "SELECT * FROM subscriptions WHERE email = ?",
-            (email.lower().strip(),),
+            "SELECT * FROM subscriptions WHERE email = ?", (normalized,)
         ).fetchone()
         if row is None:
             return None
@@ -457,6 +621,16 @@ def get_subscription(email: str) -> dict | None:
 
 def get_subscription_by_customer(lemonsqueezy_customer_id: str) -> dict | None:
     """Look up subscription by LemonSqueezy customer ID."""
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM subscriptions WHERE lemonsqueezy_customer_id = %s",
+                    (lemonsqueezy_customer_id,),
+                )
+                row = cur.fetchone()
+        return _row_to_dict(row)
+
     with get_db() as conn:
         row = conn.execute(
             "SELECT * FROM subscriptions WHERE lemonsqueezy_customer_id = ?",
@@ -468,30 +642,70 @@ def get_subscription_by_customer(lemonsqueezy_customer_id: str) -> dict | None:
 
 
 def save_paypal_checkout_email(order_id: str, checkout_email: str):
-    """Persist the checkout email chosen before PayPal approval."""
+    """Persist the checkout email chosen before PayPal approval (dual-write)."""
     now = datetime.now(timezone.utc).isoformat()
     normalized_email = checkout_email.lower().strip()
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
 
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO paypal_checkout_context
-               (order_id, checkout_email, created_at, updated_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(order_id) DO UPDATE SET
-                   checkout_email = excluded.checkout_email,
-                   updated_at = excluded.updated_at""",
-            (order_id, normalized_email, now, now),
-        )
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """INSERT INTO paypal_checkout_context
+                   (order_id, checkout_email, created_at, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(order_id) DO UPDATE SET
+                       checkout_email = excluded.checkout_email,
+                       updated_at = excluded.updated_at""",
+                (order_id, normalized_email, now, now),
+            )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write save_paypal_checkout_email sqlite failed order_id=%s", order_id)
 
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO paypal_checkout_context
+                            (order_id, checkout_email, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (order_id) DO UPDATE SET
+                            checkout_email = EXCLUDED.checkout_email,
+                            updated_at = EXCLUDED.updated_at
+                        """,
+                        (order_id, normalized_email, now, now),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write save_paypal_checkout_email pg failed order_id=%s", order_id)
+
+    _record_obs("save_paypal_checkout_email", sqlite_ok, pg_ok)
     logger.info(
-        "Saved PayPal checkout email: order_id=%s checkout_email=%s",
-        order_id,
-        normalized_email,
+        "Saved PayPal checkout email: order_id=%s checkout_email=%s sqlite_ok=%s pg_ok=%s",
+        order_id, normalized_email, sqlite_ok, pg_ok,
     )
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for save_paypal_checkout_email order_id={order_id}")
 
 
 def get_paypal_checkout_email(order_id: str) -> str | None:
     """Return the saved checkout email for a PayPal order, if present."""
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT checkout_email FROM paypal_checkout_context WHERE order_id = %s",
+                    (order_id,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return row["checkout_email"]
+
     with get_db() as conn:
         row = conn.execute(
             "SELECT checkout_email FROM paypal_checkout_context WHERE order_id = ?",
@@ -507,41 +721,87 @@ def record_paypal_capture(
     capture_id: str | None = None,
     payer_email: str | None = None,
 ):
-    """Attach capture audit data to a stored PayPal checkout context."""
+    """Attach capture audit data to a stored PayPal checkout context (dual-write)."""
     now = datetime.now(timezone.utc).isoformat()
     normalized_payer_email = payer_email.lower().strip() if payer_email else None
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
 
-    with get_db() as conn:
-        conn.execute(
-            """UPDATE paypal_checkout_context
-               SET payer_email = COALESCE(?, payer_email),
-                   capture_id = COALESCE(?, capture_id),
-                   updated_at = ?
-               WHERE order_id = ?""",
-            (normalized_payer_email, capture_id, now, order_id),
-        )
-
-        if conn.total_changes == 0 and normalized_payer_email:
+    try:
+        with get_db() as conn:
             conn.execute(
-                """INSERT OR IGNORE INTO paypal_checkout_context
-                   (order_id, checkout_email, payer_email, capture_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    order_id,
-                    normalized_payer_email,
-                    normalized_payer_email,
-                    capture_id,
-                    now,
-                    now,
-                ),
+                """UPDATE paypal_checkout_context
+                   SET payer_email = COALESCE(?, payer_email),
+                       capture_id = COALESCE(?, capture_id),
+                       updated_at = ?
+                   WHERE order_id = ?""",
+                (normalized_payer_email, capture_id, now, order_id),
             )
 
+            if conn.total_changes == 0 and normalized_payer_email:
+                conn.execute(
+                    """INSERT OR IGNORE INTO paypal_checkout_context
+                       (order_id, checkout_email, payer_email, capture_id, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        order_id,
+                        normalized_payer_email,
+                        normalized_payer_email,
+                        capture_id,
+                        now,
+                        now,
+                    ),
+                )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write record_paypal_capture sqlite failed order_id=%s", order_id)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    # Try UPDATE first; if 0 rows affected and we have an email, INSERT.
+                    cur.execute(
+                        """
+                        UPDATE paypal_checkout_context
+                        SET payer_email = COALESCE(%s, payer_email),
+                            capture_id = COALESCE(%s, capture_id),
+                            updated_at = %s
+                        WHERE order_id = %s
+                        """,
+                        (normalized_payer_email, capture_id, now, order_id),
+                    )
+                    rows_updated = cur.rowcount
+
+                    if rows_updated == 0 and normalized_payer_email:
+                        cur.execute(
+                            """
+                            INSERT INTO paypal_checkout_context
+                                (order_id, checkout_email, payer_email, capture_id, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (order_id) DO NOTHING
+                            """,
+                            (
+                                order_id,
+                                normalized_payer_email,
+                                normalized_payer_email,
+                                capture_id,
+                                now,
+                                now,
+                            ),
+                        )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write record_paypal_capture pg failed order_id=%s", order_id)
+
+    _record_obs("record_paypal_capture", sqlite_ok, pg_ok)
     logger.info(
-        "Recorded PayPal capture audit: order_id=%s capture_id=%s payer_email=%s",
-        order_id,
-        capture_id,
-        normalized_payer_email,
+        "Recorded PayPal capture audit: order_id=%s capture_id=%s payer_email=%s sqlite_ok=%s pg_ok=%s",
+        order_id, capture_id, normalized_payer_email, sqlite_ok, pg_ok,
     )
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for record_paypal_capture order_id={order_id}")
 
 
 def is_user_active(email: str) -> bool:
@@ -553,15 +813,42 @@ def is_user_active(email: str) -> bool:
 
 
 def cancel_subscription_db(email: str):
-    """Mark subscription as pending cancellation (cancel at period end)."""
+    """Mark subscription as pending cancellation (cancel at period end). Dual-write."""
     now = datetime.now(timezone.utc).isoformat()
     email = email.lower().strip()
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE subscriptions SET cancel_at_period_end = 1, updated_at = ? WHERE email = ?",
-            (now, email),
-        )
-    logger.info("Subscription cancel requested: %s", email)
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE subscriptions SET cancel_at_period_end = 1, updated_at = ? WHERE email = ?",
+                (now, email),
+            )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write cancel_subscription_db sqlite failed email=%s", email)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE subscriptions SET cancel_at_period_end = TRUE, updated_at = %s WHERE email = %s",
+                        (now, email),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write cancel_subscription_db pg failed email=%s", email)
+
+    _record_obs("cancel_subscription_db", sqlite_ok, pg_ok)
+    logger.info(
+        "Subscription cancel requested: %s sqlite_ok=%s pg_ok=%s",
+        email, sqlite_ok, pg_ok,
+    )
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for cancel_subscription_db email={email}")
 
 
 # --- Download tracking ---
@@ -571,6 +858,16 @@ FREE_DAILY_LIMIT = 3
 
 def get_download_count(ip: str, date_str: str) -> int:
     """Get number of downloads for an IP on a given date."""
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM downloads WHERE ip = %s AND download_date = %s",
+                    (ip, date_str),
+                )
+                row = cur.fetchone()
+        return int(row["cnt"]) if row and row.get("cnt") is not None else 0
+
     with get_db() as conn:
         row = conn.execute(
             "SELECT COUNT(*) as cnt FROM downloads WHERE ip = ? AND download_date = ?",
@@ -580,13 +877,39 @@ def get_download_count(ip: str, date_str: str) -> int:
 
 
 def record_download(ip: str, task_id: str):
-    """Record a download event."""
+    """Record a download event (dual-write)."""
     now = datetime.now(timezone.utc)
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO downloads (ip, download_date, task_id, created_at) VALUES (?, ?, ?, ?)",
-            (ip, now.strftime("%Y-%m-%d"), task_id, now.isoformat()),
-        )
+    date_str = now.strftime("%Y-%m-%d")
+    iso = now.isoformat()
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO downloads (ip, download_date, task_id, created_at) VALUES (?, ?, ?, ?)",
+                (ip, date_str, task_id, iso),
+            )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write record_download sqlite failed ip=%s task_id=%s", ip, task_id)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO downloads (ip, download_date, task_id, created_at) VALUES (%s, %s, %s, %s)",
+                        (ip, date_str, task_id, iso),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write record_download pg failed ip=%s task_id=%s", ip, task_id)
+
+    _record_obs("record_download", sqlite_ok, pg_ok)
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for record_download ip={ip}")
 
 
 def check_download_limit(ip: str, email: str | None = None) -> dict:
@@ -623,30 +946,88 @@ def record_processing_complete(
     entry_variant: str | None = None,
     checkout_source: str | None = None,
 ):
-    """Persist a processing completion event for 24h metric aggregation."""
+    """Persist a processing completion event (dual-write)."""
     now = datetime.now(timezone.utc).isoformat()
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO processing_events
-            (task_id, mode, landing_page, cta_slot, entry_variant, checkout_source, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                mode,
-                _normalize_attr(landing_page),
-                _normalize_attr(cta_slot),
-                _normalize_attr(entry_variant),
-                _normalize_attr(checkout_source),
-                now,
-            ),
-        )
+    lp = _normalize_attr(landing_page)
+    cs = _normalize_attr(cta_slot)
+    ev = _normalize_attr(entry_variant)
+    src = _normalize_attr(checkout_source)
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO processing_events
+                (task_id, mode, landing_page, cta_slot, entry_variant, checkout_source, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, mode, lp, cs, ev, src, now),
+            )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write record_processing_complete sqlite failed task_id=%s", task_id)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO processing_events
+                            (task_id, mode, landing_page, cta_slot, entry_variant, checkout_source, completed_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (task_id) DO UPDATE SET
+                            mode = EXCLUDED.mode,
+                            landing_page = EXCLUDED.landing_page,
+                            cta_slot = EXCLUDED.cta_slot,
+                            entry_variant = EXCLUDED.entry_variant,
+                            checkout_source = EXCLUDED.checkout_source,
+                            completed_at = EXCLUDED.completed_at
+                        """,
+                        (task_id, mode, lp, cs, ev, src, now),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write record_processing_complete pg failed task_id=%s", task_id)
+
+    _record_obs("record_processing_complete", sqlite_ok, pg_ok)
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for record_processing_complete task_id={task_id}")
 
 
 def get_processing_complete_metrics(hours: int = 24) -> dict:
     """Return completion count and mode split in the trailing N hours."""
     now, start_iso = _metrics_window(hours)
+
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM processing_events WHERE completed_at >= %s",
+                    (start_iso,),
+                )
+                total_row = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT mode, COUNT(*) AS cnt
+                    FROM processing_events
+                    WHERE completed_at >= %s
+                    GROUP BY mode
+                    ORDER BY cnt DESC
+                    """,
+                    (start_iso,),
+                )
+                mode_rows = cur.fetchall()
+        return {
+            "count": int(total_row["cnt"]) if total_row else 0,
+            "by_mode": {row["mode"]: int(row["cnt"]) for row in mode_rows},
+            "storage_backend": get_database_backend(),
+            "window_hours": max(1, hours),
+            "generated_at": now.isoformat(),
+        }
 
     with get_db() as conn:
         total_row = conn.execute(
@@ -667,6 +1048,7 @@ def get_processing_complete_metrics(hours: int = 24) -> dict:
     return {
         "count": int(total_row["cnt"]) if total_row else 0,
         "by_mode": {row["mode"]: int(row["cnt"]) for row in mode_rows},
+        "storage_backend": get_database_backend(),
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),
     }
@@ -681,58 +1063,59 @@ def record_payment_initiation(
     entry_variant: str | None = None,
     checkout_source: str | None = None,
 ):
-    """Persist a server-side payment initiation event for exact-window counting."""
+    """Persist a server-side payment initiation event (dual-write with attribution)."""
     now = datetime.now(timezone.utc).isoformat()
-    if _use_metrics_postgres():
-        with _connect_metrics_postgres() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO payment_initiations
-                    (order_id, payment_provider, email, created_at)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (order_id) DO NOTHING
-                    """,
-                    (order_id, payment_provider, email.lower().strip(), now),
-                )
-            conn.commit()
-        return
+    normalized_email = email.lower().strip()
+    lp = _normalize_attr(landing_page)
+    cs = _normalize_attr(cta_slot)
+    ev = _normalize_attr(entry_variant)
+    src = _normalize_attr(checkout_source)
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
 
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO payment_initiations
-            (
-                order_id,
-                payment_provider,
-                email,
-                landing_page,
-                cta_slot,
-                entry_variant,
-                checkout_source,
-                created_at
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO payment_initiations
+                (order_id, payment_provider, email, landing_page, cta_slot, entry_variant, checkout_source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (order_id, payment_provider, normalized_email, lp, cs, ev, src, now),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                order_id,
-                payment_provider,
-                email.lower().strip(),
-                _normalize_attr(landing_page),
-                _normalize_attr(cta_slot),
-                _normalize_attr(entry_variant),
-                _normalize_attr(checkout_source),
-                now,
-            ),
-        )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write record_payment_initiation sqlite failed order_id=%s", order_id)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO payment_initiations
+                            (order_id, payment_provider, email, landing_page, cta_slot, entry_variant, checkout_source, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_id) DO NOTHING
+                        """,
+                        (order_id, payment_provider, normalized_email, lp, cs, ev, src, now),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write record_payment_initiation pg failed order_id=%s", order_id)
+
+    _record_obs("record_payment_initiation", sqlite_ok, pg_ok)
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for record_payment_initiation order_id={order_id}")
 
 
 def get_payment_initiation_metrics(hours: int = 24) -> dict:
-    """Return payment initiation count and provider split in trailing N hours."""
+    """Return payment initiation count and provider split in trailing N hours. PG-only when configured."""
     now, start_iso = _metrics_window(hours)
 
-    if _use_metrics_postgres():
-        with _connect_metrics_postgres() as conn:
+    if _use_postgres():
+        with _connect_postgres() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT COUNT(*) AS cnt FROM payment_initiations WHERE created_at >= %s",
@@ -756,7 +1139,7 @@ def get_payment_initiation_metrics(hours: int = 24) -> dict:
             "by_provider": {
                 row["payment_provider"]: int(row["cnt"]) for row in provider_rows
             },
-            "storage_backend": get_payment_metrics_storage_backend(),
+            "storage_backend": get_database_backend(),
             "window_hours": max(1, hours),
             "generated_at": now.isoformat(),
         }
@@ -782,7 +1165,7 @@ def get_payment_initiation_metrics(hours: int = 24) -> dict:
         "by_provider": {
             row["payment_provider"]: int(row["cnt"]) for row in provider_rows
         },
-        "storage_backend": get_payment_metrics_storage_backend(),
+        "storage_backend": get_database_backend(),
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),
     }
@@ -795,12 +1178,7 @@ def get_exact_funnel_tuple_metrics(
     checkout_source: str,
     hours: int = 24,
 ) -> dict:
-    """Return exact payment/processing counts for one funnel tuple."""
-    if _use_metrics_postgres():
-        raise RuntimeError(
-            "Exact funnel tuple metrics currently require sqlite metrics backend"
-        )
-
+    """Return exact payment/processing counts for one funnel tuple. PG-only when configured."""
     now, start_iso = _metrics_window(hours)
     normalized_tuple = {
         "landing_page": _normalize_attr(landing_page),
@@ -819,6 +1197,83 @@ def get_exact_funnel_tuple_metrics(
         normalized_tuple["entry_variant"],
         normalized_tuple["checkout_source"],
     )
+
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM payment_initiations
+                    WHERE created_at >= %s
+                      AND landing_page = %s
+                      AND cta_slot = %s
+                      AND entry_variant = %s
+                      AND checkout_source = %s
+                    """,
+                    tuple_params,
+                )
+                payment_row = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT payment_provider, COUNT(*) AS cnt
+                    FROM payment_initiations
+                    WHERE created_at >= %s
+                      AND landing_page = %s
+                      AND cta_slot = %s
+                      AND entry_variant = %s
+                      AND checkout_source = %s
+                    GROUP BY payment_provider
+                    ORDER BY cnt DESC
+                    """,
+                    tuple_params,
+                )
+                payment_provider_rows = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM processing_events
+                    WHERE completed_at >= %s
+                      AND landing_page = %s
+                      AND cta_slot = %s
+                      AND entry_variant = %s
+                      AND checkout_source = %s
+                    """,
+                    tuple_params,
+                )
+                processing_row = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT mode, COUNT(*) AS cnt
+                    FROM processing_events
+                    WHERE completed_at >= %s
+                      AND landing_page = %s
+                      AND cta_slot = %s
+                      AND entry_variant = %s
+                      AND checkout_source = %s
+                    GROUP BY mode
+                    ORDER BY cnt DESC
+                    """,
+                    tuple_params,
+                )
+                processing_mode_rows = cur.fetchall()
+
+        return {
+            **normalized_tuple,
+            "payment_initiations": int(payment_row["cnt"]) if payment_row else 0,
+            "payment_by_provider": {
+                row["payment_provider"]: int(row["cnt"])
+                for row in payment_provider_rows
+            },
+            "processing_completions": int(processing_row["cnt"]) if processing_row else 0,
+            "processing_by_mode": {
+                row["mode"]: int(row["cnt"])
+                for row in processing_mode_rows
+            },
+            "storage_backend": get_database_backend(),
+            "window_hours": max(1, hours),
+            "generated_at": now.isoformat(),
+        }
 
     with get_db() as conn:
         payment_row = conn.execute(
@@ -886,7 +1341,7 @@ def get_exact_funnel_tuple_metrics(
             row["mode"]: int(row["cnt"])
             for row in processing_mode_rows
         },
-        "storage_backend": get_payment_metrics_storage_backend(),
+        "storage_backend": get_database_backend(),
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),
     }
@@ -900,60 +1355,61 @@ def record_payment_success(
     payment_provider: str = "paypal",
     completed_at: str | None = None,
 ):
-    """Persist a server-side payment success event for exact-window counting."""
+    """Persist a server-side payment success event (dual-write)."""
     success_key = capture_id or (f"order:{order_id}" if order_id else None)
     if success_key is None:
         raise ValueError("record_payment_success requires capture_id or order_id")
 
     occurred_at = completed_at or datetime.now(timezone.utc).isoformat()
-    if _use_metrics_postgres():
-        with _connect_metrics_postgres() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO payment_successes
-                    (success_key, capture_id, order_id, payment_provider, email, completed_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (success_key) DO NOTHING
-                    """,
-                    (
-                        success_key,
-                        capture_id,
-                        order_id,
-                        payment_provider,
-                        email.lower().strip(),
-                        occurred_at,
-                    ),
-                )
-            conn.commit()
-        return
+    normalized_email = email.lower().strip()
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
 
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO payment_successes
-            (success_key, capture_id, order_id, payment_provider, email, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                success_key,
-                capture_id,
-                order_id,
-                payment_provider,
-                email.lower().strip(),
-                occurred_at,
-            ),
-        )
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO payment_successes
+                (success_key, capture_id, order_id, payment_provider, email, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (success_key, capture_id, order_id, payment_provider, normalized_email, occurred_at),
+            )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write record_payment_success sqlite failed key=%s", success_key)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO payment_successes
+                            (success_key, capture_id, order_id, payment_provider, email, completed_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (success_key) DO NOTHING
+                        """,
+                        (success_key, capture_id, order_id, payment_provider, normalized_email, occurred_at),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write record_payment_success pg failed key=%s", success_key)
+
+    _record_obs("record_payment_success", sqlite_ok, pg_ok)
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for record_payment_success key={success_key}")
 
 
 def get_payment_success_metrics(hours: int = 24) -> dict:
-    """Return payment success count and provider split in trailing N hours."""
+    """Return payment success count and provider split in trailing N hours. PG-only when configured."""
     now = datetime.now(timezone.utc)
     start = now.timestamp() - max(1, hours) * 3600
     start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
 
-    if _use_metrics_postgres():
-        with _connect_metrics_postgres() as conn:
+    if _use_postgres():
+        with _connect_postgres() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT COUNT(*) AS cnt FROM payment_successes WHERE completed_at >= %s",
@@ -977,7 +1433,7 @@ def get_payment_success_metrics(hours: int = 24) -> dict:
             "by_provider": {
                 row["payment_provider"]: int(row["cnt"]) for row in provider_rows
             },
-            "storage_backend": get_payment_metrics_storage_backend(),
+            "storage_backend": get_database_backend(),
             "window_hours": max(1, hours),
             "generated_at": now.isoformat(),
         }
@@ -1003,7 +1459,7 @@ def get_payment_success_metrics(hours: int = 24) -> dict:
         "by_provider": {
             row["payment_provider"]: int(row["cnt"]) for row in provider_rows
         },
-        "storage_backend": get_payment_metrics_storage_backend(),
+        "storage_backend": get_database_backend(),
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),
     }
