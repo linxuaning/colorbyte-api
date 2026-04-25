@@ -58,4 +58,7 @@ services:
       # Database path (WARNING: ephemeral on free tier - upgrade to paid for persistence)
       - key: DATABASE_PATH
         value: data/artimagehub.db
+      # Unified PostgreSQL URL (subscriptions + metrics). Use Neon connection string with pooler endpoint.
+      - key: DATABASE_URL
+        sync: false  # Set in Render dashboard (Neon connection string)
     healthCheckPath: /health

@@ -38,54 +38,170 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
 
 
-def _get_metrics_database_url() -> str:
-    return get_settings().metrics_database_url.strip()
+def _get_database_url() -> str:
+    """Unified Postgres URL. Prefers `database_url`; falls back to legacy `metrics_database_url`."""
+    settings = get_settings()
+    primary = settings.database_url.strip()
+    if primary:
+        return primary
+    return settings.metrics_database_url.strip()
 
 
-def _use_metrics_postgres() -> bool:
-    return bool(_get_metrics_database_url())
+def _use_postgres() -> bool:
+    return bool(_get_database_url())
 
 
-def get_payment_metrics_storage_backend() -> str:
-    return "postgres" if _use_metrics_postgres() else "sqlite"
+def get_database_backend() -> str:
+    return "postgres" if _use_postgres() else "sqlite"
 
 
-def _connect_metrics_postgres():
+def _connect_postgres():
     from psycopg import connect
     from psycopg.rows import dict_row
 
     return connect(
-        _get_metrics_database_url(),
+        _get_database_url(),
         connect_timeout=5,
         row_factory=dict_row,
     )
 
 
-def _init_metrics_postgres():
-    with _connect_metrics_postgres() as conn:
+# --- Deprecated metrics-only aliases (kept so app-code keeps working until Commit B) ---
+
+def _get_metrics_database_url() -> str:
+    return _get_database_url()
+
+
+def _use_metrics_postgres() -> bool:
+    return _use_postgres()
+
+
+def get_payment_metrics_storage_backend() -> str:
+    return get_database_backend()
+
+
+def _connect_metrics_postgres():
+    return _connect_postgres()
+
+
+def _init_postgres():
+    """Create all Postgres tables idempotently (subscriptions + auxiliary + metrics)."""
+    url = _get_database_url()
+    if "-pooler" not in url:
+        logger.warning(
+            "DATABASE_URL does not contain '-pooler' — direct Neon endpoint detected. "
+            "Consider switching to the pooler endpoint for connection scaling."
+        )
+
+    with _connect_postgres() as conn:
         with conn.cursor() as cur:
+            # subscriptions (P0 entitlement)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    email TEXT PRIMARY KEY,
+                    payment_provider TEXT DEFAULT 'lemonsqueezy',
+                    lemonsqueezy_customer_id TEXT,
+                    lemonsqueezy_subscription_id TEXT,
+                    bmc_supporter_id TEXT,
+                    bmc_membership_id TEXT,
+                    paypal_order_id TEXT,
+                    paypal_payer_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'none',
+                    trial_start TIMESTAMPTZ,
+                    trial_end TIMESTAMPTZ,
+                    current_period_start TIMESTAMPTZ,
+                    current_period_end TIMESTAMPTZ,
+                    cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sub_lemonsqueezy_customer ON subscriptions(lemonsqueezy_customer_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sub_lemonsqueezy_sub ON subscriptions(lemonsqueezy_subscription_id);")
+
+            # webhook_events (P1 idempotency)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS webhook_events (
+                    event_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    processed_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+
+            # paypal_checkout_context (P1 webhook→email mapping)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paypal_checkout_context (
+                    order_id TEXT PRIMARY KEY,
+                    checkout_email TEXT NOT NULL,
+                    payer_email TEXT,
+                    capture_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paypal_checkout_email ON paypal_checkout_context(checkout_email);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paypal_capture_id ON paypal_checkout_context(capture_id);")
+
+            # downloads (P2 free-tier rate limit)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS downloads (
+                    id BIGSERIAL PRIMARY KEY,
+                    ip TEXT NOT NULL,
+                    download_date DATE NOT NULL,
+                    task_id TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_downloads_ip_date ON downloads(ip, download_date);")
+
+            # processing_events (P2 attribution metrics)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processing_events (
+                    task_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    landing_page TEXT,
+                    cta_slot TEXT,
+                    entry_variant TEXT,
+                    checkout_source TEXT,
+                    completed_at TIMESTAMPTZ NOT NULL
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_processing_events_completed_at ON processing_events(completed_at);")
+
+            # payment_initiations (existing) + attribution columns
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS payment_initiations (
                     order_id TEXT PRIMARY KEY,
                     payment_provider TEXT NOT NULL,
                     email TEXT NOT NULL,
+                    landing_page TEXT,
+                    cta_slot TEXT,
+                    entry_variant TEXT,
+                    checkout_source TEXT,
                     created_at TIMESTAMPTZ NOT NULL
                 );
                 """
             )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_payment_initiations_created_at
-                    ON payment_initiations(created_at);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_payment_initiations_provider_created_at
-                    ON payment_initiations(payment_provider, created_at);
-                """
-            )
+            # Backfill attribution columns for pre-existing PG installations
+            cur.execute("ALTER TABLE payment_initiations ADD COLUMN IF NOT EXISTS landing_page TEXT;")
+            cur.execute("ALTER TABLE payment_initiations ADD COLUMN IF NOT EXISTS cta_slot TEXT;")
+            cur.execute("ALTER TABLE payment_initiations ADD COLUMN IF NOT EXISTS entry_variant TEXT;")
+            cur.execute("ALTER TABLE payment_initiations ADD COLUMN IF NOT EXISTS checkout_source TEXT;")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_initiations_created_at ON payment_initiations(created_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_initiations_provider_created_at ON payment_initiations(payment_provider, created_at);")
+
+            # payment_successes
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS payment_successes (
@@ -98,20 +214,15 @@ def _init_metrics_postgres():
                 );
                 """
             )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_payment_successes_completed_at
-                    ON payment_successes(completed_at);
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_payment_successes_provider_completed_at
-                    ON payment_successes(payment_provider, completed_at);
-                """
-            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_successes_completed_at ON payment_successes(completed_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_successes_provider_completed_at ON payment_successes(payment_provider, completed_at);")
         conn.commit()
-    logger.info("Metrics Postgres initialized")
+    logger.info("PostgreSQL schema initialized (subscriptions + auxiliary + metrics)")
+
+
+# Deprecated alias retained for callers in current app-code; rewritten in Commit B.
+def _init_metrics_postgres():
+    _init_postgres()
 
 
 def _seed_owner_access():
@@ -230,11 +341,11 @@ def init_db():
         _ensure_columns(conn, "payment_initiations", _ATTRIBUTION_COLUMNS)
     logger.info("Database initialized at %s", path)
 
-    if _use_metrics_postgres():
+    if _use_postgres():
         try:
-            _init_metrics_postgres()
+            _init_postgres()
         except Exception:
-            logger.warning("Metrics Postgres initialization failed", exc_info=True)
+            logger.warning("PostgreSQL initialization failed", exc_info=True)
 
     _seed_owner_access()
 

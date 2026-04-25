@@ -96,7 +96,8 @@ class Settings(BaseSettings):
 
     # Database
     database_path: str = "data/artimagehub.db"
-    metrics_database_url: str = ""
+    database_url: str = ""           # Unified PG (subscriptions + metrics). Falls back to metrics_database_url for back-compat.
+    metrics_database_url: str = ""   # Deprecated alias retained for back-compat.
 
     # CORS
     frontend_url: str = "http://localhost:3000"

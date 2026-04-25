@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import upload, tasks, download, payment, metrics, admin
-from app.services.database import get_payment_metrics_storage_backend, init_db
+from app.services.database import get_database_backend, get_payment_metrics_storage_backend, init_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +78,8 @@ async def health_check():
         "configured_ai_provider": settings.ai_provider,
         "provider_source": provider_source,
         "replicate_token_configured": bool(settings.replicate_api_token),
+        "database_url_configured": bool(settings.database_url or settings.metrics_database_url),
+        "database_backend": get_database_backend(),
         "metrics_database_configured": bool(settings.metrics_database_url),
         "payment_metrics_backend": get_payment_metrics_storage_backend(),
     }
