@@ -965,6 +965,21 @@ def _handle_dodo_payment_succeeded(event_data: dict):
             completed_at=now.isoformat(),
         )
 
+    # Enqueue Mask post-purchase thank-you email (5 min after purchase).
+    # All hard guards (provider/status/owner/kill-switch) are inside enqueue;
+    # never raises — best-effort, won't break webhook ack.
+    if payment_id:
+        from app.services.mask_email import enqueue_mask_email
+
+        enqueue_mask_email(
+            email=primary_email,
+            payment_id=payment_id,
+            payment_provider="dodo",
+            subscription_status="active",
+            landing_page=metadata.get("landing_page") if isinstance(metadata, dict) else None,
+            customer_name=customer.get("name") if isinstance(customer, dict) else None,
+        )
+
     if checkout_email and payer_email and checkout_email != payer_email:
         upsert_subscription(
             email=checkout_email,

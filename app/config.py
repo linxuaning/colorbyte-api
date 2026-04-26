@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     # Admin
     admin_secret: str = ""  # Set ADMIN_SECRET env var to enable /api/admin/* endpoints
 
+    # Mask post-purchase thank-you email (founder feature, 2026-04-26)
+    mask_email_enabled: bool = True  # Kill switch: set MASK_EMAIL_ENABLED=false to stop all sends
+
     # Database
     database_path: str = "data/artimagehub.db"
     database_url: str = ""           # Unified PG (subscriptions + metrics). Falls back to metrics_database_url for back-compat.
