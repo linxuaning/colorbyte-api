@@ -23,6 +23,7 @@ from app.services.database import (
     is_event_processed,
     mark_event_processed,
     record_payment_initiation,
+    record_payment_success,
 )
 
 logger = logging.getLogger("artimagehub.payment")
@@ -953,6 +954,16 @@ def _handle_dodo_payment_succeeded(event_data: dict):
         current_period_start=now.isoformat(),
         current_period_end=period_end.isoformat(),
     )
+
+    # Record success for /api/metrics/payment-successes counter (forward-only;
+    # historical rows pre-dating this commit are not backfilled).
+    if payment_id:
+        record_payment_success(
+            order_id=payment_id,
+            email=primary_email,
+            payment_provider="dodo",
+            completed_at=now.isoformat(),
+        )
 
     if checkout_email and payer_email and checkout_email != payer_email:
         upsert_subscription(
