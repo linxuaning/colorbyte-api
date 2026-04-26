@@ -1,0 +1,40 @@
+name: Mask post-purchase email poll
+
+# GitHub Actions cron min granularity is 5 minutes. Drops are common on free
+# tier (per keepalive.yml note); two staggered schedules keep us close to the
+# 5-min nominal cadence. The poll endpoint is idempotent — duplicate fires
+# only re-scan the queue, no duplicate sends (sent_at gate + UNIQUE constraint).
+on:
+  schedule:
+    - cron: '*/5 * * * *'          # 0, 5, 10, ... minutes past the hour
+    - cron: '2-59/5 * * * *'       # 2, 7, 12, ... offset by 2 min for redundancy
+  workflow_dispatch:
+
+concurrency:
+  group: mask-email-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Trigger Mask email poll
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+        run: |
+          if [ -z "$ADMIN_SECRET" ]; then
+            echo "WARN: ADMIN_SECRET not set in repo secrets — skipping poll (cron will silently no-op until configured)"
+            exit 0
+          fi
+          echo "::group::POST /api/internal/mask-email-poll"
+          # Auth header uses env-var expansion (per feedback_admin_cmd_output_redact);
+          # secret never appears in stdout/stderr/log.
+          response=$(curl -sS -X POST \
+            -H "Authorization: Bearer $ADMIN_SECRET" \
+            -H "Content-Type: application/json" \
+            --max-time 60 \
+            -w "\nhttp=%{http_code}\n" \
+            "https://colorbyte-api.onrender.com/api/internal/mask-email-poll")
+          echo "$response"
+          echo "::endgroup::"
