@@ -284,8 +284,31 @@ def _init_postgres():
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_successes_completed_at ON payment_successes(completed_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_successes_provider_completed_at ON payment_successes(payment_provider, completed_at);")
+
+            # mask_email_queue (post-purchase Mask thank-you email; founder-driven feature)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mask_email_queue (
+                    id BIGSERIAL PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    payment_id TEXT NOT NULL,
+                    first_name TEXT,
+                    tool_name TEXT,
+                    scheduled_at TIMESTAMPTZ NOT NULL,
+                    sent_at TIMESTAMPTZ,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (email, payment_id)
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mask_email_due ON mask_email_queue(scheduled_at) WHERE sent_at IS NULL;"
+            )
         conn.commit()
-    logger.info("PostgreSQL schema initialized (subscriptions + auxiliary + metrics)")
+    logger.info("PostgreSQL schema initialized (subscriptions + auxiliary + metrics + mask_email_queue)")
 
 
 # Deprecated alias retained for callers in current app-code; rewritten in Commit B.
