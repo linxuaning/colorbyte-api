@@ -957,12 +957,20 @@ def _handle_dodo_payment_succeeded(event_data: dict):
 
     # Record success for /api/metrics/payment-successes counter (forward-only;
     # historical rows pre-dating this commit are not backfilled).
+    # Attribution fields ride along on Dodo's metadata echo from the
+    # checkout-create call, so the success row captures the same funnel
+    # source the initiation row recorded — analyst can join on email or
+    # read either table directly.
     if payment_id:
         record_payment_success(
             order_id=payment_id,
             email=primary_email,
             payment_provider="dodo",
             completed_at=now.isoformat(),
+            landing_page=metadata.get("landing_page") if isinstance(metadata, dict) else None,
+            cta_slot=metadata.get("cta_slot") if isinstance(metadata, dict) else None,
+            entry_variant=metadata.get("entry_variant") if isinstance(metadata, dict) else None,
+            checkout_source=metadata.get("checkout_source") if isinstance(metadata, dict) else None,
         )
 
     # Enqueue Mask post-purchase thank-you email (5 min after purchase).

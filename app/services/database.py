@@ -269,7 +269,7 @@ def _init_postgres():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_initiations_created_at ON payment_initiations(created_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_initiations_provider_created_at ON payment_initiations(payment_provider, created_at);")
 
-            # payment_successes
+            # payment_successes (with attribution columns; mirrors payment_initiations)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS payment_successes (
@@ -278,10 +278,19 @@ def _init_postgres():
                     order_id TEXT,
                     payment_provider TEXT NOT NULL,
                     email TEXT NOT NULL,
+                    landing_page TEXT,
+                    cta_slot TEXT,
+                    entry_variant TEXT,
+                    checkout_source TEXT,
                     completed_at TIMESTAMPTZ NOT NULL
                 );
                 """
             )
+            # Backfill attribution columns for pre-existing PG installations.
+            cur.execute("ALTER TABLE payment_successes ADD COLUMN IF NOT EXISTS landing_page TEXT;")
+            cur.execute("ALTER TABLE payment_successes ADD COLUMN IF NOT EXISTS cta_slot TEXT;")
+            cur.execute("ALTER TABLE payment_successes ADD COLUMN IF NOT EXISTS entry_variant TEXT;")
+            cur.execute("ALTER TABLE payment_successes ADD COLUMN IF NOT EXISTS checkout_source TEXT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_successes_completed_at ON payment_successes(completed_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_successes_provider_completed_at ON payment_successes(payment_provider, completed_at);")
 
@@ -421,6 +430,10 @@ def init_db():
                 order_id TEXT,
                 payment_provider TEXT NOT NULL,
                 email TEXT NOT NULL,
+                landing_page TEXT,
+                cta_slot TEXT,
+                entry_variant TEXT,
+                checkout_source TEXT,
                 completed_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_payment_successes_completed_at
@@ -430,6 +443,7 @@ def init_db():
         """)
         _ensure_columns(conn, "processing_events", _ATTRIBUTION_COLUMNS)
         _ensure_columns(conn, "payment_initiations", _ATTRIBUTION_COLUMNS)
+        _ensure_columns(conn, "payment_successes", _ATTRIBUTION_COLUMNS)
     logger.info("Database initialized at %s", path)
 
     if _use_postgres():
@@ -1377,14 +1391,28 @@ def record_payment_success(
     email: str,
     payment_provider: str = "paypal",
     completed_at: str | None = None,
+    landing_page: str | None = None,
+    cta_slot: str | None = None,
+    entry_variant: str | None = None,
+    checkout_source: str | None = None,
 ):
-    """Persist a server-side payment success event (dual-write)."""
+    """Persist a server-side payment success event (dual-write with attribution).
+
+    The four attribution fields mirror those on payment_initiations so the
+    funnel from "first paint" through "paid" can be analysed without a
+    metadata join. They are nullable to preserve compatibility with callers
+    that don't yet pass attribution (e.g. the legacy PayPal capture flow).
+    """
     success_key = capture_id or (f"order:{order_id}" if order_id else None)
     if success_key is None:
         raise ValueError("record_payment_success requires capture_id or order_id")
 
     occurred_at = completed_at or datetime.now(timezone.utc).isoformat()
     normalized_email = email.lower().strip()
+    lp = _normalize_attr(landing_page)
+    cs = _normalize_attr(cta_slot)
+    ev = _normalize_attr(entry_variant)
+    src = _normalize_attr(checkout_source)
     sqlite_ok = False
     pg_ok = not _use_postgres()
 
@@ -1393,10 +1421,12 @@ def record_payment_success(
             conn.execute(
                 """
                 INSERT OR IGNORE INTO payment_successes
-                (success_key, capture_id, order_id, payment_provider, email, completed_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (success_key, capture_id, order_id, payment_provider, email,
+                 landing_page, cta_slot, entry_variant, checkout_source, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (success_key, capture_id, order_id, payment_provider, normalized_email, occurred_at),
+                (success_key, capture_id, order_id, payment_provider, normalized_email,
+                 lp, cs, ev, src, occurred_at),
             )
         sqlite_ok = True
     except Exception:
@@ -1409,11 +1439,13 @@ def record_payment_success(
                     cur.execute(
                         """
                         INSERT INTO payment_successes
-                            (success_key, capture_id, order_id, payment_provider, email, completed_at)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                            (success_key, capture_id, order_id, payment_provider, email,
+                             landing_page, cta_slot, entry_variant, checkout_source, completed_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (success_key) DO NOTHING
                         """,
-                        (success_key, capture_id, order_id, payment_provider, normalized_email, occurred_at),
+                        (success_key, capture_id, order_id, payment_provider, normalized_email,
+                         lp, cs, ev, src, occurred_at),
                     )
                 conn.commit()
             pg_ok = True
