@@ -49,6 +49,13 @@ class Settings(BaseSettings):
         "caidas/swin2SR-lightweight-x2-64"
     )
 
+    # LaMa inpainting inference (/api/inpaint/lama, object remover).
+    # Primary: standalone server on 192.168.68.221 via Cloudflare Tunnel.
+    # Fallback: HF Spaces (Carve/LaMa-Demo) via gradio_client.
+    # DO NOT commit real values — set via Render env vars only.
+    lama_inference_url: str = ""    # e.g. https://lama-inference.artimagehub.com (no trailing slash)
+    lama_inference_token: str = ""  # bearer token from setup-221.sh ~/.lama-server-token
+
     # Storage (Cloudflare R2 - future)
     r2_account_id: str = ""
     r2_access_key_id: str = ""
