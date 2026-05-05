@@ -77,6 +77,36 @@ GEO_SOURCES = {
 }
 
 
+def _ga4_token() -> tuple:
+    """Return (token, url, headers) or raise."""
+    sa_json = os.environ.get("ARTIMAGEHUB_GA4_SA_KEY", "").strip()
+    if not sa_json:
+        raise RuntimeError("ARTIMAGEHUB_GA4_SA_KEY not set")
+    from google.oauth2 import service_account  # type: ignore
+    from google.auth.transport.requests import Request as GRequest  # type: ignore
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(sa_json),
+        scopes=["https://www.googleapis.com/auth/analytics.readonly"],
+    )
+    creds.refresh(GRequest())
+    url = "https://analyticsdata.googleapis.com/v1beta/properties/525510036:runReport"
+    headers = {"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"}
+    return url, headers
+
+
+def _ga4_post(url: str, headers: dict, body: dict) -> dict:
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def ascii_bar(value: int, max_val: int, width: int = 18) -> str:
+    if max_val == 0:
+        return "░" * width
+    filled = round(value / max_val * width)
+    return "█" * filled + "░" * (width - filled)
+
+
 def fetch_ga4_metrics() -> dict:
     """Fetch yesterday's PV, UV, sessions, GEO breakdown from GA4 Data API.
     Returns {'available': False} when SA key is missing or import fails."""
@@ -84,53 +114,37 @@ def fetch_ga4_metrics() -> dict:
     if not sa_json:
         return {"available": False, "reason": "ARTIMAGEHUB_GA4_SA_KEY not set"}
     try:
-        from google.oauth2 import service_account  # type: ignore
-        from google.auth.transport.requests import Request as GRequest  # type: ignore
+        from google.oauth2 import service_account  # type: ignore  # noqa: F401
+        from google.auth.transport.requests import Request as GRequest  # type: ignore  # noqa: F401
     except ImportError:
         return {"available": False, "reason": "google-auth not installed"}
     try:
         from datetime import date, timedelta
 
-        creds = service_account.Credentials.from_service_account_info(
-            json.loads(sa_json),
-            scopes=["https://www.googleapis.com/auth/analytics.readonly"],
-        )
-        creds.refresh(GRequest())
-        token = creds.token
-
+        url, headers = _ga4_token()
         yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-        url = "https://analyticsdata.googleapis.com/v1beta/properties/525510036:runReport"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        # Total PV / UV / sessions
-        body = {
+        total = _ga4_post(url, headers, {
             "dateRanges": [{"startDate": yesterday, "endDate": yesterday}],
             "metrics": [
                 {"name": "screenPageViews"},
                 {"name": "activeUsers"},
                 {"name": "sessions"},
             ],
-        }
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=30) as r:
-            total = json.loads(r.read())
+        })
 
         pv = uv = sessions = 0
         if total.get("rows"):
             vals = total["rows"][0]["metricValues"]
             pv, uv, sessions = int(vals[0]["value"]), int(vals[1]["value"]), int(vals[2]["value"])
 
-        # Sessions by source to extract GEO
-        geo_body = {
+        by_src = _ga4_post(url, headers, {
             "dateRanges": [{"startDate": yesterday, "endDate": yesterday}],
             "dimensions": [{"name": "sessionSource"}],
             "metrics": [{"name": "sessions"}],
             "orderBys": [{"metric": {"metricName": "sessions"}, "desc": True}],
             "limit": 100,
-        }
-        req2 = urllib.request.Request(url, data=json.dumps(geo_body).encode(), headers=headers, method="POST")
-        with urllib.request.urlopen(req2, timeout=30) as r:
-            by_src = json.loads(r.read())
+        })
 
         geo_sessions = 0
         geo_breakdown: dict[str, int] = {}
@@ -151,6 +165,64 @@ def fetch_ga4_metrics() -> dict:
             "geo_pct": (geo_sessions / sessions * 100) if sessions > 0 else 0.0,
             "geo_breakdown": geo_breakdown,
         }
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
+def fetch_ga4_7day_trend() -> dict:
+    """Fetch 7-day daily PV/UV/GEO trend for sparkline charts in the email."""
+    sa_json = os.environ.get("ARTIMAGEHUB_GA4_SA_KEY", "").strip()
+    if not sa_json:
+        return {"available": False}
+    try:
+        from google.oauth2 import service_account  # type: ignore  # noqa: F401
+        from google.auth.transport.requests import Request as GRequest  # type: ignore  # noqa: F401
+    except ImportError:
+        return {"available": False}
+    try:
+        url, headers = _ga4_token()
+
+        # Daily PV/UV/sessions for last 7 complete days
+        daily = _ga4_post(url, headers, {
+            "dateRanges": [{"startDate": "7daysAgo", "endDate": "yesterday"}],
+            "dimensions": [{"name": "date"}],
+            "metrics": [
+                {"name": "screenPageViews"},
+                {"name": "activeUsers"},
+                {"name": "sessions"},
+            ],
+            "orderBys": [{"dimension": {"dimensionName": "date"}}],
+        })
+
+        # Daily GEO sessions (date + source)
+        geo_daily = _ga4_post(url, headers, {
+            "dateRanges": [{"startDate": "7daysAgo", "endDate": "yesterday"}],
+            "dimensions": [{"name": "date"}, {"name": "sessionSource"}],
+            "metrics": [{"name": "sessions"}],
+            "limit": 500,
+        })
+
+        # Build geo_by_date lookup
+        geo_by_date: dict[str, int] = {}
+        for row in (geo_daily.get("rows") or []):
+            d = row["dimensionValues"][0]["value"]  # YYYYMMDD
+            src = row["dimensionValues"][1]["value"]
+            n = int(row["metricValues"][0]["value"])
+            if src in GEO_SOURCES:
+                geo_by_date[d] = geo_by_date.get(d, 0) + n
+
+        rows = []
+        for row in (daily.get("rows") or []):
+            d = row["dimensionValues"][0]["value"]  # YYYYMMDD
+            vals = row["metricValues"]
+            pv = int(vals[0]["value"])
+            uv = int(vals[1]["value"])
+            sess = int(vals[2]["value"])
+            geo = geo_by_date.get(d, 0)
+            label = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+            rows.append({"date": label, "pv": pv, "uv": uv, "sessions": sess, "geo": geo})
+
+        return {"available": True, "rows": rows}
     except Exception as e:
         return {"available": False, "reason": str(e)}
 
@@ -223,6 +295,7 @@ def build_email_body() -> tuple[str, str]:
     )
 
     ga4 = fetch_ga4_metrics()
+    trend = fetch_ga4_7day_trend()
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     subj = f"[artimagehub daily] {today} — paid={succ_now} ${revenue:.2f} | checkout={init_now} | conv={conv:.1f}%"
@@ -263,6 +336,37 @@ def build_email_body() -> tuple[str, str]:
             lines.append("  GEO breakdown: (none detected)")
     else:
         lines.append(f"Traffic: (GA4 not available — {ga4.get('reason', 'unknown')})")
+
+    # 7-day trend charts
+    if trend.get("available") and trend.get("rows"):
+        trows = trend["rows"]
+        max_uv  = max((r["uv"]  for r in trows), default=1) or 1
+        max_pv  = max((r["pv"]  for r in trows), default=1) or 1
+        max_geo = max((r["geo"] for r in trows), default=1) or 1
+
+        lines += ["", "─" * 50, "7-day trend (UV · PV · GEO/AI sessions)", "─" * 50]
+        lines.append(f"{'Date':<12}  {'UV':>4}  {'bar':<18}  {'PV':>5}  {'GEO':>4}")
+        lines.append(f"{'────────────':<12}  {'────':>4}  {'──────────────────':<18}  {'─────':>5}  {'────':>4}")
+        for r in trows:
+            bar = ascii_bar(r["uv"], max_uv)
+            lines.append(f"{r['date']:<12}  {r['uv']:>4}  {bar:<18}  {r['pv']:>5}  {r['geo']:>4}")
+
+        lines.append("")
+        lines.append("GEO/AI trend (sessions/day):")
+        for r in trows:
+            bar = ascii_bar(r["geo"], max_geo)
+            pct = f"{r['geo']/r['sessions']*100:.0f}%" if r["sessions"] else "0%"
+            lines.append(f"  {r['date']}  {bar}  {r['geo']:>3} ({pct})")
+
+        total_uv  = sum(r["uv"]  for r in trows)
+        total_geo = sum(r["geo"] for r in trows)
+        lines += [
+            "",
+            f"7d totals: UV={total_uv}  GEO sessions={total_geo}",
+            "─" * 50,
+        ]
+    elif not trend.get("available"):
+        lines += ["", f"7-day trend: (unavailable — {trend.get('reason', 'GA4 key not set')})"]
 
     lines += [
         "",
