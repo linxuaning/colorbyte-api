@@ -350,7 +350,7 @@ def _init_metrics_postgres():
 
 
 def _seed_owner_access():
-    """Grant the configured owner email paid access if not already active."""
+    """Grant the configured owner email paid access to all features (idempotent)."""
     from app.config import get_settings
     owner_email = get_settings().alert_email_to
     if not owner_email:
@@ -358,7 +358,13 @@ def _seed_owner_access():
     sub = get_subscription(owner_email)
     if sub is None or sub["status"] not in ("active", "trialing", "on_trial"):
         upsert_subscription(owner_email, payment_provider="seed", status="active")
-        logger.info("Owner access seeded: %s", owner_email)
+        logger.info("Owner access seeded (subscriptions): %s", owner_email)
+    for feature_key in (FEATURE_RESTORATION, FEATURE_DENOISING, FEATURE_DEBLURRING, FEATURE_JPEG_FIX):
+        try:
+            grant_feature_entitlement(owner_email, feature_key, payment_id="seed")
+        except Exception:
+            logger.warning("Owner feature seed failed: %s feature=%s", owner_email, feature_key, exc_info=True)
+    logger.info("Owner feature entitlements seeded: %s", owner_email)
 
 
 def init_db():
