@@ -1261,6 +1261,99 @@ class PhotoFixProvider(AIProvider):
             return ProcessingResult(success=False, error=str(exc))
 
 
+class NAFNetDenoiseProvider:
+    """Photo denoising via NAFNet (HF Space: chuxiaojie/NAFNet).
+
+    Falls back to PIL-based sharpening if the Space is unavailable.
+    """
+
+    SPACE_ID = "chuxiaojie/NAFNet"
+    TIMEOUT_S = 120
+
+    async def denoise_photo(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback: ProgressCallback,
+        email: str = "",
+    ) -> ProcessingResult:
+        import logging
+        logger = logging.getLogger("artimagehub.nafnet")
+
+        if progress_callback:
+            await progress_callback("Analyzing noise...", 10)
+
+        try:
+            from gradio_client import Client, handle_file
+
+            client = Client(self.SPACE_ID, verbose=False)
+            img = handle_file(input_path)
+
+            if progress_callback:
+                await progress_callback("Denoising with NAFNet...", 30)
+
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.predict,
+                    img,
+                    "SIDD",   # task: real-world noise removal
+                    api_name="/predict",
+                ),
+                timeout=self.TIMEOUT_S,
+            )
+
+            if isinstance(result, tuple):
+                result = result[0]
+            if isinstance(result, dict):
+                result = result.get("path") or result.get("url") or str(result)
+
+            if not result:
+                raise RuntimeError("NAFNet returned empty result")
+
+            if progress_callback:
+                await progress_callback("Writing result...", 90)
+
+            shutil.copy2(str(result), output_path)
+
+            if progress_callback:
+                await progress_callback("Complete", 100)
+
+            logger.info("NAFNet denoising succeeded")
+            return ProcessingResult(success=True, output_path=output_path)
+
+        except Exception as exc:
+            logger.warning("NAFNet denoising failed (%s); applying PIL sharpen fallback", exc)
+            return await self._pil_denoise_fallback(input_path, output_path, progress_callback)
+
+    async def _pil_denoise_fallback(
+        self, input_path: str, output_path: str, progress_callback: ProgressCallback
+    ) -> ProcessingResult:
+        """Bilateral-filter-style PIL fallback: smoothing + sharpening."""
+        import logging
+        logger = logging.getLogger("artimagehub.nafnet")
+        try:
+            from PIL import Image, ImageFilter, ImageEnhance
+
+            def _process():
+                img = Image.open(input_path).convert("RGB")
+                # Smooth then sharpen — approximates noise reduction
+                img = img.filter(ImageFilter.SMOOTH_MORE)
+                img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=130, threshold=2))
+                img = ImageEnhance.Contrast(img).enhance(1.1)
+                img.save(output_path, "JPEG", quality=90)
+
+            await asyncio.to_thread(_process)
+
+            if progress_callback:
+                await progress_callback("Complete (fallback)", 100)
+
+            logger.info("NAFNet PIL fallback succeeded")
+            return ProcessingResult(success=True, output_path=output_path)
+        except Exception as exc:
+            logger.error("NAFNet PIL fallback also failed: %s", exc)
+            return ProcessingResult(success=False, error=str(exc))
+
+
 class AIService:
     """Delegates to the configured AI provider."""
 
@@ -1268,6 +1361,7 @@ class AIService:
         settings = get_settings()
         provider = get_effective_ai_provider(settings)
         self._fallback_provider: AIProvider | None = None
+        self._denoise_provider = NAFNetDenoiseProvider()
 
         if provider == "local":
             import logging
@@ -1348,6 +1442,17 @@ class AIService:
                 input_path, output_path, colorize, progress_callback, email=email,
             )
         return result
+
+    async def denoise_photo(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback: ProgressCallback = None,
+        email: str = "",
+    ) -> ProcessingResult:
+        return await self._denoise_provider.denoise_photo(
+            input_path, output_path, progress_callback, email=email
+        )
 
 
 _service: AIService | None = None

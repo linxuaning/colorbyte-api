@@ -52,7 +52,7 @@ from app.services.storage import save_upload
 from app.services.task_store import create_task, update_task, TaskStatus
 from app.services.ai_service import get_ai_service
 from app.services.storage import RESULT_DIR
-from app.services.database import is_user_active, record_processing_complete
+from app.services.database import is_feature_entitled, record_processing_complete
 from app.services.alert_email import send_payment_failure_alert
 
 router = APIRouter()
@@ -69,6 +69,7 @@ async def upload_image(
     file: UploadFile = File(...),
     colorize: bool = Form(False),
     email: str = Form(""),
+    feature_key: str = Form("restoration"),
     landing_page: str = Form(""),
     cta_slot: str = Form(""),
     entry_variant: str = Form(""),
@@ -94,10 +95,10 @@ async def upload_image(
                 detail="Paid access is required before upload and processing. Complete checkout first, then return with the same email.",
             )
 
-        if not is_user_active(normalized_email):
+        if not is_feature_entitled(normalized_email, feature_key):
             raise HTTPException(
                 status_code=402,
-                detail="Paid access is required before upload and processing. Complete checkout with this email, then return to start.",
+                detail=f"Access to '{feature_key}' requires a separate $4.99 unlock. Complete checkout for this feature, then return to start.",
             )
 
     # Validate file type
@@ -128,6 +129,7 @@ async def upload_image(
         upload_path=upload_path,
         colorize=colorize,
         email=normalized_email,
+        feature_key=feature_key.strip() or "restoration",
         landing_page=landing_page.strip() or None,
         cta_slot=cta_slot.strip() or None,
         entry_variant=entry_variant.strip() or None,
@@ -164,14 +166,23 @@ async def _process_task(task_id: str):
         async def on_progress(stage: str, progress: int):
             update_task(task_id, stage=stage, progress=progress)
 
+        from app.services.database import FEATURE_DENOISING
         ai = get_ai_service()
-        result = await ai.process_photo(
-            input_path=task.upload_path,
-            output_path=result_path,
-            colorize=task.colorize,
-            progress_callback=on_progress,
-            email=task.email,
-        )
+        if task.feature_key == FEATURE_DENOISING:
+            result = await ai.denoise_photo(
+                input_path=task.upload_path,
+                output_path=result_path,
+                progress_callback=on_progress,
+                email=task.email,
+            )
+        else:
+            result = await ai.process_photo(
+                input_path=task.upload_path,
+                output_path=result_path,
+                colorize=task.colorize,
+                progress_callback=on_progress,
+                email=task.email,
+            )
 
         if result.success:
             # Do NOT cap the AI output. The paid "HD Original" download must
@@ -179,7 +190,7 @@ async def _process_task(task_id: str):
             # safety on Render free during preview generation is handled in
             # download._create_preview via PIL.Image.draft() subsampling.
 
-            mode = "colorize" if task.colorize else "restore"
+            mode = task.feature_key if task.feature_key != "restoration" else ("colorize" if task.colorize else "restore")
             record_processing_complete(
                 task_id=task_id,
                 mode=mode,

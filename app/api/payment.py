@@ -24,6 +24,8 @@ from app.services.database import (
     mark_event_processed,
     record_payment_initiation,
     record_payment_success,
+    grant_feature_entitlement,
+    FEATURE_RESTORATION,
 )
 
 logger = logging.getLogger("artimagehub.payment")
@@ -758,6 +760,7 @@ def _handle_bmc_donation(data: dict):
 class DodoCreateCheckoutRequest(BaseModel):
     """Request to create a Dodo checkout session."""
     email: EmailStr
+    feature_key: str = "restoration"
     resume_task_id: str | None = None
     landing_page: str | None = None
     cta_slot: str | None = None
@@ -793,6 +796,7 @@ async def create_dodo_checkout(request: DodoCreateCheckoutRequest):
     cancel_params: dict[str, str] = {}
     metadata: dict[str, str] = {
         "checkout_email": request.email,
+        "feature_key": request.feature_key,
     }
 
     if request.resume_task_id:
@@ -935,6 +939,7 @@ def _handle_dodo_payment_succeeded(event_data: dict):
 
     payer_email = str(customer.get("email", "")).strip().lower()
     checkout_email = str(metadata.get("checkout_email", "")).strip().lower()
+    feature_key = str(metadata.get("feature_key", FEATURE_RESTORATION)).strip() or FEATURE_RESTORATION
 
     primary_email = payer_email or checkout_email
     if not primary_email:
@@ -947,13 +952,19 @@ def _handle_dodo_payment_succeeded(event_data: dict):
     now = datetime.now(timezone.utc)
     period_end = now + timedelta(days=36500)  # 100 years
 
-    upsert_subscription(
-        email=primary_email,
-        payment_provider="dodo",
-        status="active",
-        current_period_start=now.isoformat(),
-        current_period_end=period_end.isoformat(),
-    )
+    # Grant per-feature entitlement (new model)
+    grant_feature_entitlement(primary_email, feature_key, payment_id or None)
+
+    # Legacy subscriptions table: only for restoration (backward compat).
+    # New features (denoising etc.) are access-controlled via feature_entitlements only.
+    if feature_key == FEATURE_RESTORATION:
+        upsert_subscription(
+            email=primary_email,
+            payment_provider="dodo",
+            status="active",
+            current_period_start=now.isoformat(),
+            current_period_end=period_end.isoformat(),
+        )
 
     # Record success for /api/metrics/payment-successes counter (forward-only;
     # historical rows pre-dating this commit are not backfilled).
@@ -989,13 +1000,15 @@ def _handle_dodo_payment_succeeded(event_data: dict):
         )
 
     if checkout_email and payer_email and checkout_email != payer_email:
-        upsert_subscription(
-            email=checkout_email,
-            payment_provider="dodo",
-            status="active",
-            current_period_start=now.isoformat(),
-            current_period_end=period_end.isoformat(),
-        )
+        grant_feature_entitlement(checkout_email, feature_key, payment_id or None)
+        if feature_key == FEATURE_RESTORATION:
+            upsert_subscription(
+                email=checkout_email,
+                payment_provider="dodo",
+                status="active",
+                current_period_start=now.isoformat(),
+                current_period_end=period_end.isoformat(),
+            )
         logger.info(
             "Dodo Pro activated for both emails: payer=%s checkout=%s payment_id=%s",
             payer_email,

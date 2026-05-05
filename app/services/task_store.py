@@ -38,6 +38,7 @@ class Task:
     error: Optional[str] = None
     colorize: bool = False
     email: str = ""
+    feature_key: str = "restoration"
     landing_page: Optional[str] = None
     cta_slot: Optional[str] = None
     entry_variant: Optional[str] = None
@@ -96,6 +97,7 @@ def create_task(
     upload_path: str,
     colorize: bool = False,
     email: str = "",
+    feature_key: str = "restoration",
     landing_page: str | None = None,
     cta_slot: str | None = None,
     entry_variant: str | None = None,
@@ -108,6 +110,7 @@ def create_task(
         upload_path=upload_path,
         colorize=colorize,
         email=email,
+        feature_key=feature_key,
         landing_page=landing_page,
         cta_slot=cta_slot,
         entry_variant=entry_variant,

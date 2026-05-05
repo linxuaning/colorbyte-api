@@ -27,6 +27,9 @@ _ATTRIBUTION_COLUMNS = {
     "checkout_source": "TEXT",
 }
 
+FEATURE_RESTORATION = "restoration"
+FEATURE_DENOISING = "denoising"
+
 # --- Dual-write observability ---
 # Tracks recent dual-write outcomes for /health success-ratio reporting.
 # Single-worker free tier; lock keeps trim+append atomic under the GIL.
@@ -294,6 +297,25 @@ def _init_postgres():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_successes_completed_at ON payment_successes(completed_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_successes_provider_completed_at ON payment_successes(payment_provider, completed_at);")
 
+            # feature_entitlements — per-feature access control (2026-05-05)
+            # Each row grants one email access to one feature_key.
+            # Legacy subscriptions table still covers 'restoration' for pre-existing users.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feature_entitlements (
+                    id BIGSERIAL PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    feature_key TEXT NOT NULL,
+                    payment_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE(email, feature_key)
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_feature_entitlements_email ON feature_entitlements(email);"
+            )
+
             # mask_email_queue (post-purchase Mask thank-you email; founder-driven feature)
             cur.execute(
                 """
@@ -408,6 +430,17 @@ def init_db():
                 ON paypal_checkout_context(checkout_email);
             CREATE INDEX IF NOT EXISTS idx_paypal_capture_id
                 ON paypal_checkout_context(capture_id);
+
+            CREATE TABLE IF NOT EXISTS feature_entitlements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                feature_key TEXT NOT NULL,
+                payment_id TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(email, feature_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_feature_entitlements_email
+                ON feature_entitlements(email);
 
             CREATE TABLE IF NOT EXISTS payment_initiations (
                 order_id TEXT PRIMARY KEY,
@@ -842,11 +875,107 @@ def record_paypal_capture(
 
 
 def is_user_active(email: str) -> bool:
-    """Check if a user has an active subscription or is in trial."""
+    """Check if a user has any active entitlement (legacy subscription OR feature entitlement)."""
     sub = get_subscription(email)
-    if sub is None:
-        return False
-    return sub["status"] in ("trialing", "active", "on_trial")
+    if sub is not None and sub["status"] in ("trialing", "active", "on_trial"):
+        return True
+    # Also check feature_entitlements table (new per-feature model)
+    return _has_any_feature_entitlement(email)
+
+
+def _has_any_feature_entitlement(email: str) -> bool:
+    """Return True if email has at least one row in feature_entitlements."""
+    normalized = email.lower().strip()
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM feature_entitlements WHERE email = %s LIMIT 1",
+                    (normalized,),
+                )
+                return cur.fetchone() is not None
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM feature_entitlements WHERE email = ? LIMIT 1",
+            (normalized,),
+        ).fetchone()
+        return row is not None
+
+
+def grant_feature_entitlement(email: str, feature_key: str, payment_id: str | None = None):
+    """Grant access to a specific feature for an email (idempotent, dual-write)."""
+    now = datetime.now(timezone.utc).isoformat()
+    normalized = email.lower().strip()
+    sqlite_ok = False
+    pg_ok = not _use_postgres()
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO feature_entitlements (email, feature_key, payment_id, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(email, feature_key) DO NOTHING
+                """,
+                (normalized, feature_key, payment_id, now),
+            )
+        sqlite_ok = True
+    except Exception:
+        logger.exception("dual_write grant_feature_entitlement sqlite failed email=%s feature=%s", normalized, feature_key)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO feature_entitlements (email, feature_key, payment_id, created_at)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (email, feature_key) DO NOTHING
+                        """,
+                        (normalized, feature_key, payment_id, now),
+                    )
+                conn.commit()
+            pg_ok = True
+        except Exception:
+            logger.exception("dual_write grant_feature_entitlement pg failed email=%s feature=%s", normalized, feature_key)
+
+    _record_obs("grant_feature_entitlement", sqlite_ok, pg_ok)
+    logger.info("Feature entitlement granted: %s feature=%s payment_id=%s", normalized, feature_key, payment_id)
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for grant_feature_entitlement email={normalized} feature={feature_key}")
+
+
+def is_feature_entitled(email: str, feature_key: str) -> bool:
+    """Check if an email is entitled to use a specific feature.
+
+    For 'restoration': also accepts legacy subscriptions.status=active (backward compat).
+    For new features (e.g. 'denoising'): only feature_entitlements table.
+    """
+    normalized = email.lower().strip()
+
+    # Legacy fallback: old restoration buyers are in subscriptions table, not feature_entitlements
+    if feature_key == FEATURE_RESTORATION:
+        sub = get_subscription(normalized)
+        if sub is not None and sub["status"] in ("trialing", "active", "on_trial"):
+            return True
+
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM feature_entitlements WHERE email = %s AND feature_key = %s LIMIT 1",
+                    (normalized, feature_key),
+                )
+                return cur.fetchone() is not None
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM feature_entitlements WHERE email = ? AND feature_key = ? LIMIT 1",
+            (normalized, feature_key),
+        ).fetchone()
+        return row is not None
 
 
 def cancel_subscription_db(email: str):
