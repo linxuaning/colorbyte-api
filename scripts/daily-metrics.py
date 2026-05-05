@@ -3,12 +3,15 @@
 
 Pulls 24h numbers from the backend `/api/metrics/*` endpoints and the prior
 24h window for delta context, then sends a clean text email via Resend.
+Also pulls GA4 PV/UV/GEO data when ARTIMAGEHUB_GA4_SA_KEY is set.
 Runs once a day from a GitHub Actions cron at 00:00 UTC (08:00 Beijing).
 
 Required env:
-    RESEND_API_KEY      — for outbound email
-    METRICS_BASE        — backend base URL (default https://colorbyte-api.onrender.com)
-    ALERT_TO            — recipient (default linxuaning98@gmail.com)
+    RESEND_API_KEY           — for outbound email
+    METRICS_BASE             — backend base URL (default https://colorbyte-api.onrender.com)
+    ALERT_TO                 — recipient (default linxuaning98@gmail.com)
+Optional env:
+    ARTIMAGEHUB_GA4_SA_KEY   — GA4 service account JSON string; enables PV/UV/GEO section
 """
 from __future__ import annotations
 
@@ -52,6 +55,91 @@ def delta(now: int, prev: int) -> str:
     pct = (diff / prev) * 100
     sign = "+" if diff >= 0 else ""
     return f"{sign}{diff} ({sign}{pct:.0f}%)"
+
+
+GEO_SOURCES = {
+    "chatgpt.com", "perplexity.ai", "claude.ai",
+    "gemini.google.com", "copilot.microsoft.com",
+    "you.com", "phind.com", "bard.google.com",
+}
+
+
+def fetch_ga4_metrics() -> dict:
+    """Fetch yesterday's PV, UV, sessions, GEO breakdown from GA4 Data API.
+    Returns {'available': False} when SA key is missing or import fails."""
+    sa_json = os.environ.get("ARTIMAGEHUB_GA4_SA_KEY", "").strip()
+    if not sa_json:
+        return {"available": False, "reason": "ARTIMAGEHUB_GA4_SA_KEY not set"}
+    try:
+        from google.oauth2 import service_account  # type: ignore
+        from google.auth.transport.requests import Request as GRequest  # type: ignore
+    except ImportError:
+        return {"available": False, "reason": "google-auth not installed"}
+    try:
+        from datetime import date, timedelta
+
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(sa_json),
+            scopes=["https://www.googleapis.com/auth/analytics.readonly"],
+        )
+        creds.refresh(GRequest())
+        token = creds.token
+
+        yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+        url = "https://analyticsdata.googleapis.com/v1beta/properties/525510036:runReport"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        # Total PV / UV / sessions
+        body = {
+            "dateRanges": [{"startDate": yesterday, "endDate": yesterday}],
+            "metrics": [
+                {"name": "screenPageViews"},
+                {"name": "activeUsers"},
+                {"name": "sessions"},
+            ],
+        }
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            total = json.loads(r.read())
+
+        pv = uv = sessions = 0
+        if total.get("rows"):
+            vals = total["rows"][0]["metricValues"]
+            pv, uv, sessions = int(vals[0]["value"]), int(vals[1]["value"]), int(vals[2]["value"])
+
+        # Sessions by source to extract GEO
+        geo_body = {
+            "dateRanges": [{"startDate": yesterday, "endDate": yesterday}],
+            "dimensions": [{"name": "sessionSource"}],
+            "metrics": [{"name": "sessions"}],
+            "orderBys": [{"metric": {"metricName": "sessions"}, "desc": True}],
+            "limit": 100,
+        }
+        req2 = urllib.request.Request(url, data=json.dumps(geo_body).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req2, timeout=30) as r:
+            by_src = json.loads(r.read())
+
+        geo_sessions = 0
+        geo_breakdown: dict[str, int] = {}
+        for row in (by_src.get("rows") or []):
+            src = row["dimensionValues"][0]["value"]
+            n = int(row["metricValues"][0]["value"])
+            if src in GEO_SOURCES:
+                geo_sessions += n
+                geo_breakdown[src] = n
+
+        return {
+            "available": True,
+            "date": yesterday,
+            "pv": pv,
+            "uv": uv,
+            "sessions": sessions,
+            "geo_sessions": geo_sessions,
+            "geo_pct": (geo_sessions / sessions * 100) if sessions > 0 else 0.0,
+            "geo_breakdown": geo_breakdown,
+        }
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
 
 
 def fetch_webhook_health() -> dict:
@@ -121,6 +209,8 @@ def build_email_body() -> tuple[str, str]:
         else "Webhook health: (Render API not configured)"
     )
 
+    ga4 = fetch_ga4_metrics()
+
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     subj = f"[artimagehub daily] {today} — paid={succ_now} ${revenue:.2f} | checkout={init_now} | conv={conv:.1f}%"
 
@@ -141,11 +231,31 @@ def build_email_body() -> tuple[str, str]:
         lines.append(f"  - {prov}: {n}")
     if not (succ24.get("by_provider") or {}):
         lines.append("  (none)")
+
+    lines.append("")
+    if ga4.get("available"):
+        geo_pct = ga4["geo_pct"]
+        lines += [
+            f"Traffic — {ga4['date']} (GA4, T-1 Asia/Shanghai):",
+            f"  PV (pageviews):     {ga4['pv']:6}",
+            f"  UV (active users):  {ga4['uv']:6}",
+            f"  Sessions:           {ga4['sessions']:6}",
+            f"  GEO/AI sessions:    {ga4['geo_sessions']:6}    ({geo_pct:.1f}% of sessions)",
+        ]
+        if ga4["geo_breakdown"]:
+            lines.append("  GEO breakdown:")
+            for src, n in sorted(ga4["geo_breakdown"].items(), key=lambda x: -x[1]):
+                lines.append(f"    {src}: {n}")
+        else:
+            lines.append("  GEO breakdown: (none detected)")
+    else:
+        lines.append(f"Traffic: (GA4 not available — {ga4.get('reason', 'unknown')})")
+
     lines += [
         "",
         "Notes",
-        "- Numbers above are from /api/metrics/payment-* on the live backend.",
-        "- LLM referrer + GSC impressions are not in this report yet (need Vercel Analytics or GSC API wired). Ping foreman to add when wanted.",
+        "- Revenue/checkout numbers: rolling 24h window from /api/metrics/payment-* on live backend.",
+        "- Traffic/GEO: GA4 T-1 day (yesterday in Asia/Shanghai). GEO sources = chatgpt/perplexity/claude/gemini/copilot/you/phind.",
         f"- Full dashboard: {DASHBOARD_HINT}",
     ]
     return subj, "\n".join(lines)
