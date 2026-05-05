@@ -25,6 +25,7 @@ from app.services.database import (
     record_payment_initiation,
     record_payment_success,
     grant_feature_entitlement,
+    is_feature_entitled,
     FEATURE_RESTORATION,
 )
 
@@ -192,6 +193,20 @@ async def start_trial(req: StartTrialRequest):
     except Exception as e:
         logger.error("LemonSqueezy error: %s", e)
         raise HTTPException(status_code=502, detail=f"Payment service error: {str(e)}")
+
+
+class FeatureEntitlementResponse(BaseModel):
+    email: str
+    feature_key: str
+    is_entitled: bool
+
+
+@router.get("/payment/feature-entitlement/{email}/{feature_key}", response_model=FeatureEntitlementResponse)
+async def check_feature_entitlement(email: str, feature_key: str):
+    """Check whether an email is entitled to a specific feature."""
+    email = email.lower().strip()
+    entitled = is_feature_entitled(email, feature_key)
+    return FeatureEntitlementResponse(email=email, feature_key=feature_key, is_entitled=entitled)
 
 
 @router.get("/payment/subscription/{email}", response_model=SubscriptionStatusResponse)
