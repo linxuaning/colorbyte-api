@@ -1261,10 +1261,62 @@ class PhotoFixProvider(AIProvider):
             return ProcessingResult(success=False, error=str(exc))
 
 
+async def _try_local_mac(
+    input_path: str,
+    output_path: str,
+    endpoint: str,
+    progress_callback: "ProgressCallback",
+    progress_msg: str,
+    progress_pct: int,
+) -> bool:
+    """POST image to Mac inference server. Returns True on success, False on any failure.
+
+    Uses lama_inference_url / lama_inference_token (same Cloudflare Tunnel as LaMa).
+    12s connect + 90s read — matches cross-region RTT budget from memory.
+    """
+    import logging
+    import httpx
+
+    logger = logging.getLogger("artimagehub.local_mac")
+    settings = get_settings()
+    url = (settings.lama_inference_url or "").rstrip("/")
+    token = settings.lama_inference_token or ""
+
+    if not url or not token:
+        return False
+
+    if progress_callback:
+        await progress_callback(progress_msg, progress_pct)
+
+    timeout = httpx.Timeout(connect=12.0, read=90.0, write=15.0, pool=5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            with open(input_path, "rb") as fh:
+                resp = await client.post(
+                    f"{url}/{endpoint}",
+                    files={"file": (Path(input_path).name, fh, "image/jpeg")},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if resp.status_code == 200:
+                Path(output_path).write_bytes(resp.content)
+                ms = resp.headers.get("X-Inference-Duration-Ms", "?")
+                logger.info("Local Mac %s ok (%sms, %d bytes)", endpoint, ms, len(resp.content))
+                return True
+            logger.warning("Local Mac %s returned %s: %s", endpoint, resp.status_code, resp.text[:200])
+            return False
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+        logger.warning("Local Mac %s network error: %s — falling back to HF", endpoint, exc)
+        return False
+    except Exception as exc:
+        logger.warning("Local Mac %s unexpected error: %s — falling back to HF", endpoint, exc)
+        return False
+
+
 class NAFNetDenoiseProvider:
     """Photo denoising via NAFNet (HF Space: chuxiaojie/NAFNet).
 
-    Falls back to PIL-based sharpening if the Space is unavailable.
+    Primary: local Mac inference server (192.168.68.221 via Cloudflare Tunnel).
+    Fallback: HuggingFace Space chuxiaojie/NAFNet.
     """
 
     SPACE_ID = "chuxiaojie/NAFNet"
@@ -1282,6 +1334,16 @@ class NAFNetDenoiseProvider:
 
         if progress_callback:
             await progress_callback("Analyzing noise...", 10)
+
+        # Primary: local Mac inference server
+        ok = await _try_local_mac(
+            input_path, output_path, "denoise",
+            progress_callback, "Denoising with local NAFNet...", 30,
+        )
+        if ok:
+            if progress_callback:
+                await progress_callback("Complete", 100)
+            return ProcessingResult(success=True, output_path=output_path)
 
         try:
             from gradio_client import Client, handle_file
@@ -1359,8 +1421,8 @@ class NAFNetDenoiseProvider:
 class NAFNetDeblurProvider:
     """Photo deblurring via NAFNet GoPro model (HF Space: chuxiaojie/NAFNet).
 
-    Uses the same space as denoising with task="GoPro" for motion/defocus blur removal.
-    Falls back to PIL unsharp mask if the Space is unavailable.
+    Primary: local Mac inference server (192.168.68.221 via Cloudflare Tunnel).
+    Fallback: HuggingFace Space chuxiaojie/NAFNet (GoPro task).
     """
 
     SPACE_ID = "chuxiaojie/NAFNet"
@@ -1378,6 +1440,16 @@ class NAFNetDeblurProvider:
 
         if progress_callback:
             await progress_callback("Analyzing blur...", 10)
+
+        # Primary: local Mac inference server
+        ok = await _try_local_mac(
+            input_path, output_path, "deblur",
+            progress_callback, "Deblurring with local NAFNet...", 30,
+        )
+        if ok:
+            if progress_callback:
+                await progress_callback("Complete", 100)
+            return ProcessingResult(success=True, output_path=output_path)
 
         try:
             from gradio_client import Client, handle_file
@@ -1453,9 +1525,8 @@ class NAFNetDeblurProvider:
 class SwinIRJpegProvider:
     """JPEG artifact removal via SwinIR (HF Space: JingyunLiang/SwinIR).
 
-    Uses SwinIR's color_jpeg_car model to remove JPEG compression artifacts,
-    blocking, and ringing artifacts from compressed photos.
-    Falls back to PIL smoothing if the Space is unavailable.
+    Primary: local Mac inference server (192.168.68.221 via Cloudflare Tunnel).
+    Fallback: HuggingFace Space JingyunLiang/SwinIR (color_jpeg_car model).
     """
 
     SPACE_ID = "JingyunLiang/SwinIR"
@@ -1473,6 +1544,16 @@ class SwinIRJpegProvider:
 
         if progress_callback:
             await progress_callback("Analyzing compression artifacts...", 10)
+
+        # Primary: local Mac inference server
+        ok = await _try_local_mac(
+            input_path, output_path, "jpeg-fix",
+            progress_callback, "Removing JPEG artifacts with local SwinIR...", 30,
+        )
+        if ok:
+            if progress_callback:
+                await progress_callback("Complete", 100)
+            return ProcessingResult(success=True, output_path=output_path)
 
         try:
             from gradio_client import Client, handle_file
