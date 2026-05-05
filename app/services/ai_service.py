@@ -1322,8 +1322,10 @@ class NAFNetDenoiseProvider:
             return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as exc:
-            logger.warning("NAFNet denoising failed (%s); applying PIL sharpen fallback", exc)
-            return await self._pil_denoise_fallback(input_path, output_path, progress_callback)
+            logger.warning("NAFNet denoising failed (%s); falling back to HuggingFace restore approach", exc)
+            return await HuggingFaceProvider().process_photo(
+                input_path, output_path, False, progress_callback, email=email
+            )
 
     async def _pil_denoise_fallback(
         self, input_path: str, output_path: str, progress_callback: ProgressCallback
@@ -1416,8 +1418,10 @@ class NAFNetDeblurProvider:
             return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as exc:
-            logger.warning("NAFNet deblurring failed (%s); applying PIL sharpen fallback", exc)
-            return await self._pil_deblur_fallback(input_path, output_path, progress_callback)
+            logger.warning("NAFNet deblurring failed (%s); falling back to HuggingFace restore approach", exc)
+            return await HuggingFaceProvider().process_photo(
+                input_path, output_path, False, progress_callback, email=email
+            )
 
     async def _pil_deblur_fallback(
         self, input_path: str, output_path: str, progress_callback: ProgressCallback
@@ -1510,8 +1514,10 @@ class SwinIRJpegProvider:
             return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as exc:
-            logger.warning("SwinIR JPEG fix failed (%s); applying PIL fallback", exc)
-            return await self._pil_jpeg_fallback(input_path, output_path, progress_callback)
+            logger.warning("SwinIR JPEG fix failed (%s); falling back to HuggingFace restore approach", exc)
+            return await HuggingFaceProvider().process_photo(
+                input_path, output_path, False, progress_callback, email=email
+            )
 
     async def _pil_jpeg_fallback(
         self, input_path: str, output_path: str, progress_callback: ProgressCallback
