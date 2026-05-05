@@ -1354,6 +1354,193 @@ class NAFNetDenoiseProvider:
             return ProcessingResult(success=False, error=str(exc))
 
 
+class NAFNetDeblurProvider:
+    """Photo deblurring via NAFNet GoPro model (HF Space: chuxiaojie/NAFNet).
+
+    Uses the same space as denoising with task="GoPro" for motion/defocus blur removal.
+    Falls back to PIL unsharp mask if the Space is unavailable.
+    """
+
+    SPACE_ID = "chuxiaojie/NAFNet"
+    TIMEOUT_S = 120
+
+    async def deblur_photo(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback: ProgressCallback,
+        email: str = "",
+    ) -> ProcessingResult:
+        import logging
+        logger = logging.getLogger("artimagehub.nafnet_deblur")
+
+        if progress_callback:
+            await progress_callback("Analyzing blur...", 10)
+
+        try:
+            from gradio_client import Client, handle_file
+
+            client = Client(self.SPACE_ID, verbose=False)
+            img = handle_file(input_path)
+
+            if progress_callback:
+                await progress_callback("Deblurring with NAFNet...", 30)
+
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.predict,
+                    img,
+                    "GoPro",  # motion deblur benchmark dataset model
+                    api_name="/predict",
+                ),
+                timeout=self.TIMEOUT_S,
+            )
+
+            if isinstance(result, tuple):
+                result = result[0]
+            if isinstance(result, dict):
+                result = result.get("path") or result.get("url") or str(result)
+
+            if not result:
+                raise RuntimeError("NAFNet deblur returned empty result")
+
+            if progress_callback:
+                await progress_callback("Writing result...", 90)
+
+            shutil.copy2(str(result), output_path)
+
+            if progress_callback:
+                await progress_callback("Complete", 100)
+
+            logger.info("NAFNet deblurring succeeded")
+            return ProcessingResult(success=True, output_path=output_path)
+
+        except Exception as exc:
+            logger.warning("NAFNet deblurring failed (%s); applying PIL sharpen fallback", exc)
+            return await self._pil_deblur_fallback(input_path, output_path, progress_callback)
+
+    async def _pil_deblur_fallback(
+        self, input_path: str, output_path: str, progress_callback: ProgressCallback
+    ) -> ProcessingResult:
+        import logging
+        logger = logging.getLogger("artimagehub.nafnet_deblur")
+        try:
+            from PIL import Image, ImageFilter, ImageEnhance
+
+            def _process():
+                img = Image.open(input_path).convert("RGB")
+                img = img.filter(ImageFilter.UnsharpMask(radius=2.0, percent=180, threshold=2))
+                img = ImageEnhance.Sharpness(img).enhance(1.8)
+                img = ImageEnhance.Contrast(img).enhance(1.1)
+                img.save(output_path, "JPEG", quality=92)
+
+            await asyncio.to_thread(_process)
+
+            if progress_callback:
+                await progress_callback("Complete (fallback)", 100)
+
+            logger.info("NAFNet deblur PIL fallback succeeded")
+            return ProcessingResult(success=True, output_path=output_path)
+        except Exception as exc:
+            logger.error("NAFNet deblur PIL fallback also failed: %s", exc)
+            return ProcessingResult(success=False, error=str(exc))
+
+
+class SwinIRJpegProvider:
+    """JPEG artifact removal via SwinIR (HF Space: JingyunLiang/SwinIR).
+
+    Uses SwinIR's color_jpeg_car model to remove JPEG compression artifacts,
+    blocking, and ringing artifacts from compressed photos.
+    Falls back to PIL smoothing if the Space is unavailable.
+    """
+
+    SPACE_ID = "JingyunLiang/SwinIR"
+    TIMEOUT_S = 120
+
+    async def fix_jpeg(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback: ProgressCallback,
+        email: str = "",
+    ) -> ProcessingResult:
+        import logging
+        logger = logging.getLogger("artimagehub.swinir_jpeg")
+
+        if progress_callback:
+            await progress_callback("Analyzing compression artifacts...", 10)
+
+        try:
+            from gradio_client import Client, handle_file
+
+            client = Client(self.SPACE_ID, verbose=False)
+            img = handle_file(input_path)
+
+            if progress_callback:
+                await progress_callback("Removing JPEG artifacts with SwinIR...", 30)
+
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.predict,
+                    img,
+                    "color_jpeg_car",  # JPEG artifact reduction for color images
+                    40,                # JPEG quality factor (worst case; handles 40-100)
+                    api_name="/predict",
+                ),
+                timeout=self.TIMEOUT_S,
+            )
+
+            if isinstance(result, tuple):
+                result = result[0]
+            if isinstance(result, dict):
+                result = result.get("path") or result.get("url") or str(result)
+
+            if not result:
+                raise RuntimeError("SwinIR returned empty result")
+
+            if progress_callback:
+                await progress_callback("Writing result...", 90)
+
+            shutil.copy2(str(result), output_path)
+
+            if progress_callback:
+                await progress_callback("Complete", 100)
+
+            logger.info("SwinIR JPEG artifact removal succeeded")
+            return ProcessingResult(success=True, output_path=output_path)
+
+        except Exception as exc:
+            logger.warning("SwinIR JPEG fix failed (%s); applying PIL fallback", exc)
+            return await self._pil_jpeg_fallback(input_path, output_path, progress_callback)
+
+    async def _pil_jpeg_fallback(
+        self, input_path: str, output_path: str, progress_callback: ProgressCallback
+    ) -> ProcessingResult:
+        import logging
+        logger = logging.getLogger("artimagehub.swinir_jpeg")
+        try:
+            from PIL import Image, ImageFilter, ImageEnhance
+
+            def _process():
+                img = Image.open(input_path).convert("RGB")
+                # Mild smoothing to reduce JPEG blocking
+                img = img.filter(ImageFilter.SMOOTH)
+                # Unsharp mask to recover edge sharpness lost to compression
+                img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=3))
+                img.save(output_path, "JPEG", quality=92)
+
+            await asyncio.to_thread(_process)
+
+            if progress_callback:
+                await progress_callback("Complete (fallback)", 100)
+
+            logger.info("SwinIR PIL fallback succeeded")
+            return ProcessingResult(success=True, output_path=output_path)
+        except Exception as exc:
+            logger.error("SwinIR PIL fallback also failed: %s", exc)
+            return ProcessingResult(success=False, error=str(exc))
+
+
 class AIService:
     """Delegates to the configured AI provider."""
 
@@ -1362,6 +1549,8 @@ class AIService:
         provider = get_effective_ai_provider(settings)
         self._fallback_provider: AIProvider | None = None
         self._denoise_provider = NAFNetDenoiseProvider()
+        self._deblur_provider = NAFNetDeblurProvider()
+        self._jpeg_provider = SwinIRJpegProvider()
 
         if provider == "local":
             import logging
@@ -1451,6 +1640,28 @@ class AIService:
         email: str = "",
     ) -> ProcessingResult:
         return await self._denoise_provider.denoise_photo(
+            input_path, output_path, progress_callback, email=email
+        )
+
+    async def deblur_photo(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback: ProgressCallback = None,
+        email: str = "",
+    ) -> ProcessingResult:
+        return await self._deblur_provider.deblur_photo(
+            input_path, output_path, progress_callback, email=email
+        )
+
+    async def fix_jpeg_artifacts(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback: ProgressCallback = None,
+        email: str = "",
+    ) -> ProcessingResult:
+        return await self._jpeg_provider.fix_jpeg(
             input_path, output_path, progress_callback, email=email
         )
 

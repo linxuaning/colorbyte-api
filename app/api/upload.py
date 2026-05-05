@@ -166,10 +166,24 @@ async def _process_task(task_id: str):
         async def on_progress(stage: str, progress: int):
             update_task(task_id, stage=stage, progress=progress)
 
-        from app.services.database import FEATURE_DENOISING
+        from app.services.database import FEATURE_DENOISING, FEATURE_DEBLURRING, FEATURE_JPEG_FIX
         ai = get_ai_service()
         if task.feature_key == FEATURE_DENOISING:
             result = await ai.denoise_photo(
+                input_path=task.upload_path,
+                output_path=result_path,
+                progress_callback=on_progress,
+                email=task.email,
+            )
+        elif task.feature_key == FEATURE_DEBLURRING:
+            result = await ai.deblur_photo(
+                input_path=task.upload_path,
+                output_path=result_path,
+                progress_callback=on_progress,
+                email=task.email,
+            )
+        elif task.feature_key == FEATURE_JPEG_FIX:
+            result = await ai.fix_jpeg_artifacts(
                 input_path=task.upload_path,
                 output_path=result_path,
                 progress_callback=on_progress,

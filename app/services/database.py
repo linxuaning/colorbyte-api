@@ -29,6 +29,8 @@ _ATTRIBUTION_COLUMNS = {
 
 FEATURE_RESTORATION = "restoration"
 FEATURE_DENOISING = "denoising"
+FEATURE_DEBLURRING = "deblurring"
+FEATURE_JPEG_FIX = "jpeg-fix"
 
 # --- Dual-write observability ---
 # Tracks recent dual-write outcomes for /health success-ratio reporting.
