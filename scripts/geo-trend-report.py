@@ -24,31 +24,23 @@ PROPERTY_ID = "525510036"
 GA4_URL = f"https://analyticsdata.googleapis.com/v1beta/properties/{PROPERTY_ID}:runReport"
 
 GEO_SOURCES = {
-    # Confirmed from paid user traces
-    "chatgpt.com",
-    # AI chat platforms
-    "perplexity.ai",
-    "claude.ai",
-    "gemini.google.com",
-    "bard.google.com",
-    "copilot.microsoft.com",
-    "you.com",
-    "phind.com",
-    "poe.com",
-    "character.ai",
-    "pi.ai",
-    "inflection.ai",
-    "mistral.ai",
-    "groq.com",
-    "meta.ai",
-    "grok.com",
-    "kagi.com",
-    # OpenAI direct
-    "openai.com",
-    # Brave Leo AI
+    # Tier 1 — confirmed paid conversions (90d GA4 data)
+    "chatgpt.com",          # 108 sessions, 2 confirmed paid users
+    "copilot.com",          # 15 sessions, 2 payment_clicks (Microsoft Copilot)
+    # Tier 2 — confirmed sessions
+    "perplexity", "perplexity.ai",
+    "chat.qwen.ai",         # Alibaba Qwen
+    "doubao.com",           # ByteDance Doubao
     "search.brave.com",
-    # Microsoft Copilot via Bing
-    "bing.com",
+    "toolpilot.ai",
+    "gemini.google.com", "bard.google.com",
+    "x.com",
+    # Tier 3 — watchlist
+    "claude.ai", "openai.com",
+    "copilot.microsoft.com", "you.com", "phind.com",
+    "poe.com", "pi.ai", "grok.com", "meta.ai",
+    "kagi.com", "character.ai", "mistral.ai", "groq.com",
+    "inflection.ai",
 }
 
 

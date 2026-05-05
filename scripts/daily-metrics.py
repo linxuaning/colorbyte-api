@@ -58,9 +58,22 @@ def delta(now: int, prev: int) -> str:
 
 
 GEO_SOURCES = {
-    "chatgpt.com", "perplexity.ai", "claude.ai",
-    "gemini.google.com", "copilot.microsoft.com",
-    "you.com", "phind.com", "bard.google.com",
+    # Tier 1 — confirmed paid conversions (90d data)
+    "chatgpt.com",          # 108 sessions, 2 confirmed paid users
+    "copilot.com",          # 15 sessions, 2 payment_clicks
+    # Tier 2 — confirmed sessions (no paid yet)
+    "perplexity", "perplexity.ai",
+    "chat.qwen.ai",         # Alibaba Qwen (Chinese AI)
+    "doubao.com",           # ByteDance (Chinese AI)
+    "search.brave.com",
+    "toolpilot.ai",
+    "gemini.google.com", "bard.google.com",
+    "x.com",
+    # Tier 3 — watchlist (0 sessions but industry standard)
+    "claude.ai", "openai.com",
+    "copilot.microsoft.com", "you.com", "phind.com",
+    "poe.com", "pi.ai", "grok.com", "meta.ai",
+    "kagi.com", "character.ai", "mistral.ai", "groq.com",
 }
 
 
