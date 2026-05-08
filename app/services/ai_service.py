@@ -100,14 +100,17 @@ class HuggingFaceProvider(AIProvider):
     # leaves paying users staring at a stuck progress bar. Fall through to
     # the next Space instead.
     #
-    # 2026-05-08: dropped 90 -> 30s after observing sczhou/CodeFormer (L4 GPU,
-    # normally 5-15s) silently parking a task at 90s queue-stall while the
-    # cpu-basic fallback (PERCY001) was sitting idle. 30s preserves the fast-
-    # path success window for healthy GPU Spaces and cuts wasted dwell time
-    # by 60s when a Space is in queue-stall. async /api/upload flow still
-    # absorbs the worst-case sum across all Spaces; sync /api/restore stays
-    # near the proxy 100s ceiling.
-    _SPACE_PREDICT_TIMEOUT_S = 30
+    # History: 90 -> 30 (5/8 16:51) attempted to cut sczhou queue-stall
+    # waste, but reverted to 90 (5/8 17:18) after task f47a2e804a29
+    # confirmed 30s is too tight for cpu-basic fallbacks (PERCY001 ~76s,
+    # avans06/titanito cpu-basic 30-60s) — 30s caused ALL HF Spaces to
+    # timeout, dropping into PIL UnsharpMask fallback which AMPLIFIES
+    # scan-line noise on real old-photo inputs (visible quality regression
+    # vs prior baseline). 90s preserves cpu-basic success path; sczhou
+    # queue-stall waste is an acceptable cost vs the alternative of
+    # delivering PIL output to paying users. Per-Space differentiated
+    # timeout (sczhou 30 / others 90) is a follow-up optimization.
+    _SPACE_PREDICT_TIMEOUT_S = 90
 
     async def _try_space(
         self, space_id: str, space_type: str, input_path: str, api_endpoint: str = "/predict"
