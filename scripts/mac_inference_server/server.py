@@ -17,7 +17,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -64,7 +64,7 @@ def _load_nafnet(task: str):
     if str(NAFNET_DIR) not in sys.path:
         sys.path.insert(0, str(NAFNET_DIR))
 
-    from basicsr.archs.nafnet_arch import NAFNet  # type: ignore[import]
+    from basicsr.models.archs.NAFNet_arch import NAFNet  # type: ignore[import]
 
     if task == "SIDD":
         model_path = MODELS_DIR / "NAFNet-SIDD-width64.pth"
@@ -107,7 +107,7 @@ def _load_swinir_jpeg():
 
     logger.info("Loading SwinIR JPEG from %s...", model_path)
     model = SwinIR(
-        upscale=1, in_chans=3, img_size=126, window_size=7,
+        upscale=1, in_chans=1, img_size=126, window_size=7,
         img_range=255.0, depths=[6, 6, 6, 6, 6, 6], embed_dim=180,
         num_heads=[6, 6, 6, 6, 6, 6], mlp_ratio=2,
         upsampler=None, resi_connection="1conv",
@@ -156,7 +156,7 @@ def _from_tensor(t: torch.Tensor) -> np.ndarray:
     ).astype(np.uint8)
 
 
-def _pad_multiple(arr: np.ndarray, mult: int) -> tuple[np.ndarray, tuple[int, int]]:
+def _pad_multiple(arr: np.ndarray, mult: int) -> Tuple[np.ndarray, Tuple[int, int]]:
     """Reflect-pad HWC array so H and W are multiples of `mult`."""
     h, w = arr.shape[:2]
     ph = (mult - h % mult) % mult
@@ -175,11 +175,18 @@ def _run_nafnet(model, img: Image.Image) -> Image.Image:
 
 
 def _run_swinir_jpeg(model, img: Image.Image) -> Image.Image:
-    arr = np.array(img)
+    """Run grayscale JPEG-CAR model on Y channel, reconstruct YCbCr → RGB."""
+    ycbcr = img.convert("YCbCr")
+    y, cb, cr = ycbcr.split()
+    arr = np.array(y)[:, :, np.newaxis]  # HW1
     arr_pad, (oh, ow) = _pad_multiple(arr, 7)
     with torch.no_grad():
-        out = model(_to_tensor(arr_pad))
-    return Image.fromarray(_from_tensor(out)[:oh, :ow])
+        t = torch.from_numpy(arr_pad.astype(np.float32)).div(255.0).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+        out = model(t)
+    y_out = (out.squeeze(0).squeeze(0).clamp(0.0, 1.0).cpu().numpy()[:oh, :ow] * 255).astype(np.uint8)
+    y_img = Image.fromarray(y_out, mode="L")
+    result = Image.merge("YCbCr", [y_img, cb, cr]).convert("RGB")
+    return result
 
 
 def _to_jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:

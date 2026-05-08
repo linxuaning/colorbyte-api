@@ -80,11 +80,20 @@ class HuggingFaceProvider(AIProvider):
     ]
 
     # Colorization Spaces — jantic/DeOldify was deleted from HF; audited alternatives 2026-04-17.
-    # Each entry: (space_id, call_style). call_style distinguishes the old DeOldify signature
-    # (image + render_factor) from the simpler single-arg ialhashim/Colorizer.
+    # gudada/DDColor (RUNNING cpu-basic verified 2026-05-08) is SOTA — DDColor 2023 model
+    # outputs more natural colors than ialhashim's 2019 fast.ai model. Returns imageslider:
+    # list[before_path, after_path] — caller takes result[-1].
+    # Each entry: (space_id, call_style).
     DEOLDIFY_SPACES: list[tuple[str, str]] = [
+        ("gudada/DDColor", "ddcolor_imageslider"),
         ("ialhashim/Colorizer", "single_arg"),
     ]
+
+    # Cap input short-edge before sending to HF Spaces. Gradio Spaces frequently
+    # downsample on their side to 512–1024px and then upscale, double-lossy. Pre-resizing
+    # locally with Lanczos preserves more detail; CodeFormer's `face_upsample` and
+    # ESRGAN-style models still scale ≥2× from this baseline.
+    _INPUT_SHORT_EDGE_CAP = 1280
 
     # Hard ceiling on how long any single HF Space may block. HF free-tier
     # queues can take 5-10+ min during peak; blocking the task that long
@@ -112,7 +121,9 @@ class HuggingFaceProvider(AIProvider):
                     True,    # background_enhance
                     True,    # face_upsample
                     2,       # upscale
-                    0.7,     # codeformer_fidelity (0=quality, 1=fidelity)
+                    0.5,     # codeformer_fidelity (0=quality, 1=fidelity).
+                             # 0.5 favors identity preservation over generative
+                             # detail — fewer "uncanny" face swaps on portraits.
                     api_name=api_endpoint,
                 ),
                 timeout=self._SPACE_PREDICT_TIMEOUT_S,
@@ -267,7 +278,20 @@ class HuggingFaceProvider(AIProvider):
             try:
                 logger.info("Trying colorizer: %s (%s)", space_id, call_style)
                 client = Client(space_id, verbose=False)
-                if call_style == "single_arg":
+                if call_style == "ddcolor_imageslider":
+                    # gudada/DDColor: api_name=/colorize, output is ImageSlider returning
+                    # [before_path, after_path]. Take after.
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            client.predict,
+                            handle_file(input_path),
+                            api_name="/colorize",
+                        ),
+                        timeout=self._SPACE_PREDICT_TIMEOUT_S,
+                    )
+                    if isinstance(result, (list, tuple)) and len(result) >= 2:
+                        result = result[-1]
+                elif call_style == "single_arg":
                     result = await asyncio.wait_for(
                         asyncio.to_thread(
                             client.predict,
@@ -298,6 +322,43 @@ class HuggingFaceProvider(AIProvider):
 
         raise RuntimeError("No colorization Space available")
 
+    async def _pre_resize_input(self, input_path: str) -> str:
+        """Pre-cap input short-edge before HF Spaces; return possibly-rewritten path.
+
+        Without this, large originals (e.g. 4000px scans) get downsampled inside
+        the Space to 512–1024px and then upscaled, losing detail twice. We cap
+        short-edge locally with Lanczos so CodeFormer / ESRGAN see the highest-
+        quality possible baseline, and downstream face_upsample / x2 still expand
+        from there.
+        """
+        import logging
+        from PIL import Image
+        logger = logging.getLogger("artimagehub.hf")
+
+        try:
+            with Image.open(input_path) as im:
+                w, h = im.size
+                short = min(w, h)
+                if short <= self._INPUT_SHORT_EDGE_CAP:
+                    return input_path
+                ratio = self._INPUT_SHORT_EDGE_CAP / short
+                new_w = int(round(w * ratio))
+                new_h = int(round(h * ratio))
+                resized = im.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
+                # Write next to the input so cleanup logic still applies.
+                from pathlib import Path
+                p = Path(input_path)
+                out = p.with_name(p.stem + "_pre" + p.suffix.lower() if p.suffix else p.stem + "_pre.jpg")
+                fmt = "JPEG" if out.suffix.lower() in {".jpg", ".jpeg"} else "PNG"
+                save_kwargs = {"quality": 95, "optimize": True} if fmt == "JPEG" else {}
+                resized.save(str(out), fmt, **save_kwargs)
+                logger.info("Pre-resize %sx%s -> %sx%s (short-edge cap=%d)",
+                            w, h, new_w, new_h, self._INPUT_SHORT_EDGE_CAP)
+                return str(out)
+        except Exception as exc:
+            logger.warning("Pre-resize skipped (%s); using original input", exc)
+            return input_path
+
     async def process_photo(
         self, input_path: str, output_path: str, colorize: bool, progress_callback: ProgressCallback,
         email: str = "",
@@ -305,6 +366,9 @@ class HuggingFaceProvider(AIProvider):
         try:
             import logging
             logger = logging.getLogger("artimagehub.hf")
+
+            # Step 0: Pre-resize input to avoid double-lossy downsampling inside HF Spaces
+            input_path = await self._pre_resize_input(input_path)
 
             # Step 1: Face restoration (tries CodeFormer → multi-model → GFPGAN)
             if progress_callback:
@@ -1100,20 +1164,17 @@ class PILEnhanceProvider(AIProvider):
 
 
 class PhotoFixProvider(AIProvider):
-    """Delegates photo restoration to the PhotoFix backend at backend.artimagehub.com.
+    """Delegates photo restoration to the PhotoFix backend via base64 JSON API.
 
-    Flow:
-      1. Register email as subscriber (admin-set-subscriber).
-      2. POST /api/upload with the image file + email → remote task_id.
-      3. Poll GET /api/tasks/{task_id} every 2s (max 20 min) until completed/failed.
-      4. GET /api/download/{task_id} and write bytes to output_path.
+    POST api_url with {"image": "<base64>", "task": "restore|colorize|enhance"}
+    Headers: X-Internal-Key + Content-Type: application/json
+    Response: {"ok": true, "result": "<base64>"} or {"ok": false, "error": "..."}
     """
 
-    POLL_INTERVAL = 2      # seconds between polls
-    MAX_POLL_TIME = 1200   # 20 minutes max — observed real input at 432s/48% (~15 min projected); backend agent's 3-5 min spec was for 600x400, larger user inputs run longer
+    REQUEST_TIMEOUT = 6000.0  # backend can take up to ~100 min for large inputs
 
     def __init__(self, api_url: str, internal_api_key: str = ""):
-        self.api_url = api_url.rstrip("/")
+        self.api_url = api_url
         self.internal_api_key = internal_api_key
 
     async def process_photo(
@@ -1124,6 +1185,7 @@ class PhotoFixProvider(AIProvider):
         progress_callback: ProgressCallback,
         email: str = "",
     ) -> ProcessingResult:
+        import base64
         import logging
         import httpx
 
@@ -1132,129 +1194,44 @@ class PhotoFixProvider(AIProvider):
         if not self.api_url:
             return ProcessingResult(success=False, error="PHOTOFIX_API_URL is not configured.")
 
+        task = "colorize" if colorize else "restore"
+
         try:
+            if progress_callback:
+                await progress_callback("Preparing image...", 10)
+
+            image_bytes = Path(input_path).read_bytes()
+            image_b64 = base64.b64encode(image_bytes).decode("ascii")
+
+            if progress_callback:
+                await progress_callback("Processing with PhotoFix...", 20)
+
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(60.0, connect=10.0, read=60.0, write=60.0),
+                timeout=httpx.Timeout(self.REQUEST_TIMEOUT, connect=30.0),
                 follow_redirects=True,
             ) as http:
-                # Step 1: register email as subscriber so upload gate passes
-                if email:
-                    try:
-                        await http.post(
-                            f"{self.api_url}/api/payment/admin-set-subscriber",
-                            json={"email": email, "subscribed": True},
-                        )
-                        logger.info("PhotoFix: registered subscriber email=%s", email)
-                    except Exception as exc:
-                        logger.warning("PhotoFix: admin-set-subscriber failed (continuing): %s", exc)
+                resp = await http.post(
+                    self.api_url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Internal-Key": self.internal_api_key,
+                    },
+                    json={"image": image_b64, "task": task},
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
-                # Step 2: upload image (stream from disk to avoid loading full file in memory)
-                if progress_callback:
-                    await progress_callback("Uploading to PhotoFix...", 10)
+            if not data.get("ok"):
+                raise RuntimeError(data.get("error") or "PhotoFix returned ok=false")
 
-                import mimetypes
-                mime = mimetypes.guess_type(input_path)[0] or "image/jpeg"
-                filename = Path(input_path).name
+            result_bytes = base64.b64decode(data["result"])
+            Path(output_path).write_bytes(result_bytes)
 
-                upload_data: dict = {
-                    "email": email or "",
-                    "colorize": "true" if colorize else "false",
-                }
-                if self.internal_api_key:
-                    upload_data["internal_key"] = self.internal_api_key
+            if progress_callback:
+                await progress_callback("Complete", 100)
 
-                with open(input_path, "rb") as fh:
-                    upload_resp = await http.post(
-                        f"{self.api_url}/api/upload",
-                        data=upload_data,
-                        files={"file": (filename, fh, mime)},
-                        timeout=httpx.Timeout(120.0, connect=10.0),
-                    )
-                if not upload_resp.is_success:
-                    detail = ""
-                    try:
-                        detail = upload_resp.json().get("detail", "")
-                    except Exception:
-                        pass
-                    raise RuntimeError(
-                        f"PhotoFix upload failed ({upload_resp.status_code}): {detail or upload_resp.text[:200]}"
-                    )
-
-                remote_task_id = upload_resp.json()["task_id"]
-                logger.info("PhotoFix: upload OK, remote_task_id=%s", remote_task_id)
-
-                # Step 3: poll until completed or failed
-                if progress_callback:
-                    await progress_callback("Processing (PhotoFix)...", 20)
-
-                elapsed = 0.0
-                last_progress = 20
-                while elapsed < self.MAX_POLL_TIME:
-                    await asyncio.sleep(self.POLL_INTERVAL)
-                    elapsed += self.POLL_INTERVAL
-
-                    status_resp = await http.get(
-                        f"{self.api_url}/api/tasks/{remote_task_id}",
-                        timeout=httpx.Timeout(30.0),
-                    )
-                    status_resp.raise_for_status()
-                    status_data = status_resp.json()
-
-                    remote_status = status_data.get("status", "")
-                    remote_progress = status_data.get("progress", 0)
-                    remote_message = status_data.get("message", "")
-
-                    # Map remote progress (0-100) to local range 20-90
-                    local_progress = 20 + int(remote_progress * 0.7)
-                    if local_progress > last_progress:
-                        last_progress = local_progress
-                        if progress_callback:
-                            await progress_callback(remote_message or "Processing...", local_progress)
-
-                    logger.debug(
-                        "PhotoFix poll: status=%s progress=%s elapsed=%.0fs",
-                        remote_status, remote_progress, elapsed,
-                    )
-
-                    if remote_status == "completed":
-                        break
-                    elif remote_status == "failed":
-                        raise RuntimeError(
-                            f"PhotoFix processing failed: {remote_message or 'unknown error'}"
-                        )
-                else:
-                    raise RuntimeError(f"PhotoFix processing timed out after {self.MAX_POLL_TIME // 60} minutes.")
-
-                # Step 4: stream result to disk (avoid holding full image in memory)
-                if progress_callback:
-                    await progress_callback("Downloading result...", 95)
-
-                # Backend gates download on is_user_active(email) and returns 402
-                # otherwise. Pass internal_key (service-to-service bypass) plus
-                # email + quality=original per backend's documented contract.
-                # Without this we silently fall back to the broken HF chain.
-                download_params: dict[str, str] = {"quality": "original"}
-                if email:
-                    download_params["email"] = email
-                if self.internal_api_key:
-                    download_params["internal_key"] = self.internal_api_key
-
-                async with http.stream(
-                    "GET",
-                    f"{self.api_url}/api/download/{remote_task_id}",
-                    params=download_params,
-                    timeout=httpx.Timeout(120.0, connect=10.0),
-                ) as download_resp:
-                    download_resp.raise_for_status()
-                    with open(output_path, "wb") as out_fh:
-                        async for chunk in download_resp.aiter_bytes(chunk_size=65536):
-                            out_fh.write(chunk)
-
-                if progress_callback:
-                    await progress_callback("Complete", 100)
-
-                logger.info("PhotoFix: done, output saved to %s", output_path)
-                return ProcessingResult(success=True, output_path=output_path)
+            logger.info("PhotoFix: done, output saved to %s", output_path)
+            return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as exc:
             logger.error("PhotoFix processing failed: %s", exc)
@@ -1522,6 +1499,98 @@ class NAFNetDeblurProvider:
             return ProcessingResult(success=False, error=str(exc))
 
 
+class DeepSeekProvider(AIProvider):
+    """Intelligent photo restoration router powered by DeepSeek V4 Pro + HF.
+
+    DeepSeek V4 Pro is a text model (no vision), so it cannot process images
+    directly. Instead it analyzes image metadata (format, dimensions, file size)
+    and recommends the best restoration strategy. Actual restoration delegates
+    to HuggingFace Spaces; if those also fail, PILEnhanceProvider is the last
+    resort so the user never sees a hard error.
+    """
+
+    def __init__(self, api_key: str, api_base: str, model: str):
+        self.api_key = api_key
+        self.api_base = api_base.rstrip("/")
+        self.model = model
+
+    async def _recommend_strategy(self, input_path: str, colorize: bool) -> str:
+        """Ask DeepSeek V4 Pro to recommend a restoration strategy from file metadata."""
+        import os
+        import httpx
+        from PIL import Image as PILImg
+
+        stat = os.stat(input_path)
+        img = PILImg.open(input_path)
+        w, h = img.size
+        fmt = img.format or "unknown"
+        mode = img.mode
+
+        metadata = (
+            f"Image: {os.path.basename(input_path)}\n"
+            f"Format: {fmt}, Mode: {mode}\n"
+            f"Dimensions: {w}x{h} ({(w * h / 1_000_000):.1f} MP)\n"
+            f"File size: {stat.st_size / 1024:.0f} KB\n"
+            f"Colorize requested: {colorize}\n"
+        )
+
+        prompt = (
+            "You are an image restoration expert. Based on the image metadata below, "
+            "recommend the best restoration strategy. Consider: 1) If dimensions are "
+            "small (<1MP), upscaling should be prioritized. 2) If the format is JPEG "
+            "with small file size, compression artifact removal may help. 3) If "
+            "colorize is requested, note that old B&W photos benefit most. "
+            "4) If mode is not RGB, conversion is needed. "
+            "Give a concise 2-3 sentence recommendation.\n\n"
+            f"{metadata}"
+        )
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300,
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+            resp = await client.post(
+                f"{self.api_base}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+
+    async def process_photo(
+        self, input_path: str, output_path: str, colorize: bool,
+        progress_callback: ProgressCallback, email: str = "",
+    ) -> ProcessingResult:
+        import logging
+        logger = logging.getLogger("artimagehub.deepseek")
+
+        try:
+            if progress_callback:
+                await progress_callback("Analyzing with DeepSeek V4...", 10)
+
+            recommendation = await self._recommend_strategy(input_path, colorize)
+            logger.info("DeepSeek recommendation: %s", recommendation[:300])
+
+            if progress_callback:
+                await progress_callback("DeepSeek analysis complete, restoring...", 20)
+
+            return await HuggingFaceProvider().process_photo(
+                input_path, output_path, colorize, progress_callback, email=email
+            )
+        except Exception as exc:
+            logger.warning("DeepSeek failed (%s), falling back to HuggingFace", exc)
+            return await HuggingFaceProvider().process_photo(
+                input_path, output_path, colorize, progress_callback, email=email
+            )
+
+
 class SwinIRJpegProvider:
     """JPEG artifact removal via SwinIR (HF Space: JingyunLiang/SwinIR).
 
@@ -1693,6 +1762,13 @@ class AIService:
                 if candidate.strip()
             ]
             self._provider = HFInferenceProvider(settings.hf_token, model_candidates)
+        elif provider == "deepseek":
+            self._provider = DeepSeekProvider(
+                api_key=settings.deepseek_api_key,
+                api_base=settings.deepseek_api_base,
+                model=settings.deepseek_model,
+            )
+            self._fallback_provider = HuggingFaceProvider()
         elif provider == "huggingface":
             self._provider = HuggingFaceProvider()
         else:

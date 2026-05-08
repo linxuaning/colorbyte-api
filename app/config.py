@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # - "nero": Nero AI task API
     # - "local": local GFPGAN + Real-ESRGAN (no API key required)
     # - "mock": local no-op provider
-    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock", "photofix"] = "photofix"
+    ai_provider: Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock", "photofix", "deepseek"] = "photofix"
 
     # Local GFPGAN/Real-ESRGAN (only needed when ai_provider=local)
     local_python: str = ""       # path to gfpgan-env Python, e.g. /path/to/gfpgan-env/bin/python
@@ -29,9 +29,14 @@ class Settings(BaseSettings):
     local_scale: int = 2         # upscale factor
 
     # PhotoFix backend (only needed when ai_provider=photofix)
-    photofix_api_url: str = "https://backend.artimagehub.com"
+    photofix_api_url: str = "https://backend.artimagehub.com/api/restore"
     # Internal API key for service-to-service calls (bypasses payment check)
     internal_api_key: str = "artimagehub-internal-2026"
+
+    # DeepSeek V4 Pro via Alibaba DashScope (only needed when ai_provider=deepseek)
+    deepseek_api_key: str = ""
+    deepseek_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    deepseek_model: str = "deepseek-v4-pro"
 
     # Replicate AI (only needed when ai_provider=replicate)
     replicate_api_token: str = ""
@@ -125,7 +130,7 @@ def get_settings() -> Settings:
 
 def get_effective_ai_provider(
     settings: Settings | None = None,
-) -> Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock", "photofix"]:
+) -> Literal["huggingface", "hf_inference", "replicate", "nero", "local", "mock", "photofix", "deepseek"]:
     """Auto-switch to Replicate when token exists and provider is still default huggingface."""
     settings = settings or get_settings()
 
