@@ -99,7 +99,15 @@ class HuggingFaceProvider(AIProvider):
     # queues can take 5-10+ min during peak; blocking the task that long
     # leaves paying users staring at a stuck progress bar. Fall through to
     # the next Space instead.
-    _SPACE_PREDICT_TIMEOUT_S = 90
+    #
+    # 2026-05-08: dropped 90 -> 30s after observing sczhou/CodeFormer (L4 GPU,
+    # normally 5-15s) silently parking a task at 90s queue-stall while the
+    # cpu-basic fallback (PERCY001) was sitting idle. 30s preserves the fast-
+    # path success window for healthy GPU Spaces and cuts wasted dwell time
+    # by 60s when a Space is in queue-stall. async /api/upload flow still
+    # absorbs the worst-case sum across all Spaces; sync /api/restore stays
+    # near the proxy 100s ceiling.
+    _SPACE_PREDICT_TIMEOUT_S = 30
 
     async def _try_space(
         self, space_id: str, space_type: str, input_path: str, api_endpoint: str = "/predict"
