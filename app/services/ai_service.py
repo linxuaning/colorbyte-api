@@ -74,9 +74,16 @@ class HuggingFaceProvider(AIProvider):
         # CodeFormer v2: (image, face_align, bg_enhance, face_upsample, upscale, fidelity)
         ("sczhou/CodeFormer", "codeformer_v2", "/inference"),
         ("PERCY001/CodeFormer", "codeformer_v2", "/predict"),
-        # Multi-model spaces (gallery-based /inference API)
-        ("avans06/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
-        ("titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
+        # Multi-model gallery Spaces DISABLED 2026-05-08 after task 79f9992f8074:
+        # avans06/titanito return a multi-entry gallery [face_crop, restore_thumb,
+        # cmp.zip, restore_full, ...]. Our parser took result[0] = face_crop or
+        # bundled comparison artifact. The downstream DDColor pass then recolored
+        # that crop/zip as if it were the full image, producing a purple-noise
+        # output (founder retry on real old photo). PIL fallback is preferable to
+        # this until the gallery parse is fixed properly (filter for
+        # name contains 'restore' / largest dimensions).
+        # ("avans06/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
+        # ("titanito/Image_Face_Upscale_Restoration-GFPGAN-RestoreFormer-CodeFormer-GPEN", "multimodel_v2", "/inference"),
     ]
 
     # Colorization Spaces — jantic/DeOldify was deleted from HF; audited alternatives 2026-04-17.
