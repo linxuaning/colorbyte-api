@@ -1214,6 +1214,19 @@ class PhotoFixProvider(AIProvider):
 
         task = "colorize" if colorize else "restore"
 
+        # Retry policy: cloudflared tunnel + Render → 221 path can have transient
+        # connect-time blips (sin POP failover, Render egress reroute, etc).
+        # Without retry these blips cascade to silent HF Spaces fallback that
+        # serves bad output (5/10 evening: Mariella's tunnel switch caught two
+        # users in fallback windows). Retry 3x: 0s/2s/8s backoff. Total worst-case
+        # 10s + 3 connect-timeouts before giving up to outer fallback. Most
+        # transient blips resolve <2s. Single full chain runs ~80-90s so adding
+        # 10s when blip occurs is acceptable; the alternative (HF fallback) gives
+        # PIL UnsharpMask quality which is worse than waiting another attempt.
+        # Keep HF fallback (founder 5-10 directive "HF fallback 还是要的，作为保底").
+        import asyncio
+        RETRY_DELAYS = [0, 2, 8]
+        last_exc: Exception | None = None
         try:
             if progress_callback:
                 await progress_callback("Preparing image...", 10)
@@ -1224,35 +1237,54 @@ class PhotoFixProvider(AIProvider):
             if progress_callback:
                 await progress_callback("Processing with PhotoFix...", 20)
 
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(self.REQUEST_TIMEOUT, connect=30.0),
-                follow_redirects=True,
-            ) as http:
-                resp = await http.post(
-                    self.api_url,
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Internal-Key": self.internal_api_key,
-                    },
-                    json={"image": image_b64, "task": task},
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            for attempt_idx, delay in enumerate(RETRY_DELAYS):
+                if delay:
+                    logger.warning(
+                        "PhotoFix retry %d/3 after %ds backoff (last error: %s)",
+                        attempt_idx + 1, delay, last_exc,
+                    )
+                    await asyncio.sleep(delay)
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(self.REQUEST_TIMEOUT, connect=30.0),
+                        follow_redirects=True,
+                    ) as http:
+                        resp = await http.post(
+                            self.api_url,
+                            headers={
+                                "Content-Type": "application/json",
+                                "X-Internal-Key": self.internal_api_key,
+                            },
+                            json={"image": image_b64, "task": task},
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
 
-            if not data.get("ok"):
-                raise RuntimeError(data.get("error") or "PhotoFix returned ok=false")
+                    if not data.get("ok"):
+                        raise RuntimeError(data.get("error") or "PhotoFix returned ok=false")
 
-            result_bytes = base64.b64decode(data["result"])
-            Path(output_path).write_bytes(result_bytes)
+                    result_bytes = base64.b64decode(data["result"])
+                    Path(output_path).write_bytes(result_bytes)
 
-            if progress_callback:
-                await progress_callback("Complete", 100)
+                    if progress_callback:
+                        await progress_callback("Complete", 100)
 
-            logger.info("PhotoFix: done, output saved to %s", output_path)
-            return ProcessingResult(success=True, output_path=output_path)
+                    if attempt_idx > 0:
+                        logger.info(
+                            "PhotoFix: succeeded on retry %d/3 → %s",
+                            attempt_idx + 1, output_path,
+                        )
+                    else:
+                        logger.info("PhotoFix: done, output saved to %s", output_path)
+                    return ProcessingResult(success=True, output_path=output_path)
+                except Exception as exc:
+                    last_exc = exc
+                    # Continue retry loop unless this is the final attempt
+                    if attempt_idx == len(RETRY_DELAYS) - 1:
+                        raise
 
         except Exception as exc:
-            logger.error("PhotoFix processing failed: %s", exc)
+            logger.error("PhotoFix processing failed after retries: %s", exc)
             return ProcessingResult(success=False, error=str(exc))
 
 
