@@ -781,6 +781,7 @@ class DodoCreateCheckoutRequest(BaseModel):
     cta_slot: str | None = None
     entry_variant: str | None = None
     checkout_source: str | None = None
+    ga_client_id: str | None = None
 
 
 class DodoCreateCheckoutResponse(BaseModel):
@@ -834,6 +835,8 @@ async def create_dodo_checkout(request: DodoCreateCheckoutRequest):
         success_params["checkout_source"] = request.checkout_source
         cancel_params["checkout_source"] = request.checkout_source
         metadata["checkout_source"] = request.checkout_source
+    if request.ga_client_id:
+        metadata["ga_client_id"] = request.ga_client_id
 
     return_url = f"{frontend_base}/payment/success?{urlencode(success_params)}"
     cancel_url = (
@@ -993,6 +996,21 @@ def _handle_dodo_payment_succeeded(event_data: dict):
             email=primary_email,
             payment_provider="dodo",
             completed_at=now.isoformat(),
+            landing_page=metadata.get("landing_page") if isinstance(metadata, dict) else None,
+            cta_slot=metadata.get("cta_slot") if isinstance(metadata, dict) else None,
+            entry_variant=metadata.get("entry_variant") if isinstance(metadata, dict) else None,
+            checkout_source=metadata.get("checkout_source") if isinstance(metadata, dict) else None,
+        )
+
+        from app.services.ga4_measurement import send_purchase_event
+
+        send_purchase_event(
+            client_id=metadata.get("ga_client_id") if isinstance(metadata, dict) else None,
+            transaction_id=payment_id,
+            value=get_settings().dodo_payments_price_usd,
+            currency=get_settings().dodo_payments_currency,
+            payment_provider="dodo",
+            feature_key=feature_key,
             landing_page=metadata.get("landing_page") if isinstance(metadata, dict) else None,
             cta_slot=metadata.get("cta_slot") if isinstance(metadata, dict) else None,
             entry_variant=metadata.get("entry_variant") if isinstance(metadata, dict) else None,
@@ -1369,4 +1387,3 @@ async def admin_set_subscriber(req: AdminSetSubscriberRequest):
     )
     logger.info("Admin granted lifetime access: email=%s", email)
     return {"status": "ok", "email": email, "access": "lifetime"}
-

@@ -109,6 +109,10 @@ class Settings(BaseSettings):
     # Mask post-purchase thank-you email (founder feature, 2026-04-26)
     mask_email_enabled: bool = True  # Kill switch: set MASK_EMAIL_ENABLED=false to stop all sends
 
+    # GA4 Measurement Protocol (server-side paid conversion attribution)
+    ga4_measurement_id: str = ""
+    ga4_measurement_api_secret: str = ""
+
     # Database
     database_path: str = "data/artimagehub.db"
     database_url: str = ""           # Unified PG (subscriptions + metrics). Falls back to metrics_database_url for back-compat.
