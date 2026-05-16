@@ -1657,16 +1657,53 @@ def get_payment_success_metrics(hours: int = 24) -> dict:
     }
 
 
-def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25) -> dict:
+_INTERNAL_FUNNEL_CTA_SLOTS = {
+    "alias_verify",
+    "followup_latency_check",
+    "hourly_revenue_check",
+    "live_verify_after_dns",
+    "proof_check",
+    "proof_latency_check",
+    "speed_probe",
+    "standup_latency_check",
+}
+_INTERNAL_FUNNEL_ENTRY_VARIANTS = {
+    "dev_curl",
+    "foreman_proof",
+    "foreman_speed_probe",
+}
+_INTERNAL_FUNNEL_CHECKOUT_SOURCES = {
+    "alias_verify",
+    "ops_proof_check",
+    "speed_probe",
+    "terminal_probe",
+}
+
+
+def _internal_funnel_filter_sql(prefix: str = "") -> str:
+    """Exclude ops/dev probes from revenue funnel reporting by default."""
+    column = f"{prefix}." if prefix else ""
+    internal_cta = ", ".join(repr(v) for v in sorted(_INTERNAL_FUNNEL_CTA_SLOTS))
+    internal_entry = ", ".join(repr(v) for v in sorted(_INTERNAL_FUNNEL_ENTRY_VARIANTS))
+    internal_source = ", ".join(repr(v) for v in sorted(_INTERNAL_FUNNEL_CHECKOUT_SOURCES))
+    return f"""
+              AND COALESCE(NULLIF({column}cta_slot, ''), '(unset)') NOT IN ({internal_cta})
+              AND COALESCE(NULLIF({column}entry_variant, ''), '(unset)') NOT IN ({internal_entry})
+              AND COALESCE(NULLIF({column}checkout_source, ''), '(unset)') NOT IN ({internal_source})
+    """
+
+
+def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25, include_internal: bool = False) -> dict:
     """Return payment initiation/success counts grouped by attribution tuple."""
     now, start_iso = _metrics_window(hours)
     safe_limit = max(1, min(limit, 100))
+    internal_filter = "" if include_internal else _internal_funnel_filter_sql()
 
     if _use_postgres():
         with _connect_postgres() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     WITH initiation_rows AS (
                         SELECT
                             COALESCE(NULLIF(landing_page, ''), '(unset)') AS landing_page,
@@ -1676,6 +1713,7 @@ def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25) -> dict:
                             COUNT(*) AS payment_initiations
                         FROM payment_initiations
                         WHERE created_at >= %s
+                        {internal_filter}
                         GROUP BY 1, 2, 3, 4
                     ),
                     success_rows AS (
@@ -1687,6 +1725,7 @@ def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25) -> dict:
                             COUNT(*) AS payment_successes
                         FROM payment_successes
                         WHERE completed_at >= %s
+                        {internal_filter}
                         GROUP BY 1, 2, 3, 4
                     )
                     SELECT
@@ -1711,7 +1750,7 @@ def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25) -> dict:
     else:
         with get_db() as conn:
             rows = conn.execute(
-                """
+                f"""
                 WITH initiation_rows AS (
                     SELECT
                         COALESCE(NULLIF(landing_page, ''), '(unset)') AS landing_page,
@@ -1721,6 +1760,7 @@ def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25) -> dict:
                         COUNT(*) AS payment_initiations
                     FROM payment_initiations
                     WHERE created_at >= ?
+                    {internal_filter}
                     GROUP BY 1, 2, 3, 4
                 ),
                 success_rows AS (
@@ -1732,6 +1772,7 @@ def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25) -> dict:
                         COUNT(*) AS payment_successes
                     FROM payment_successes
                     WHERE completed_at >= ?
+                    {internal_filter}
                     GROUP BY 1, 2, 3, 4
                 )
                 SELECT

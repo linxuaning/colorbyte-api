@@ -124,9 +124,14 @@ def build_payment_success_metrics(hours: int) -> PaymentSuccessMetricsResponse:
 async def get_payment_funnel_breakdown_metrics(
     hours: int = Query(default=24, ge=1, le=168),
     limit: int = Query(default=25, ge=1, le=100),
+    include_internal: bool = Query(default=False),
 ):
     """Return payment initiation/success counts grouped by funnel attribution."""
-    data = get_payment_funnel_breakdown(hours=hours, limit=limit)
+    data = get_payment_funnel_breakdown(
+        hours=hours,
+        limit=limit,
+        include_internal=include_internal,
+    )
     return PaymentFunnelBreakdownResponse(**data)
 
 
