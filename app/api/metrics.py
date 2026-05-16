@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from app.services.database import (
     get_exact_funnel_tuple_metrics,
+    get_payment_funnel_breakdown,
     get_payment_initiation_metrics,
     get_payment_success_metrics,
     get_processing_complete_metrics,
@@ -46,6 +47,23 @@ class ExactFunnelTupleMetricsResponse(BaseModel):
     payment_by_provider: dict[str, int]
     processing_completions: int
     processing_by_mode: dict[str, int]
+    storage_backend: str
+    window_hours: int
+    generated_at: str
+
+
+class PaymentFunnelBreakdownRow(BaseModel):
+    landing_page: str
+    cta_slot: str
+    entry_variant: str
+    checkout_source: str
+    payment_initiations: int
+    payment_successes: int
+    success_rate: float | None
+
+
+class PaymentFunnelBreakdownResponse(BaseModel):
+    breakdown: list[PaymentFunnelBreakdownRow]
     storage_backend: str
     window_hours: int
     generated_at: str
@@ -97,6 +115,19 @@ async def get_payment_successes(
 def build_payment_success_metrics(hours: int) -> PaymentSuccessMetricsResponse:
     data = get_payment_success_metrics(hours=hours)
     return PaymentSuccessMetricsResponse(**data)
+
+
+@router.get(
+    "/metrics/payment-funnel-breakdown",
+    response_model=PaymentFunnelBreakdownResponse,
+)
+async def get_payment_funnel_breakdown_metrics(
+    hours: int = Query(default=24, ge=1, le=168),
+    limit: int = Query(default=25, ge=1, le=100),
+):
+    """Return payment initiation/success counts grouped by funnel attribution."""
+    data = get_payment_funnel_breakdown(hours=hours, limit=limit)
+    return PaymentFunnelBreakdownResponse(**data)
 
 
 @router.get(

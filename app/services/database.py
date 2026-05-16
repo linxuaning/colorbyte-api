@@ -1655,3 +1655,136 @@ def get_payment_success_metrics(hours: int = 24) -> dict:
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),
     }
+
+
+def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25) -> dict:
+    """Return payment initiation/success counts grouped by attribution tuple."""
+    now, start_iso = _metrics_window(hours)
+    safe_limit = max(1, min(limit, 100))
+
+    if _use_postgres():
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH initiation_rows AS (
+                        SELECT
+                            COALESCE(NULLIF(landing_page, ''), '(unset)') AS landing_page,
+                            COALESCE(NULLIF(cta_slot, ''), '(unset)') AS cta_slot,
+                            COALESCE(NULLIF(entry_variant, ''), '(unset)') AS entry_variant,
+                            COALESCE(NULLIF(checkout_source, ''), '(unset)') AS checkout_source,
+                            COUNT(*) AS payment_initiations
+                        FROM payment_initiations
+                        WHERE created_at >= %s
+                        GROUP BY 1, 2, 3, 4
+                    ),
+                    success_rows AS (
+                        SELECT
+                            COALESCE(NULLIF(landing_page, ''), '(unset)') AS landing_page,
+                            COALESCE(NULLIF(cta_slot, ''), '(unset)') AS cta_slot,
+                            COALESCE(NULLIF(entry_variant, ''), '(unset)') AS entry_variant,
+                            COALESCE(NULLIF(checkout_source, ''), '(unset)') AS checkout_source,
+                            COUNT(*) AS payment_successes
+                        FROM payment_successes
+                        WHERE completed_at >= %s
+                        GROUP BY 1, 2, 3, 4
+                    )
+                    SELECT
+                        COALESCE(i.landing_page, s.landing_page) AS landing_page,
+                        COALESCE(i.cta_slot, s.cta_slot) AS cta_slot,
+                        COALESCE(i.entry_variant, s.entry_variant) AS entry_variant,
+                        COALESCE(i.checkout_source, s.checkout_source) AS checkout_source,
+                        COALESCE(i.payment_initiations, 0) AS payment_initiations,
+                        COALESCE(s.payment_successes, 0) AS payment_successes
+                    FROM initiation_rows i
+                    FULL OUTER JOIN success_rows s
+                      ON i.landing_page = s.landing_page
+                     AND i.cta_slot = s.cta_slot
+                     AND i.entry_variant = s.entry_variant
+                     AND i.checkout_source = s.checkout_source
+                    ORDER BY payment_initiations DESC, payment_successes DESC
+                    LIMIT %s
+                    """,
+                    (start_iso, start_iso, safe_limit),
+                )
+                rows = cur.fetchall()
+    else:
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                WITH initiation_rows AS (
+                    SELECT
+                        COALESCE(NULLIF(landing_page, ''), '(unset)') AS landing_page,
+                        COALESCE(NULLIF(cta_slot, ''), '(unset)') AS cta_slot,
+                        COALESCE(NULLIF(entry_variant, ''), '(unset)') AS entry_variant,
+                        COALESCE(NULLIF(checkout_source, ''), '(unset)') AS checkout_source,
+                        COUNT(*) AS payment_initiations
+                    FROM payment_initiations
+                    WHERE created_at >= ?
+                    GROUP BY 1, 2, 3, 4
+                ),
+                success_rows AS (
+                    SELECT
+                        COALESCE(NULLIF(landing_page, ''), '(unset)') AS landing_page,
+                        COALESCE(NULLIF(cta_slot, ''), '(unset)') AS cta_slot,
+                        COALESCE(NULLIF(entry_variant, ''), '(unset)') AS entry_variant,
+                        COALESCE(NULLIF(checkout_source, ''), '(unset)') AS checkout_source,
+                        COUNT(*) AS payment_successes
+                    FROM payment_successes
+                    WHERE completed_at >= ?
+                    GROUP BY 1, 2, 3, 4
+                )
+                SELECT
+                    COALESCE(i.landing_page, s.landing_page) AS landing_page,
+                    COALESCE(i.cta_slot, s.cta_slot) AS cta_slot,
+                    COALESCE(i.entry_variant, s.entry_variant) AS entry_variant,
+                    COALESCE(i.checkout_source, s.checkout_source) AS checkout_source,
+                    COALESCE(i.payment_initiations, 0) AS payment_initiations,
+                    COALESCE(s.payment_successes, 0) AS payment_successes
+                FROM initiation_rows i
+                LEFT JOIN success_rows s
+                  ON i.landing_page = s.landing_page
+                 AND i.cta_slot = s.cta_slot
+                 AND i.entry_variant = s.entry_variant
+                 AND i.checkout_source = s.checkout_source
+                UNION ALL
+                SELECT
+                    s.landing_page,
+                    s.cta_slot,
+                    s.entry_variant,
+                    s.checkout_source,
+                    0 AS payment_initiations,
+                    s.payment_successes
+                FROM success_rows s
+                LEFT JOIN initiation_rows i
+                  ON i.landing_page = s.landing_page
+                 AND i.cta_slot = s.cta_slot
+                 AND i.entry_variant = s.entry_variant
+                 AND i.checkout_source = s.checkout_source
+                WHERE i.landing_page IS NULL
+                ORDER BY payment_initiations DESC, payment_successes DESC
+                LIMIT ?
+                """,
+                (start_iso, start_iso, safe_limit),
+            ).fetchall()
+
+    breakdown = []
+    for row in rows:
+        initiations = int(row["payment_initiations"] or 0)
+        successes = int(row["payment_successes"] or 0)
+        breakdown.append({
+            "landing_page": row["landing_page"],
+            "cta_slot": row["cta_slot"],
+            "entry_variant": row["entry_variant"],
+            "checkout_source": row["checkout_source"],
+            "payment_initiations": initiations,
+            "payment_successes": successes,
+            "success_rate": round(successes / initiations, 4) if initiations else None,
+        })
+
+    return {
+        "breakdown": breakdown,
+        "storage_backend": get_database_backend(),
+        "window_hours": max(1, hours),
+        "generated_at": now.isoformat(),
+    }
