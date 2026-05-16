@@ -132,11 +132,16 @@ def _connect_postgres():
     from psycopg import connect
     from psycopg.rows import dict_row
 
-    return connect(
+    conn = connect(
         _get_database_url(),
         connect_timeout=5,
         row_factory=dict_row,
     )
+    try:
+        conn.execute("SET statement_timeout = '8000ms'")
+    except Exception:
+        logger.exception("failed to set postgres statement_timeout")
+    return conn
 
 
 # --- Deprecated metrics-only aliases (kept so app-code keeps working until Commit B) ---
@@ -1704,24 +1709,27 @@ def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25, include_inter
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    WITH initiation_rows AS (
+                    WITH funnel_events AS (
                         SELECT
                             COALESCE(NULLIF(landing_page, ''), '(unset)') AS landing_page,
                             COALESCE(NULLIF(cta_slot, ''), '(unset)') AS cta_slot,
                             COALESCE(NULLIF(entry_variant, ''), '(unset)') AS entry_variant,
                             COALESCE(NULLIF(checkout_source, ''), '(unset)') AS checkout_source,
-                            COUNT(*) AS payment_initiations
+                            COUNT(*) AS payment_initiations,
+                            0 AS payment_successes
                         FROM payment_initiations
                         WHERE created_at >= %s
                         {internal_filter}
                         GROUP BY 1, 2, 3, 4
-                    ),
-                    success_rows AS (
+
+                        UNION ALL
+
                         SELECT
                             COALESCE(NULLIF(landing_page, ''), '(unset)') AS landing_page,
                             COALESCE(NULLIF(cta_slot, ''), '(unset)') AS cta_slot,
                             COALESCE(NULLIF(entry_variant, ''), '(unset)') AS entry_variant,
                             COALESCE(NULLIF(checkout_source, ''), '(unset)') AS checkout_source,
+                            0 AS payment_initiations,
                             COUNT(*) AS payment_successes
                         FROM payment_successes
                         WHERE completed_at >= %s
@@ -1729,18 +1737,14 @@ def get_payment_funnel_breakdown(hours: int = 24, limit: int = 25, include_inter
                         GROUP BY 1, 2, 3, 4
                     )
                     SELECT
-                        COALESCE(i.landing_page, s.landing_page) AS landing_page,
-                        COALESCE(i.cta_slot, s.cta_slot) AS cta_slot,
-                        COALESCE(i.entry_variant, s.entry_variant) AS entry_variant,
-                        COALESCE(i.checkout_source, s.checkout_source) AS checkout_source,
-                        COALESCE(i.payment_initiations, 0) AS payment_initiations,
-                        COALESCE(s.payment_successes, 0) AS payment_successes
-                    FROM initiation_rows i
-                    FULL OUTER JOIN success_rows s
-                      ON i.landing_page = s.landing_page
-                     AND i.cta_slot = s.cta_slot
-                     AND i.entry_variant = s.entry_variant
-                     AND i.checkout_source = s.checkout_source
+                        landing_page,
+                        cta_slot,
+                        entry_variant,
+                        checkout_source,
+                        SUM(payment_initiations) AS payment_initiations,
+                        SUM(payment_successes) AS payment_successes
+                    FROM funnel_events
+                    GROUP BY 1, 2, 3, 4
                     ORDER BY payment_initiations DESC, payment_successes DESC
                     LIMIT %s
                     """,
