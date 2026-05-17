@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     # Alert Email (payment failure notifications)
     alert_email_to: str = "linxuaning98@gmail.com"
     resend_api_key: str = ""  # Resend API key (preferred over SMTP when set)
-    resend_from_email: str = "alerts@artimagehub.com"  # Sender address (must be verified in Resend)
+    resend_from_email: str = "support@artimagehub.com"  # Verified Resend sender
     alert_smtp_host: str = "smtp.gmail.com"
     alert_smtp_port: int = 587
     alert_smtp_user: str = ""   # Gmail address used to send alerts

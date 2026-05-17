@@ -147,6 +147,8 @@ def _send_via_resend(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            # Cloudflare in front of Resend 1010-blocks urllib's default UA.
+            "User-Agent": "artimagehub-alert/1.0",
         },
         method="POST",
     )
