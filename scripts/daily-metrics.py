@@ -78,6 +78,11 @@ GEO_SOURCES = {
     "kagi.com", "character.ai", "mistral.ai", "groq.com",
 }
 
+SUSPICIOUS_SG_MIN_SESSIONS = 50
+SUSPICIOUS_SG_MAX_ENGAGEMENT_RATE = 0.10
+SUSPICIOUS_SG_DIRECT_SOURCE = "(direct)"
+SUSPICIOUS_SG_DIRECT_MEDIUM = "(none)"
+
 INTERNAL_FUNNEL_MARKERS = (
     "probe",
     "monitor",
@@ -131,6 +136,75 @@ def _ga4_post(url: str, headers: dict, body: dict) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
+
+
+def _date_filter(day: str) -> dict:
+    return {"startDate": day, "endDate": day}
+
+
+def _and_filter(expressions: list[dict]) -> dict:
+    return {"andGroup": {"expressions": expressions}}
+
+
+def _exact_filter(field: str, value: str) -> dict:
+    return {
+        "filter": {
+            "fieldName": field,
+            "stringFilter": {"value": value, "matchType": "EXACT"},
+        }
+    }
+
+
+def is_suspicious_singapore_direct(sessions: int, engagement_rate: float) -> bool:
+    return sessions >= SUSPICIOUS_SG_MIN_SESSIONS and engagement_rate <= SUSPICIOUS_SG_MAX_ENGAGEMENT_RATE
+
+
+def fetch_suspicious_singapore_day(url: str, headers: dict, day: str) -> dict:
+    """Return Singapore direct traffic quality for one day.
+
+    The suspicious pattern seen on 2026-05-19+ is high-volume Singapore direct
+    desktop Chrome traffic with near-zero engagement and zero conversions.
+    We filter only the country/source/medium here so the report can show the
+    raw evidence rather than silently rewriting GA4 totals.
+    """
+    resp = _ga4_post(url, headers, {
+        "dateRanges": [_date_filter(day)],
+        "metrics": [
+            {"name": "sessions"},
+            {"name": "activeUsers"},
+            {"name": "screenPageViews"},
+            {"name": "engagedSessions"},
+            {"name": "engagementRate"},
+            {"name": "conversions"},
+        ],
+        "dimensionFilter": _and_filter([
+            _exact_filter("country", "Singapore"),
+            _exact_filter("sessionSource", SUSPICIOUS_SG_DIRECT_SOURCE),
+            _exact_filter("sessionMedium", SUSPICIOUS_SG_DIRECT_MEDIUM),
+        ]),
+    })
+    if not resp.get("rows"):
+        return {
+            "sessions": 0,
+            "active_users": 0,
+            "pv": 0,
+            "engaged_sessions": 0,
+            "engagement_rate": 0.0,
+            "conversions": 0,
+            "suspicious": False,
+        }
+    vals = resp["rows"][0]["metricValues"]
+    sessions = int(vals[0]["value"])
+    engagement_rate = float(vals[4]["value"])
+    return {
+        "sessions": sessions,
+        "active_users": int(vals[1]["value"]),
+        "pv": int(vals[2]["value"]),
+        "engaged_sessions": int(vals[3]["value"]),
+        "engagement_rate": engagement_rate,
+        "conversions": int(float(vals[5]["value"])),
+        "suspicious": is_suspicious_singapore_direct(sessions, engagement_rate),
+    }
 
 
 def ascii_bar(value: int, max_val: int, width: int = 18) -> str:
@@ -188,12 +262,17 @@ def fetch_ga4_metrics() -> dict:
                 geo_sessions += n
                 geo_breakdown[src] = n
 
+        suspicious_sg = fetch_suspicious_singapore_day(url, headers, yesterday)
+        clean_sessions = max(0, sessions - (suspicious_sg["sessions"] if suspicious_sg["suspicious"] else 0))
+
         return {
             "available": True,
             "date": yesterday,
             "pv": pv,
             "uv": uv,
             "sessions": sessions,
+            "clean_sessions": clean_sessions,
+            "suspicious_sg": suspicious_sg,
             "geo_sessions": geo_sessions,
             "geo_pct": (geo_sessions / sessions * 100) if sessions > 0 else 0.0,
             "geo_breakdown": geo_breakdown,
@@ -235,6 +314,24 @@ def fetch_ga4_7day_trend() -> dict:
             "limit": 500,
         })
 
+        # Daily suspicious Singapore direct traffic.
+        sg_daily = _ga4_post(url, headers, {
+            "dateRanges": [{"startDate": "7daysAgo", "endDate": "yesterday"}],
+            "dimensions": [{"name": "date"}],
+            "metrics": [
+                {"name": "sessions"},
+                {"name": "engagementRate"},
+                {"name": "conversions"},
+            ],
+            "dimensionFilter": _and_filter([
+                _exact_filter("country", "Singapore"),
+                _exact_filter("sessionSource", SUSPICIOUS_SG_DIRECT_SOURCE),
+                _exact_filter("sessionMedium", SUSPICIOUS_SG_DIRECT_MEDIUM),
+            ]),
+            "orderBys": [{"dimension": {"dimensionName": "date"}}],
+            "limit": 14,
+        })
+
         # Build geo_by_date lookup
         geo_by_date: dict[str, int] = {}
         for row in (geo_daily.get("rows") or []):
@@ -244,6 +341,15 @@ def fetch_ga4_7day_trend() -> dict:
             if src in GEO_SOURCES:
                 geo_by_date[d] = geo_by_date.get(d, 0) + n
 
+        suspicious_sg_by_date: dict[str, int] = {}
+        for row in (sg_daily.get("rows") or []):
+            d = row["dimensionValues"][0]["value"]
+            sessions = int(row["metricValues"][0]["value"])
+            engagement_rate = float(row["metricValues"][1]["value"])
+            conversions = int(float(row["metricValues"][2]["value"]))
+            if conversions == 0 and is_suspicious_singapore_direct(sessions, engagement_rate):
+                suspicious_sg_by_date[d] = sessions
+
         rows = []
         for row in (daily.get("rows") or []):
             d = row["dimensionValues"][0]["value"]  # YYYYMMDD
@@ -252,8 +358,17 @@ def fetch_ga4_7day_trend() -> dict:
             uv = int(vals[1]["value"])
             sess = int(vals[2]["value"])
             geo = geo_by_date.get(d, 0)
+            suspicious_sg = suspicious_sg_by_date.get(d, 0)
             label = f"{d[:4]}-{d[4:6]}-{d[6:]}"
-            rows.append({"date": label, "pv": pv, "uv": uv, "sessions": sess, "geo": geo})
+            rows.append({
+                "date": label,
+                "pv": pv,
+                "uv": uv,
+                "sessions": sess,
+                "clean_sessions": max(0, sess - suspicious_sg),
+                "suspicious_sg": suspicious_sg,
+                "geo": geo,
+            })
 
         return {"available": True, "rows": rows}
     except Exception as e:
@@ -362,13 +477,21 @@ def build_email_body() -> tuple[str, str]:
     lines.append("")
     if ga4.get("available"):
         geo_pct = ga4["geo_pct"]
+        sg = ga4.get("suspicious_sg") or {}
+        suspicious_sg_sessions = int(sg.get("sessions") or 0) if sg.get("suspicious") else 0
         lines += [
             f"流量 — {ga4['date']}（GA4，T-1，北京时间）:",
             f"  PV（页面浏览）:       {ga4['pv']:6}",
             f"  UV（活跃用户）:       {ga4['uv']:6}",
-            f"  Sessions:           {ga4['sessions']:6}",
+            f"  Sessions（raw）:     {ga4['sessions']:6}",
+            f"  可疑新加坡 direct:   {suspicious_sg_sessions:6}",
+            f"  Sessions（剔除后）:   {ga4.get('clean_sessions', ga4['sessions']):6}",
             f"  GEO/AI 会话:         {ga4['geo_sessions']:6}    （占 sessions {geo_pct:.1f}%）",
         ]
+        if suspicious_sg_sessions:
+            lines.append(
+                "  判定: 新加坡 direct 量级异常且低互动，按疑似机器人/无效流量处理，不计入有效增长。"
+            )
         if ga4["geo_breakdown"]:
             lines.append("  GEO 来源拆分:")
             for src, n in sorted(ga4["geo_breakdown"].items(), key=lambda x: -x[1]):
@@ -386,11 +509,15 @@ def build_email_body() -> tuple[str, str]:
         max_geo = max((r["geo"] for r in trows), default=1) or 1
 
         lines += ["", "─" * 50, "7 日趋势（UV · PV · GEO/AI sessions）", "─" * 50]
-        lines.append(f"{'日期':<12}  {'UV':>4}  {'趋势':<18}  {'PV':>5}  {'GEO':>4}")
-        lines.append(f"{'────────────':<12}  {'────':>4}  {'──────────────────':<18}  {'─────':>5}  {'────':>4}")
+        lines.append(f"{'日期':<12}  {'UV':>4}  {'趋势':<18}  {'PV':>5}  {'RawS':>5}  {'可疑SG':>5}  {'净S':>5}  {'GEO':>4}")
+        lines.append(f"{'────────────':<12}  {'────':>4}  {'──────────────────':<18}  {'─────':>5}  {'─────':>5}  {'─────':>5}  {'─────':>5}  {'────':>4}")
         for r in trows:
             bar = ascii_bar(r["uv"], max_uv)
-            lines.append(f"{r['date']:<12}  {r['uv']:>4}  {bar:<18}  {r['pv']:>5}  {r['geo']:>4}")
+            lines.append(
+                f"{r['date']:<12}  {r['uv']:>4}  {bar:<18}  {r['pv']:>5}  "
+                f"{r['sessions']:>5}  {r.get('suspicious_sg', 0):>5}  "
+                f"{r.get('clean_sessions', r['sessions']):>5}  {r['geo']:>4}"
+            )
 
         lines.append("")
         lines.append("GEO/AI 趋势（sessions/day）:")
@@ -399,11 +526,16 @@ def build_email_body() -> tuple[str, str]:
             pct = f"{r['geo']/r['sessions']*100:.0f}%" if r["sessions"] else "0%"
             lines.append(f"  {r['date']}  {bar}  {r['geo']:>3} ({pct})")
 
-        total_uv  = sum(r["uv"]  for r in trows)
+        total_uv = sum(r["uv"] for r in trows)
         total_geo = sum(r["geo"] for r in trows)
+        total_raw_sessions = sum(r["sessions"] for r in trows)
+        total_suspicious_sg = sum(r.get("suspicious_sg", 0) for r in trows)
+        total_clean_sessions = sum(r.get("clean_sessions", r["sessions"]) for r in trows)
         lines += [
             "",
-            f"7 日合计: UV={total_uv}  GEO sessions={total_geo}",
+            f"7 日合计: UV={total_uv}  raw sessions={total_raw_sessions}  "
+            f"可疑新加坡={total_suspicious_sg}  剔除后 sessions={total_clean_sessions}  "
+            f"GEO sessions={total_geo}",
             "─" * 50,
         ]
     elif not trend.get("available"):
@@ -415,6 +547,7 @@ def build_email_body() -> tuple[str, str]:
         "- 订单/收入/checkout：只来自 ArtImageHub live backend `/api/metrics/payment-*` 的滚动 24h 数据。",
         "- 不使用 GA4 `purchase`、Dodo 全账号订单数、mbtiusa/test you 项目订单作为本日报订单数。",
         "- 流量/GEO：GA4 T-1 日（北京时间昨天）。GEO 来源包含 chatgpt/perplexity/claude/gemini/copilot/you/phind 等。",
+        "- 可疑新加坡流量：country=Singapore + direct/(none)，且 sessions>=50、engagement rate<=10%、0 conversion 时，按疑似无效流量单列并从净 sessions 扣除。",
         f"- 后台入口: {DASHBOARD_HINT}",
     ]
     return subj, "\n".join(lines)
