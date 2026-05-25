@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Daily growth/revenue metrics email for artimagehub.com.
+"""ArtImageHub 每日增长/收入指标邮件。
 
-Pulls 24h numbers from the backend `/api/metrics/*` endpoints and the prior
-24h window for delta context, then sends a clean text email via Resend.
-Also pulls GA4 PV/UV/GEO data when ARTIMAGEHUB_GA4_SA_KEY is set.
-Runs once a day from a GitHub Actions cron at 00:00 UTC (08:00 Beijing).
+订单数只读取 ArtImageHub 后端 `/api/metrics/payment-successes`，不要使用
+GA4 purchase、Dodo 全账号总数、mbtiusa/test you 项目的订单。
+
+脚本拉取最近 24h 与前一 24h 的指标做环比，并在配置
+ARTIMAGEHUB_GA4_SA_KEY 时附带 GA4 流量/GEO 趋势。GitHub Actions 每天
+00:00 UTC（北京时间 08:00）运行一次。
 
 Required env:
     RESEND_API_KEY           — for outbound email
@@ -50,7 +52,7 @@ def delta(now: int, prev: int) -> str:
     if prev == 0 and now == 0:
         return "—"
     if prev == 0:
-        return f"+{now} (new)"
+        return f"+{now}（新增）"
     diff = now - prev
     pct = (diff / prev) * 100
     sign = "+" if diff >= 0 else ""
@@ -75,6 +77,37 @@ GEO_SOURCES = {
     "poe.com", "pi.ai", "grok.com", "meta.ai",
     "kagi.com", "character.ai", "mistral.ai", "groq.com",
 }
+
+INTERNAL_FUNNEL_MARKERS = (
+    "probe",
+    "monitor",
+    "debug",
+    "codex",
+    "foreman",
+    "local",
+    "cors",
+    "alias",
+    "incident",
+)
+
+
+def is_internal_funnel_row(row: dict) -> bool:
+    joined = " ".join(
+        str(row.get(k) or "").lower()
+        for k in ("landing_page", "cta_slot", "entry_variant", "checkout_source")
+    )
+    return any(marker in joined for marker in INTERNAL_FUNNEL_MARKERS)
+
+
+def filtered_initiation_count(breakdown: dict) -> int | None:
+    rows = breakdown.get("breakdown")
+    if not isinstance(rows, list):
+        return None
+    return sum(
+        int(row.get("payment_initiations") or 0)
+        for row in rows
+        if isinstance(row, dict) and not is_internal_funnel_row(row)
+    )
 
 
 def _ga4_token() -> tuple:
@@ -272,13 +305,21 @@ def fetch_webhook_health() -> dict:
 def build_email_body() -> tuple[str, str]:
     init24 = fetch("/api/metrics/payment-initiations", 24)
     init48 = fetch("/api/metrics/payment-initiations", 48)
+    breakdown24 = fetch("/api/metrics/payment-funnel-breakdown", 24)
+    breakdown48 = fetch("/api/metrics/payment-funnel-breakdown", 48)
     succ24 = fetch("/api/metrics/payment-successes", 24)
     succ48 = fetch("/api/metrics/payment-successes", 48)
     proc24 = fetch("/api/metrics/processing-complete", 24)
     proc48 = fetch("/api/metrics/processing-complete", 48)
 
-    init_now = init24.get("count", 0)
-    init_prev = max(0, init48.get("count", 0) - init_now)
+    init_now = filtered_initiation_count(breakdown24)
+    init48_filtered = filtered_initiation_count(breakdown48)
+    if init_now is None:
+        init_now = init24.get("count", 0)
+    if init48_filtered is None:
+        init_prev = max(0, init48.get("count", 0) - init_now)
+    else:
+        init_prev = max(0, init48_filtered - init_now)
     succ_now = succ24.get("count", 0)
     succ_prev = max(0, succ48.get("count", 0) - succ_now)
     proc_now = proc24.get("count", 0)
@@ -289,53 +330,53 @@ def build_email_body() -> tuple[str, str]:
 
     wh = fetch_webhook_health()
     wh_line = (
-        f"Webhook health (24h): 200={wh.get('ok_200',0)} | 401={wh.get('fail_401',0)} | 5xx={wh.get('fail_5xx',0)}"
+        f"Webhook 健康（24h）: 200={wh.get('ok_200',0)} | 401={wh.get('fail_401',0)} | 5xx={wh.get('fail_5xx',0)}"
         if wh.get("available")
-        else "Webhook health: (Render API not configured)"
+        else "Webhook 健康:（Render API 未配置）"
     )
 
     ga4 = fetch_ga4_metrics()
     trend = fetch_ga4_7day_trend()
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    subj = f"[artimagehub daily] {today} — paid={succ_now} ${revenue:.2f} | checkout={init_now} | conv={conv:.1f}%"
+    subj = f"[ArtImageHub 日报] {today} — 订单={succ_now} 收入=${revenue:.2f} | checkout={init_now} | 转化={conv:.1f}%"
 
     lines = [
-        f"Daily snapshot — {today} (window: rolling 24h, all UTC)",
+        f"ArtImageHub 每日快照 — {today}（窗口：滚动 24 小时，UTC）",
         "",
-        f"  Paid orders:        {succ_now:4}    Δ vs prior 24h: {delta(succ_now, succ_prev)}",
-        f"  Revenue:            ${revenue:7.2f}",
-        f"  Checkout attempts:  {init_now:4}    Δ vs prior 24h: {delta(init_now, init_prev)}",
-        f"  Restorations done:  {proc_now:4}    Δ vs prior 24h: {delta(proc_now, proc_prev)}",
-        f"  Checkout→pay rate:  {conv:5.1f}%   (need >= 50 attempts before reading too much into this)",
+        f"  付费订单:        {succ_now:4}    较前 24h: {delta(succ_now, succ_prev)}",
+        f"  收入:            ${revenue:7.2f}",
+        f"  Checkout 发起:   {init_now:4}    较前 24h: {delta(init_now, init_prev)}",
+        f"  修复完成:        {proc_now:4}    较前 24h: {delta(proc_now, proc_prev)}",
+        f"  Checkout→付款率: {conv:5.1f}%   （样本 <50 次时只看方向，不做结论）",
         "",
         wh_line,
         "",
-        "By provider (paid 24h):",
+        "支付渠道（付费订单 24h）:",
     ]
     for prov, n in (succ24.get("by_provider") or {}).items():
         lines.append(f"  - {prov}: {n}")
     if not (succ24.get("by_provider") or {}):
-        lines.append("  (none)")
+        lines.append("  （无）")
 
     lines.append("")
     if ga4.get("available"):
         geo_pct = ga4["geo_pct"]
         lines += [
-            f"Traffic — {ga4['date']} (GA4, T-1 Asia/Shanghai):",
-            f"  PV (pageviews):     {ga4['pv']:6}",
-            f"  UV (active users):  {ga4['uv']:6}",
+            f"流量 — {ga4['date']}（GA4，T-1，北京时间）:",
+            f"  PV（页面浏览）:       {ga4['pv']:6}",
+            f"  UV（活跃用户）:       {ga4['uv']:6}",
             f"  Sessions:           {ga4['sessions']:6}",
-            f"  GEO/AI sessions:    {ga4['geo_sessions']:6}    ({geo_pct:.1f}% of sessions)",
+            f"  GEO/AI 会话:         {ga4['geo_sessions']:6}    （占 sessions {geo_pct:.1f}%）",
         ]
         if ga4["geo_breakdown"]:
-            lines.append("  GEO breakdown:")
+            lines.append("  GEO 来源拆分:")
             for src, n in sorted(ga4["geo_breakdown"].items(), key=lambda x: -x[1]):
                 lines.append(f"    {src}: {n}")
         else:
-            lines.append("  GEO breakdown: (none detected)")
+            lines.append("  GEO 来源拆分:（未检测到）")
     else:
-        lines.append(f"Traffic: (GA4 not available — {ga4.get('reason', 'unknown')})")
+        lines.append(f"流量:（GA4 不可用 — {ga4.get('reason', 'unknown')}）")
 
     # 7-day trend charts
     if trend.get("available") and trend.get("rows"):
@@ -344,15 +385,15 @@ def build_email_body() -> tuple[str, str]:
         max_pv  = max((r["pv"]  for r in trows), default=1) or 1
         max_geo = max((r["geo"] for r in trows), default=1) or 1
 
-        lines += ["", "─" * 50, "7-day trend (UV · PV · GEO/AI sessions)", "─" * 50]
-        lines.append(f"{'Date':<12}  {'UV':>4}  {'bar':<18}  {'PV':>5}  {'GEO':>4}")
+        lines += ["", "─" * 50, "7 日趋势（UV · PV · GEO/AI sessions）", "─" * 50]
+        lines.append(f"{'日期':<12}  {'UV':>4}  {'趋势':<18}  {'PV':>5}  {'GEO':>4}")
         lines.append(f"{'────────────':<12}  {'────':>4}  {'──────────────────':<18}  {'─────':>5}  {'────':>4}")
         for r in trows:
             bar = ascii_bar(r["uv"], max_uv)
             lines.append(f"{r['date']:<12}  {r['uv']:>4}  {bar:<18}  {r['pv']:>5}  {r['geo']:>4}")
 
         lines.append("")
-        lines.append("GEO/AI trend (sessions/day):")
+        lines.append("GEO/AI 趋势（sessions/day）:")
         for r in trows:
             bar = ascii_bar(r["geo"], max_geo)
             pct = f"{r['geo']/r['sessions']*100:.0f}%" if r["sessions"] else "0%"
@@ -362,18 +403,19 @@ def build_email_body() -> tuple[str, str]:
         total_geo = sum(r["geo"] for r in trows)
         lines += [
             "",
-            f"7d totals: UV={total_uv}  GEO sessions={total_geo}",
+            f"7 日合计: UV={total_uv}  GEO sessions={total_geo}",
             "─" * 50,
         ]
     elif not trend.get("available"):
-        lines += ["", f"7-day trend: (unavailable — {trend.get('reason', 'GA4 key not set')})"]
+        lines += ["", f"7 日趋势:（不可用 — {trend.get('reason', 'GA4 key not set')}）"]
 
     lines += [
         "",
-        "Notes",
-        "- Revenue/checkout numbers: rolling 24h window from /api/metrics/payment-* on live backend.",
-        "- Traffic/GEO: GA4 T-1 day (yesterday in Asia/Shanghai). GEO sources = chatgpt/perplexity/claude/gemini/copilot/you/phind.",
-        f"- Full dashboard: {DASHBOARD_HINT}",
+        "口径说明",
+        "- 订单/收入/checkout：只来自 ArtImageHub live backend `/api/metrics/payment-*` 的滚动 24h 数据。",
+        "- 不使用 GA4 `purchase`、Dodo 全账号订单数、mbtiusa/test you 项目订单作为本日报订单数。",
+        "- 流量/GEO：GA4 T-1 日（北京时间昨天）。GEO 来源包含 chatgpt/perplexity/claude/gemini/copilot/you/phind 等。",
+        f"- 后台入口: {DASHBOARD_HINT}",
     ]
     return subj, "\n".join(lines)
 
