@@ -67,6 +67,20 @@ def _build_client(require_webhook_key: bool = False):
     return DodoPayments(**kwargs)
 
 
+def payment_health() -> dict[str, Any]:
+    """Validate Dodo SDK/config without creating a checkout session."""
+    settings = get_settings()
+    client = _build_client()
+    return {
+        "status": "healthy",
+        "sdk_available": True,
+        "client_initialized": client is not None,
+        "environment": settings.dodo_payments_environment,
+        "product_configured": bool(settings.dodo_payments_product_id),
+        "currency": settings.dodo_payments_currency,
+    }
+
+
 def create_checkout_session(
     *,
     email: str,

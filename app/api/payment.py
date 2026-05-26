@@ -792,6 +792,21 @@ class DodoCreateCheckoutResponse(BaseModel):
     currency: str
 
 
+@router.get("/payment/dodo-health")
+async def dodo_payment_health():
+    """Warm and validate Dodo payment dependencies without creating checkout sessions."""
+    from app.services.dodo_payments import payment_health
+
+    settings = get_settings()
+    try:
+        health = payment_health()
+        health["price_usd"] = f"{settings.dodo_payments_price_usd:.2f}"
+        return health
+    except Exception as e:
+        logger.error("Dodo payment health failed: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=503, detail=f"Dodo payment health failed: {str(e)}")
+
+
 @router.post("/payment/dodo-create-checkout", response_model=DodoCreateCheckoutResponse)
 async def create_dodo_checkout(request: DodoCreateCheckoutRequest):
     """
