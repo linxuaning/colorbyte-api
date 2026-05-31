@@ -962,6 +962,32 @@ async def dodo_webhook(request: Request):
         raise HTTPException(status_code=500, detail="Webhook processing failed")
 
 
+def _dodo_event_product_ownership(event_data: dict):
+    """Attribution guard for a SHARED Dodo account (T149).
+
+    Returns:
+      True  -> event's product == our configured product (process normally)
+      False -> event explicitly carries a DIFFERENT product (foreign; ignore)
+      None  -> product id is unreadable OR ours isn't configured (cannot decide)
+
+    Positive whitelist match only. Caller MUST fail-open on None (never silently
+    drop a possible real buyer); only False (explicit foreign product) is dropped.
+    """
+    expected = get_settings().dodo_payments_product_id
+    if not expected:
+        return None  # not configured -> cannot attribute -> fail-open
+    product_id = ""
+    if isinstance(event_data, dict):
+        cart = event_data.get("product_cart")
+        if isinstance(cart, list) and cart and isinstance(cart[0], dict):
+            product_id = str(cart[0].get("product_id", "")).strip()
+        if not product_id:
+            product_id = str(event_data.get("product_id", "")).strip()
+    if not product_id:
+        return None  # unreadable -> fail-open
+    return product_id == expected
+
+
 def _handle_dodo_payment_succeeded(event_data: dict):
     """Handle payment.succeeded webhook event."""
     from datetime import timedelta
@@ -969,6 +995,24 @@ def _handle_dodo_payment_succeeded(event_data: dict):
     customer = event_data.get("customer", {}) if isinstance(event_data, dict) else {}
     metadata = event_data.get("metadata", {}) if isinstance(event_data, dict) else {}
     payment_id = str(event_data.get("payment_id", "")).strip()
+
+    # --- T149 product-attribution guard (shared Dodo account) ---
+    # Only OUR product proceeds. Explicit foreign product -> silent ignore
+    # (no entitlement / no email / no order / no error). Unreadable product ->
+    # FAIL-OPEN + loud warn (never silently drop a possible real buyer).
+    ownership = _dodo_event_product_ownership(event_data)
+    if ownership is False:
+        logger.info(
+            "Dodo payment.succeeded ignored: foreign product (not our DODO_PAYMENTS_PRODUCT_ID) payment_id=%s",
+            payment_id or "unknown",
+        )
+        return
+    if ownership is None:
+        logger.warning(
+            "Dodo payment.succeeded: product id unreadable/unconfigured; FAIL-OPEN, processing as ours payment_id=%s",
+            payment_id or "unknown",
+        )
+    # --- end T149 guard ---
 
     payer_email = str(customer.get("email", "")).strip().lower()
     checkout_email = str(metadata.get("checkout_email", "")).strip().lower()
@@ -1076,6 +1120,18 @@ def _handle_dodo_payment_failed(event_data: dict):
     from app.services.alert_email import send_payment_failure_alert
 
     payment_id = str(event_data.get("payment_id", "")).strip()
+
+    # --- T149 product-attribution guard (shared Dodo account) ---
+    # Explicit foreign product -> ignore (don't alert on other projects' failures).
+    # Unreadable -> fail-open (still alert; better a noisy alert than a missed one).
+    if _dodo_event_product_ownership(event_data) is False:
+        logger.info(
+            "Dodo payment.failed ignored: foreign product (not our DODO_PAYMENTS_PRODUCT_ID) payment_id=%s",
+            payment_id or "unknown",
+        )
+        return
+    # --- end T149 guard ---
+
     customer = event_data.get("customer", {}) if isinstance(event_data, dict) else {}
     payer_email = str(customer.get("email", "")).strip().lower()
     error_msg = str(event_data.get("error_message") or event_data.get("failure_reason") or "").strip()
