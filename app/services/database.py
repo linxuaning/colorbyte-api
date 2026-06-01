@@ -1599,63 +1599,114 @@ def record_payment_success(
         raise RuntimeError(f"sqlite write failed for record_payment_success key={success_key}")
 
 
+# Historical test-you ($0.99, product pdt_0NcPYot…) contamination recorded into
+# payment_successes on the SHARED Dodo account BEFORE the T149 product guard
+# (cutover commit 6c5cfa8, 2026-05-31). Excluded by order_id from artimagehub
+# revenue/success metrics. Forward orders are guarded at the webhook, so this
+# denylist is frozen (post-guard contamination = 0). 17 ids. (Reporting-layer
+# exclusion only — does NOT touch收款/grant/order-write/webhook.)
+_FOREIGN_TEST_YOU_ORDER_IDS = frozenset({
+    "pay_0Nd1BnEvIy5AZV0EjmO31", "pay_0Nd7f9hdHu8EnVSSg8atH", "pay_0Ndj0dNw1icEsUWzhdkKt",
+    "pay_0Ne9ySqIQ0kH2RxwnbvVz", "pay_0NeYNWo8y5vPIaJAI15e5", "pay_0NeeCQHLuEL7aNYzvXJhm",
+    "pay_0Nf8FoxJiJsKElXOaFtGl", "pay_0NfOulLTub8lcrfC5fYtR", "pay_0NfPlip1bvzydnKpVIkct",
+    "pay_0NfPniUGIE4HjbJDy0r6Q", "pay_0NfVzrkYa3DbdldCQ81J0", "pay_0NfY8qbtIde1DOifKZfTD",
+    "pay_0NfjfsGSVROepjMmLy4Kp", "pay_0NfukweqXDTt7zFeGmygX", "pay_0Nfv5PuLOp04LOri21TBk",
+    "pay_0Ng06jknh0LXwQDo45epq", "pay_0Ng1iXMOoJbomPV8OV9xk",
+})
+
+
+def _foreign_exclusion(placeholder: str) -> tuple[str, list[str]]:
+    """SQL clause + params to exclude historical test-you orders by order_id.
+    Keeps rows with NULL order_id (don't drop non-test-you legacy rows)."""
+    ids = sorted(_FOREIGN_TEST_YOU_ORDER_IDS)
+    if not ids:
+        return "", []
+    marks = ", ".join(placeholder for _ in ids)
+    return f" AND (order_id IS NULL OR order_id NOT IN ({marks}))", ids
+
+
 def get_payment_success_metrics(hours: int = 24) -> dict:
-    """Return payment success count and provider split in trailing N hours. PG-only when configured."""
+    """Return payment success count and provider split in trailing N hours. PG-only when configured.
+
+    Excludes historical test-you ($0.99) cross-project contamination by order_id
+    (recorded pre-T149-guard); `excluded_test_you` reports how many were removed.
+    """
     now = datetime.now(timezone.utc)
     start = now.timestamp() - max(1, hours) * 3600
     start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
 
     if _use_postgres():
+        excl, ids = _foreign_exclusion("%s")
+        excl_marks = ", ".join("%s" for _ in ids)
         with _connect_postgres() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COUNT(*) AS cnt FROM payment_successes WHERE completed_at >= %s",
-                    (start_iso,),
+                    f"SELECT COUNT(*) AS cnt FROM payment_successes WHERE completed_at >= %s{excl}",
+                    (start_iso, *ids),
                 )
                 total_row = cur.fetchone()
                 cur.execute(
-                    """
+                    f"""
                     SELECT payment_provider, COUNT(*) AS cnt
                     FROM payment_successes
-                    WHERE completed_at >= %s
+                    WHERE completed_at >= %s{excl}
                     GROUP BY payment_provider
                     ORDER BY cnt DESC
                     """,
-                    (start_iso,),
+                    (start_iso, *ids),
                 )
                 provider_rows = cur.fetchall()
+                excluded = 0
+                if ids:
+                    cur.execute(
+                        f"SELECT COUNT(*) AS cnt FROM payment_successes "
+                        f"WHERE completed_at >= %s AND order_id IN ({excl_marks})",
+                        (start_iso, *ids),
+                    )
+                    excluded = cur.fetchone()["cnt"]
 
         return {
             "count": int(total_row["cnt"]) if total_row else 0,
             "by_provider": {
                 row["payment_provider"]: int(row["cnt"]) for row in provider_rows
             },
+            "excluded_test_you": int(excluded or 0),
             "storage_backend": get_database_backend(),
             "window_hours": max(1, hours),
             "generated_at": now.isoformat(),
         }
 
+    excl, ids = _foreign_exclusion("?")
+    excl_marks = ", ".join("?" for _ in ids)
     with get_db() as conn:
         total_row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM payment_successes WHERE completed_at >= ?",
-            (start_iso,),
+            f"SELECT COUNT(*) AS cnt FROM payment_successes WHERE completed_at >= ?{excl}",
+            (start_iso, *ids),
         ).fetchone()
         provider_rows = conn.execute(
-            """
+            f"""
             SELECT payment_provider, COUNT(*) AS cnt
             FROM payment_successes
-            WHERE completed_at >= ?
+            WHERE completed_at >= ?{excl}
             GROUP BY payment_provider
             ORDER BY cnt DESC
             """,
-            (start_iso,),
+            (start_iso, *ids),
         ).fetchall()
+        excluded = 0
+        if ids:
+            excluded = conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM payment_successes "
+                f"WHERE completed_at >= ? AND order_id IN ({excl_marks})",
+                (start_iso, *ids),
+            ).fetchone()["cnt"]
 
     return {
         "count": int(total_row["cnt"]) if total_row else 0,
         "by_provider": {
             row["payment_provider"]: int(row["cnt"]) for row in provider_rows
         },
+        "excluded_test_you": int(excluded or 0),
         "storage_backend": get_database_backend(),
         "window_hours": max(1, hours),
         "generated_at": now.isoformat(),

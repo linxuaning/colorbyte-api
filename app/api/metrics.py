@@ -33,6 +33,7 @@ class PaymentInitiationMetricsResponse(BaseModel):
 class PaymentSuccessMetricsResponse(BaseModel):
     count: int
     by_provider: dict[str, int]
+    excluded_test_you: int = 0  # historical cross-project (test-you) rows removed from count
     storage_backend: str
     window_hours: int
     generated_at: str

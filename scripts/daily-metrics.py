@@ -454,13 +454,14 @@ def build_email_body() -> tuple[str, str]:
     trend = fetch_ga4_7day_trend()
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    subj = f"[ArtImageHub 日报] {today} — 订单={succ_now} 收入=${revenue:.2f} | checkout={init_now} | 转化={conv:.1f}%"
+    subj = f"[ArtImageHub 日报] {today} — 订单={succ_now} 收入(NET)=${revenue:.2f} | checkout={init_now} | 转化={conv:.1f}%"
 
     lines = [
         f"ArtImageHub 每日快照 — {today}（窗口：滚动 24 小时，UTC）",
         "",
         f"  付费订单:        {succ_now:4}    较前 24h: {delta(succ_now, succ_prev)}",
-        f"  收入:            ${revenue:7.2f}",
+        f"  收入(NET):       ${revenue:7.2f}",
+        f"  （已排除 test-you 跨项目污染: {succ24.get('excluded_test_you', 0)} 笔）",
         f"  Checkout 发起:   {init_now:4}    较前 24h: {delta(init_now, init_prev)}",
         f"  修复完成:        {proc_now:4}    较前 24h: {delta(proc_now, proc_prev)}",
         f"  Checkout→付款率: {conv:5.1f}%   （样本 <50 次时只看方向，不做结论）",
