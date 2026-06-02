@@ -916,6 +916,52 @@ def _has_any_feature_entitlement(email: str) -> bool:
         return row is not None
 
 
+def has_real_feature_entitlement(email: str, feature_key: str) -> bool:
+    """True if `email` has a CONFIRMED-real active entitlement for `feature_key`.
+
+    Used by the T151 already-purchased guard to avoid creating a duplicate Dodo
+    checkout session for someone who already genuinely bought this feature.
+
+    "Confirmed-real" = an entitlement row whose payment_id is non-NULL and NOT in
+    the historical test-you mis-grant denylist (_FOREIGN_TEST_YOU_ORDER_IDS, shared
+    with fix#1). Rationale (fail-open / never block a real buyer):
+      - test-you mis-grants are NOT treated as a real artimagehub purchase, so those
+        17 emails are NOT blocked from genuinely buying (and their access stays — we
+        don't revoke here);
+      - NULL payment_id (uncertain origin) is NOT counted, so we'd rather miss
+        blocking one repeat purchase than wrongly block a possibly-not-yet-paid buyer.
+    Caller MUST also fail-open on any exception from this function.
+    """
+    normalized = (email or "").lower().strip()
+    if not normalized or not feature_key:
+        return False
+    ids = sorted(_FOREIGN_TEST_YOU_ORDER_IDS)
+    if _use_postgres():
+        marks = ", ".join("%s" for _ in ids)
+        deny = f" AND payment_id NOT IN ({marks})" if ids else ""
+        with _connect_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""SELECT 1 FROM feature_entitlements
+                        WHERE email = %s AND feature_key = %s
+                          AND payment_id IS NOT NULL{deny}
+                        LIMIT 1""",
+                    (normalized, feature_key, *ids),
+                )
+                return cur.fetchone() is not None
+    with get_db() as conn:
+        marks = ", ".join("?" for _ in ids)
+        deny = f" AND payment_id NOT IN ({marks})" if ids else ""
+        row = conn.execute(
+            f"""SELECT 1 FROM feature_entitlements
+                WHERE email = ? AND feature_key = ?
+                  AND payment_id IS NOT NULL{deny}
+                LIMIT 1""",
+            (normalized, feature_key, *ids),
+        ).fetchone()
+        return row is not None
+
+
 def grant_feature_entitlement(email: str, feature_key: str, payment_id: str | None = None):
     """Grant access to a specific feature for an email (idempotent, dual-write)."""
     now = datetime.now(timezone.utc).isoformat()

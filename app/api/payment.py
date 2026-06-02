@@ -786,10 +786,11 @@ class DodoCreateCheckoutRequest(BaseModel):
 
 class DodoCreateCheckoutResponse(BaseModel):
     """Response from creating Dodo checkout session."""
-    session_id: str
-    checkout_url: str
+    session_id: str | None = None
+    checkout_url: str | None = None
     amount: str
     currency: str
+    already_owned: bool = False  # T151: email already owns this feature; no session created
 
 
 @router.get("/payment/dodo-health")
@@ -820,6 +821,34 @@ async def create_dodo_checkout(request: DodoCreateCheckoutRequest):
     amount = f"{settings.dodo_payments_price_usd:.2f}"
     currency = settings.dodo_payments_currency
     frontend_base = settings.frontend_url.rstrip("/")
+
+    # --- T151 already-purchased guard ---
+    # Don't create a duplicate Dodo session for an email that already genuinely
+    # bought this feature (prevents cross-session double-pay). FAIL-OPEN: any
+    # error / uncertainty -> proceed to checkout (never block a real buyer).
+    try:
+        from app.services.database import has_real_feature_entitlement
+
+        if has_real_feature_entitlement(request.email, request.feature_key):
+            logger.info(
+                "T151: checkout skipped, email already owns feature (no duplicate session) email=%s feature=%s",
+                request.email,
+                request.feature_key,
+            )
+            return DodoCreateCheckoutResponse(
+                already_owned=True,
+                session_id=None,
+                checkout_url=None,
+                amount=amount,
+                currency=currency,
+            )
+    except Exception as e:
+        logger.warning(
+            "T151 entitlement check errored; FAIL-OPEN (proceeding to checkout) email=%s: %s",
+            request.email,
+            str(e),
+        )
+    # --- end T151 guard ---
 
     success_params: dict[str, str] = {
         "email": request.email,
