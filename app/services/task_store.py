@@ -59,15 +59,60 @@ def _task_path(task_id: str) -> Path:
 def _save_task(task: Task) -> None:
     try:
         data = asdict(task)
-        _task_path(task.id).write_text(json.dumps(data))
+        task_json = json.dumps(data)
+        _task_path(task.id).write_text(task_json)
+        try:
+            from app.services.database import upsert_persistent_task
+
+            upsert_persistent_task(task.id, task_json)
+        except Exception as exc:
+            logger.warning("task_store: failed to persist task %s to database: %s", task.id, exc)
     except Exception as exc:
         logger.warning("task_store: failed to persist task %s: %s", task.id, exc)
+
+
+def _hydrate_files_from_persistent(task_id: str, row: dict) -> None:
+    """Restore image files from persistent storage onto the current local disk."""
+    try:
+        upload_bytes = row.get("upload_bytes")
+        if upload_bytes:
+            data = json.loads(row["task_json"])
+            upload_path = data.get("upload_path")
+            if upload_path:
+                path = Path(upload_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    path.write_bytes(bytes(upload_bytes))
+
+        result_bytes = row.get("result_bytes")
+        if result_bytes:
+            data = json.loads(row["task_json"])
+            result_path = data.get("result_path")
+            if result_path:
+                path = Path(result_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    path.write_bytes(bytes(result_bytes))
+    except Exception as exc:
+        logger.warning("task_store: failed to hydrate task %s files: %s", task_id, exc)
 
 
 def _load_task_from_disk(task_id: str) -> Optional[Task]:
     path = _task_path(task_id)
     if not path.exists():
-        return None
+        try:
+            from app.services.database import get_persistent_task
+
+            row = get_persistent_task(task_id)
+            if row and row.get("task_json"):
+                TASK_DIR.mkdir(exist_ok=True)
+                path.write_text(row["task_json"])
+                _hydrate_files_from_persistent(task_id, row)
+            else:
+                return None
+        except Exception as exc:
+            logger.warning("task_store: failed to load task %s from database: %s", task_id, exc)
+            return None
     try:
         data = json.loads(path.read_text())
         data["status"] = TaskStatus(data["status"])

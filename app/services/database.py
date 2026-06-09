@@ -162,6 +162,128 @@ def _connect_metrics_postgres():
     return _connect_postgres()
 
 
+def upsert_persistent_task(
+    task_id: str,
+    task_json: str,
+    upload_bytes: bytes | None = None,
+    upload_content_type: str | None = None,
+    result_bytes: bytes | None = None,
+    result_content_type: str | None = None,
+) -> None:
+    """Persist task metadata and optional image bytes.
+
+    This is best-effort for local sqlite and authoritative in Postgres when
+    DATABASE_URL is configured. Callers should not fail user processing just
+    because this durability write failed.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    sqlite_ok = True
+    pg_ok = True
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO persistent_tasks
+                    (task_id, task_json, upload_bytes, upload_content_type,
+                     result_bytes, result_content_type, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    task_json = excluded.task_json,
+                    upload_bytes = COALESCE(excluded.upload_bytes, persistent_tasks.upload_bytes),
+                    upload_content_type = COALESCE(excluded.upload_content_type, persistent_tasks.upload_content_type),
+                    result_bytes = COALESCE(excluded.result_bytes, persistent_tasks.result_bytes),
+                    result_content_type = COALESCE(excluded.result_content_type, persistent_tasks.result_content_type),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    task_json,
+                    upload_bytes,
+                    upload_content_type,
+                    result_bytes,
+                    result_content_type,
+                    now,
+                    now,
+                ),
+            )
+    except Exception:
+        sqlite_ok = False
+        logger.exception("persistent task sqlite write failed task_id=%s", task_id)
+
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO persistent_tasks
+                            (task_id, task_json, upload_bytes, upload_content_type,
+                             result_bytes, result_content_type, updated_at)
+                        VALUES (%s, %s::jsonb, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (task_id) DO UPDATE SET
+                            task_json = EXCLUDED.task_json,
+                            upload_bytes = COALESCE(EXCLUDED.upload_bytes, persistent_tasks.upload_bytes),
+                            upload_content_type = COALESCE(EXCLUDED.upload_content_type, persistent_tasks.upload_content_type),
+                            result_bytes = COALESCE(EXCLUDED.result_bytes, persistent_tasks.result_bytes),
+                            result_content_type = COALESCE(EXCLUDED.result_content_type, persistent_tasks.result_content_type),
+                            updated_at = NOW()
+                        """,
+                        (
+                            task_id,
+                            task_json,
+                            upload_bytes,
+                            upload_content_type,
+                            result_bytes,
+                            result_content_type,
+                        ),
+                    )
+                conn.commit()
+        except Exception:
+            pg_ok = False
+            logger.exception("persistent task postgres write failed task_id=%s", task_id)
+
+    _record_obs("upsert_persistent_task", sqlite_ok, pg_ok)
+
+
+def get_persistent_task(task_id: str) -> dict | None:
+    """Fetch persisted task metadata/image bytes by task id."""
+    if _use_postgres():
+        try:
+            with _connect_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT task_json, upload_bytes, upload_content_type,
+                               result_bytes, result_content_type
+                        FROM persistent_tasks
+                        WHERE task_id = %s
+                        """,
+                        (task_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return dict(row)
+        except Exception:
+            logger.exception("persistent task postgres read failed task_id=%s", task_id)
+
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                """
+                SELECT task_json, upload_bytes, upload_content_type,
+                       result_bytes, result_content_type
+                FROM persistent_tasks
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            return _row_to_dict(row) if row else None
+    except Exception:
+        logger.exception("persistent task sqlite read failed task_id=%s", task_id)
+        return None
+
+
 def _init_postgres():
     """Create all Postgres tables idempotently (subscriptions + auxiliary + metrics)."""
     url = _get_database_url()
@@ -255,6 +377,25 @@ def _init_postgres():
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_processing_events_completed_at ON processing_events(completed_at);")
+
+            # persistent_tasks (paid processing durability)
+            # Render local disk is not durable across deploys/instance swaps.
+            # Store enough task metadata + image bytes to restore previews/downloads.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS persistent_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    task_json JSONB NOT NULL,
+                    upload_bytes BYTEA,
+                    upload_content_type TEXT,
+                    result_bytes BYTEA,
+                    result_content_type TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_persistent_tasks_updated_at ON persistent_tasks(updated_at);")
 
             # payment_initiations (existing) + attribution columns
             cur.execute(
@@ -430,6 +571,19 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_processing_events_completed_at
                 ON processing_events(completed_at);
+
+            CREATE TABLE IF NOT EXISTS persistent_tasks (
+                task_id TEXT PRIMARY KEY,
+                task_json TEXT NOT NULL,
+                upload_bytes BLOB,
+                upload_content_type TEXT,
+                result_bytes BLOB,
+                result_content_type TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_persistent_tasks_updated_at
+                ON persistent_tasks(updated_at);
 
             CREATE TABLE IF NOT EXISTS paypal_checkout_context (
                 order_id TEXT PRIMARY KEY,

@@ -52,7 +52,7 @@ from app.services.storage import save_upload
 from app.services.task_store import create_task, update_task, TaskStatus
 from app.services.ai_service import get_ai_service
 from app.services.storage import RESULT_DIR
-from app.services.database import is_feature_entitled, record_processing_complete
+from app.services.database import is_feature_entitled, record_processing_complete, upsert_persistent_task
 from app.services.alert_email import send_payment_failure_alert
 
 router = APIRouter()
@@ -135,6 +135,20 @@ async def upload_image(
         entry_variant=entry_variant.strip() or None,
         checkout_source=checkout_source.strip() or None,
     )
+    try:
+        import json
+        from dataclasses import asdict
+
+        upsert_persistent_task(
+            task.id,
+            json.dumps(asdict(task)),
+            upload_bytes=content,
+            upload_content_type=file.content_type,
+        )
+    except Exception:
+        # Do not block paid users on the durability side-write; task_store still
+        # has the local copy and processing can continue.
+        pass
 
     # Start background processing
     asyncio.create_task(_process_task(task.id))
@@ -222,6 +236,21 @@ async def _process_task(task_id: str):
                 provider_used=result.provider_used,
                 provider_backend=result.provider_backend,
             )
+            try:
+                import json
+                from dataclasses import asdict
+                from app.services.task_store import get_task
+
+                completed_task = get_task(task_id)
+                if completed_task and result.output_path:
+                    upsert_persistent_task(
+                        task_id,
+                        json.dumps(asdict(completed_task)),
+                        result_bytes=Path(result.output_path).read_bytes(),
+                        result_content_type="image/jpeg",
+                    )
+            except Exception:
+                logger.warning("Task %s persistent result side-write failed", task_id, exc_info=True)
             logger.info(
                 "Task %s completed successfully provider=%s backend=%s",
                 task_id,
