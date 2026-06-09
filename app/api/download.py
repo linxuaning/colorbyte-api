@@ -157,16 +157,28 @@ async def download_result(
 
 
 @router.get("/result-preview/{task_id}")
-async def preview_result(task_id: str):
-    """Serve a watermarked preview for in-browser comparison without export access."""
+async def preview_result(
+    request: Request,
+    task_id: str,
+    email: Optional[str] = Query(None),
+):
+    """Serve a paid-only watermarked preview for in-browser comparison."""
     task = _get_completed_task_or_404(task_id)
+
+    limit_check = check_download_limit(_get_client_ip(request), email)
+    if not email or not limit_check["is_subscriber"]:
+        raise HTTPException(
+            status_code=402,
+            detail="Paid access is required to preview this processed photo. Use the same paid email that unlocked upload and processing.",
+        )
+
     preview_path = _create_preview(task.result_path, task_id)
     return FileResponse(
         path=preview_path,
         media_type="image/jpeg",
         headers={
             "Cache-Control": "private, no-store, max-age=0",
-            "X-Subscriber": "false",
+            "X-Subscriber": "true",
             "X-Quality": "preview",
         },
     )
