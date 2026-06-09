@@ -17,6 +17,8 @@ class TaskResponse(BaseModel):
     progress: int
     stage: Optional[str] = None
     error: Optional[str] = None
+    provider_used: Optional[str] = None
+    provider_backend: Optional[str] = None
 
 
 @router.get("/tasks/{task_id}", response_model=TaskResponse)
@@ -32,4 +34,6 @@ async def get_task_status(task_id: str):
         progress=task.progress,
         stage=task.stage,
         error=task.error,
+        provider_used=task.provider_used,
+        provider_backend=task.provider_backend,
     )

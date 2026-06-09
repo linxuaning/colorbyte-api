@@ -219,8 +219,15 @@ async def _process_task(task_id: str):
                 progress=100,
                 stage="Complete",
                 result_path=result.output_path,
+                provider_used=result.provider_used,
+                provider_backend=result.provider_backend,
             )
-            logger.info("Task %s completed successfully", task_id)
+            logger.info(
+                "Task %s completed successfully provider=%s backend=%s",
+                task_id,
+                result.provider_used,
+                result.provider_backend,
+            )
         else:
             update_task(
                 task_id,

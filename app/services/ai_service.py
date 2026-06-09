@@ -14,10 +14,19 @@ from app.config import get_settings, get_effective_ai_provider
 
 
 class ProcessingResult:
-    def __init__(self, success: bool, output_path: Optional[str] = None, error: Optional[str] = None):
+    def __init__(
+        self,
+        success: bool,
+        output_path: Optional[str] = None,
+        error: Optional[str] = None,
+        provider_used: Optional[str] = None,
+        provider_backend: Optional[str] = None,
+    ):
         self.success = success
         self.output_path = output_path
         self.error = error
+        self.provider_used = provider_used
+        self.provider_backend = provider_backend
 
 
 ProgressCallback = Optional[Callable[[str, int], Awaitable[None]]]
@@ -1333,6 +1342,12 @@ class PhotoFixProvider(AIProvider):
                         if progress_callback:
                             await progress_callback("Complete", 100)
 
+                        provider_backend = (
+                            data.get("backend")
+                            or data.get("pipeline")
+                            or data.get("route_used")
+                            or data.get("quality_route")
+                        )
                         if attempt_idx > 0:
                             logger.info(
                                 "PhotoFix %s: succeeded on retry %d/%d -> %s",
@@ -1347,7 +1362,12 @@ class PhotoFixProvider(AIProvider):
                                 endpoint_name,
                                 output_path,
                             )
-                        return ProcessingResult(success=True, output_path=output_path)
+                        return ProcessingResult(
+                            success=True,
+                            output_path=output_path,
+                            provider_used=f"photofix:{endpoint_name}",
+                            provider_backend=provider_backend,
+                        )
                     except Exception as exc:
                         last_exc = exc
                         final_attempt = attempt_idx == len(delays) - 1
@@ -1929,6 +1949,8 @@ class AIService:
             result = await self._fallback_provider.process_photo(
                 input_path, output_path, colorize, progress_callback, email=email,
             )
+            if result.success:
+                result.provider_used = result.provider_used or "huggingface:fallback"
         return result
 
     async def denoise_photo(

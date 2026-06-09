@@ -36,6 +36,8 @@ class Task:
     stage: str = "Queued"
     result_path: Optional[str] = None
     error: Optional[str] = None
+    provider_used: Optional[str] = None
+    provider_backend: Optional[str] = None
     colorize: bool = False
     email: str = ""
     feature_key: str = "restoration"
@@ -69,6 +71,9 @@ def _load_task_from_disk(task_id: str) -> Optional[Task]:
     try:
         data = json.loads(path.read_text())
         data["status"] = TaskStatus(data["status"])
+        data.setdefault("provider_used", None)
+        data.setdefault("provider_backend", None)
+        data.setdefault("feature_key", "restoration")
         return Task(**data)
     except Exception as exc:
         logger.warning("task_store: failed to load task %s from disk: %s", task_id, exc)
@@ -139,6 +144,8 @@ def update_task(
     stage: str | None = None,
     result_path: str | None = None,
     error: str | None = None,
+    provider_used: str | None = None,
+    provider_backend: str | None = None,
 ) -> Task | None:
     task = get_task(task_id)
     if task is None:
@@ -153,6 +160,10 @@ def update_task(
         task.result_path = result_path
     if error is not None:
         task.error = error
+    if provider_used is not None:
+        task.provider_used = provider_used
+    if provider_backend is not None:
+        task.provider_backend = provider_backend
     _save_task(task)
     return task
 
