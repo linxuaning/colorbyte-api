@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Subscription / metrics persistence.
 
@@ -11,6 +13,7 @@ import sqlite3
 import logging
 import time
 import threading
+import os
 from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -130,6 +133,32 @@ def _use_postgres() -> bool:
 
 def get_database_backend() -> str:
     return "postgres" if _use_postgres() else "sqlite"
+
+
+def get_task_persistence_health() -> dict:
+    """Report whether paid task results survive Render deploys/instance swaps."""
+    if _use_postgres():
+        return {
+            "backend": "postgres",
+            "deploy_safe": True,
+            "risk": None,
+        }
+
+    db_path = Path(_get_db_path())
+    task_path = Path("tasks")
+    has_render_disk_hint = any(
+        str(path).startswith("/data")
+        for path in (db_path, task_path)
+    )
+    return {
+        "backend": "sqlite",
+        "deploy_safe": has_render_disk_hint and bool(os.environ.get("RENDER")),
+        "database_path": str(db_path),
+        "task_dir": str(task_path),
+        "risk": None
+        if has_render_disk_hint
+        else "No DATABASE_URL or Render persistent disk path configured; paid task results can disappear after deploy/instance swap.",
+    }
 
 
 def _connect_postgres():
@@ -662,6 +691,10 @@ def init_db():
             _init_postgres()
         except Exception:
             logger.warning("PostgreSQL initialization failed", exc_info=True)
+    else:
+        persistence = get_task_persistence_health()
+        if persistence.get("risk"):
+            logger.warning("Task persistence is not deploy-safe: %s", persistence["risk"])
 
     _seed_owner_access()
 

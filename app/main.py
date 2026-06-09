@@ -12,8 +12,10 @@ from app.services.database import (
     get_database_backend,
     get_dual_write_health,
     get_payment_metrics_storage_backend,
+    get_task_persistence_health,
     init_db,
 )
+from app.services.task_store import initialize_task_store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +43,7 @@ app.add_middleware(
 
 # Initialize database
 init_db()
+initialize_task_store()
 
 # Include routers
 app.include_router(upload.router, prefix="/api", tags=["upload"])
@@ -88,6 +91,7 @@ async def health_check():
         "replicate_token_configured": bool(settings.replicate_api_token),
         "database_url_configured": bool(settings.database_url or settings.metrics_database_url),
         "database_backend": get_database_backend(),
+        "task_persistence": get_task_persistence_health(),
         "metrics_database_configured": bool(settings.metrics_database_url),
         "payment_metrics_backend": get_payment_metrics_storage_backend(),
         "dual_write_health": get_dual_write_health(),

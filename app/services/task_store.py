@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 """
 File-backed task store.
-Tasks are persisted to tasks/{task_id}.json so they survive Render OOM restarts.
-In-memory dict is the hot path; disk is the source of truth on startup.
+Tasks are persisted to tasks/{task_id}.json for same-instance restarts and
+optionally to persistent_tasks for deploy/instance-swap recovery.
+In-memory dict is the hot path.
 """
 import json
 import uuid
@@ -125,7 +128,7 @@ def _load_task_from_disk(task_id: str) -> Optional[Task]:
         return None
 
 
-def _boot_load() -> None:
+def initialize_task_store() -> None:
     """Load all persisted tasks into memory on startup."""
     loaded = 0
     for p in TASK_DIR.glob("*.json"):
@@ -136,10 +139,6 @@ def _boot_load() -> None:
             loaded += 1
     if loaded:
         logger.info("task_store: restored %d tasks from disk", loaded)
-
-
-# Run on import
-_boot_load()
 
 
 def create_task(
