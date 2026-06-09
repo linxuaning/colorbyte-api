@@ -86,6 +86,27 @@ def _save_task(task: Task) -> None:
         logger.warning("task_store: failed to persist task %s: %s", task.id, exc)
 
 
+def _save_task_with_result_bytes(task: Task) -> None:
+    """Persist completed task metadata and result bytes in the same DB upsert."""
+    _save_task(task)
+    if not task.result_path:
+        return
+    result_path = Path(task.result_path)
+    if not result_path.exists():
+        return
+    try:
+        from app.services.database import upsert_persistent_task
+
+        upsert_persistent_task(
+            task.id,
+            json.dumps(asdict(task)),
+            result_bytes=result_path.read_bytes(),
+            result_content_type="image/jpeg",
+        )
+    except Exception as exc:
+        logger.warning("task_store: failed to persist task %s result bytes: %s", task.id, exc)
+
+
 def _hydrate_files_from_persistent(task_id: str, row: dict) -> None:
     """Restore image files from persistent storage onto the current local disk."""
     try:
@@ -220,7 +241,10 @@ def update_task(
         task.provider_used = provider_used
     if provider_backend is not None:
         task.provider_backend = provider_backend
-    _save_task(task)
+    if result_path is not None:
+        _save_task_with_result_bytes(task)
+    else:
+        _save_task(task)
     return task
 
 

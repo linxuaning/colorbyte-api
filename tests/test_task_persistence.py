@@ -121,3 +121,44 @@ def test_task_store_hydrates_task_json_returned_as_postgres_jsonb(tmp_path, monk
     assert restored.provider_backend == "m2_top1_proxy"
     assert upload_path.read_bytes() == b"upload-bytes"
     assert result_path.read_bytes() == b"result-bytes"
+
+
+def test_update_task_persists_result_bytes_with_completed_metadata(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    import app.services.task_store as task_store
+
+    importlib.reload(task_store)
+
+    captured = []
+    monkeypatch.setattr(
+        "app.services.database.upsert_persistent_task",
+        lambda task_id, task_json, **kwargs: captured.append((task_id, task_json, kwargs)),
+    )
+
+    upload_path = tmp_path / "uploads" / "sample.jpg"
+    result_path = tmp_path / "results" / "sample_result.jpg"
+    upload_path.parent.mkdir(parents=True)
+    result_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"upload-bytes")
+    result_path.write_bytes(b"result-bytes")
+
+    task = task_store.create_task(
+        file_id="sample",
+        upload_path=str(upload_path),
+        email="paid@example.com",
+    )
+    task_store.update_task(
+        task.id,
+        status=task_store.TaskStatus.COMPLETED,
+        progress=100,
+        stage="Complete",
+        result_path=str(result_path),
+        provider_used="photofix:m2",
+        provider_backend="m2_top1_proxy",
+    )
+
+    result_writes = [kwargs for _, _, kwargs in captured if kwargs.get("result_bytes")]
+    assert result_writes
+    assert result_writes[-1]["result_bytes"] == b"result-bytes"
+    assert result_writes[-1]["result_content_type"] == "image/jpeg"
