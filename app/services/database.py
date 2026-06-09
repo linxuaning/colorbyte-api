@@ -26,6 +26,10 @@ _ATTRIBUTION_COLUMNS = {
     "entry_variant": "TEXT",
     "checkout_source": "TEXT",
 }
+_PROCESSING_PROVIDER_COLUMNS = {
+    "provider_used": "TEXT",
+    "provider_backend": "TEXT",
+}
 
 FEATURE_RESTORATION = "restoration"
 FEATURE_DENOISING = "denoising"
@@ -372,11 +376,15 @@ def _init_postgres():
                     cta_slot TEXT,
                     entry_variant TEXT,
                     checkout_source TEXT,
+                    provider_used TEXT,
+                    provider_backend TEXT,
                     completed_at TIMESTAMPTZ NOT NULL
                 );
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_processing_events_completed_at ON processing_events(completed_at);")
+            cur.execute("ALTER TABLE processing_events ADD COLUMN IF NOT EXISTS provider_used TEXT;")
+            cur.execute("ALTER TABLE processing_events ADD COLUMN IF NOT EXISTS provider_backend TEXT;")
 
             # persistent_tasks (paid processing durability)
             # Render local disk is not durable across deploys/instance swaps.
@@ -567,6 +575,8 @@ def init_db():
                 cta_slot TEXT,
                 entry_variant TEXT,
                 checkout_source TEXT,
+                provider_used TEXT,
+                provider_backend TEXT,
                 completed_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_processing_events_completed_at
@@ -642,6 +652,7 @@ def init_db():
                 ON payment_successes(payment_provider, completed_at);
         """)
         _ensure_columns(conn, "processing_events", _ATTRIBUTION_COLUMNS)
+        _ensure_columns(conn, "processing_events", _PROCESSING_PROVIDER_COLUMNS)
         _ensure_columns(conn, "payment_initiations", _ATTRIBUTION_COLUMNS)
         _ensure_columns(conn, "payment_successes", _ATTRIBUTION_COLUMNS)
     logger.info("Database initialized at %s", path)
@@ -1324,6 +1335,8 @@ def record_processing_complete(
     cta_slot: str | None = None,
     entry_variant: str | None = None,
     checkout_source: str | None = None,
+    provider_used: str | None = None,
+    provider_backend: str | None = None,
 ):
     """Persist a processing completion event (dual-write)."""
     now = datetime.now(timezone.utc).isoformat()
@@ -1331,6 +1344,8 @@ def record_processing_complete(
     cs = _normalize_attr(cta_slot)
     ev = _normalize_attr(entry_variant)
     src = _normalize_attr(checkout_source)
+    pu = _normalize_attr(provider_used)
+    pb = _normalize_attr(provider_backend)
     sqlite_ok = False
     pg_ok = not _use_postgres()
 
@@ -1339,10 +1354,10 @@ def record_processing_complete(
             conn.execute(
                 """
                 INSERT OR REPLACE INTO processing_events
-                (task_id, mode, landing_page, cta_slot, entry_variant, checkout_source, completed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, mode, landing_page, cta_slot, entry_variant, checkout_source, provider_used, provider_backend, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, mode, lp, cs, ev, src, now),
+                (task_id, mode, lp, cs, ev, src, pu, pb, now),
             )
         sqlite_ok = True
     except Exception:
@@ -1355,17 +1370,19 @@ def record_processing_complete(
                     cur.execute(
                         """
                         INSERT INTO processing_events
-                            (task_id, mode, landing_page, cta_slot, entry_variant, checkout_source, completed_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            (task_id, mode, landing_page, cta_slot, entry_variant, checkout_source, provider_used, provider_backend, completed_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (task_id) DO UPDATE SET
                             mode = EXCLUDED.mode,
                             landing_page = EXCLUDED.landing_page,
                             cta_slot = EXCLUDED.cta_slot,
                             entry_variant = EXCLUDED.entry_variant,
                             checkout_source = EXCLUDED.checkout_source,
+                            provider_used = EXCLUDED.provider_used,
+                            provider_backend = EXCLUDED.provider_backend,
                             completed_at = EXCLUDED.completed_at
                         """,
-                        (task_id, mode, lp, cs, ev, src, now),
+                        (task_id, mode, lp, cs, ev, src, pu, pb, now),
                     )
                 conn.commit()
             pg_ok = True

@@ -226,6 +226,8 @@ async def _process_task(task_id: str):
                 cta_slot=task.cta_slot,
                 entry_variant=task.entry_variant,
                 checkout_source=task.checkout_source,
+                provider_used=result.provider_used,
+                provider_backend=result.provider_backend,
             )
             update_task(
                 task_id,
