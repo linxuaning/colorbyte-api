@@ -1287,6 +1287,7 @@ class PhotoFixProvider(AIProvider):
         # Keep HF fallback (founder 5-10 directive "HF fallback 还是要的，作为保底").
         import asyncio
         RETRY_DELAYS = [0, 2, 8]
+        M2_RETRY_DELAYS = [0, 10, 30]
         last_exc: Exception | None = None
         try:
             if progress_callback:
@@ -1302,7 +1303,7 @@ class PhotoFixProvider(AIProvider):
                 candidate_urls = [item for item in candidate_urls if item[0] != "m2"]
 
             for endpoint_idx, (endpoint_name, endpoint_url, connect_timeout_s) in enumerate(candidate_urls):
-                delays = [0] if endpoint_name == "m2" else RETRY_DELAYS
+                delays = M2_RETRY_DELAYS if endpoint_name == "m2" else RETRY_DELAYS
                 for attempt_idx, delay in enumerate(delays):
                     if delay:
                         logger.warning(
@@ -1327,12 +1328,17 @@ class PhotoFixProvider(AIProvider):
                                 headers={
                                     "Content-Type": "application/json",
                                     "X-Internal-Key": self.internal_api_key,
+                                    "User-Agent": "artimagehub-backend/1.0",
                                 },
                                 json={"image": image_b64, "task": task},
                             )
                             resp.raise_for_status()
                             data = resp.json()
 
+                        if endpoint_name == "m2" and data.get("error") == "busy":
+                            raise RuntimeError(
+                                f"M2 restore busy; retry_after={data.get('retry_after_seconds') or '?'}"
+                            )
                         if not data.get("ok"):
                             raise RuntimeError(data.get("error") or "PhotoFix returned ok=false")
 
