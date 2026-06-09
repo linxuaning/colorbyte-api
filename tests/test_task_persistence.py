@@ -70,3 +70,54 @@ def test_task_store_hydrates_completed_task_from_persistent_sqlite(tmp_path, mon
     assert restored.provider_backend == "m2_top1_proxy"
     assert upload_path.read_bytes() == b"upload-bytes"
     assert result_path.read_bytes() == b"result-bytes"
+
+
+def test_task_store_hydrates_task_json_returned_as_postgres_jsonb(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    import app.services.task_store as task_store
+
+    importlib.reload(task_store)
+
+    upload_path = tmp_path / "uploads" / "sample.jpg"
+    result_path = tmp_path / "results" / "sample_result.jpg"
+    task_json = {
+        "id": "pgjsonb123",
+        "file_id": "sample",
+        "upload_path": str(upload_path),
+        "status": "completed",
+        "progress": 100,
+        "stage": "Complete",
+        "result_path": str(result_path),
+        "error": None,
+        "provider_used": "photofix:m2",
+        "provider_backend": "m2_top1_proxy",
+        "colorize": False,
+        "email": "paid@example.com",
+        "feature_key": "restoration",
+        "landing_page": None,
+        "cta_slot": None,
+        "entry_variant": None,
+        "checkout_source": None,
+        "created_at": 1.0,
+    }
+
+    monkeypatch.setattr(
+        "app.services.database.get_persistent_task",
+        lambda task_id: {
+            "task_json": task_json,
+            "upload_bytes": b"upload-bytes",
+            "upload_content_type": "image/jpeg",
+            "result_bytes": b"result-bytes",
+            "result_content_type": "image/jpeg",
+        },
+    )
+
+    restored = task_store.get_task("pgjsonb123")
+
+    assert restored is not None
+    assert restored.status == task_store.TaskStatus.COMPLETED
+    assert restored.provider_used == "photofix:m2"
+    assert restored.provider_backend == "m2_top1_proxy"
+    assert upload_path.read_bytes() == b"upload-bytes"
+    assert result_path.read_bytes() == b"result-bytes"

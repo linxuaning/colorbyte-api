@@ -59,6 +59,18 @@ def _task_path(task_id: str) -> Path:
     return TASK_DIR / f"{task_id}.json"
 
 
+def _task_json_to_text(task_json) -> str:
+    if isinstance(task_json, str):
+        return task_json
+    return json.dumps(task_json)
+
+
+def _task_json_to_dict(task_json) -> dict:
+    if isinstance(task_json, str):
+        return json.loads(task_json)
+    return dict(task_json)
+
+
 def _save_task(task: Task) -> None:
     try:
         data = asdict(task)
@@ -79,7 +91,7 @@ def _hydrate_files_from_persistent(task_id: str, row: dict) -> None:
     try:
         upload_bytes = row.get("upload_bytes")
         if upload_bytes:
-            data = json.loads(row["task_json"])
+            data = _task_json_to_dict(row["task_json"])
             upload_path = data.get("upload_path")
             if upload_path:
                 path = Path(upload_path)
@@ -89,7 +101,7 @@ def _hydrate_files_from_persistent(task_id: str, row: dict) -> None:
 
         result_bytes = row.get("result_bytes")
         if result_bytes:
-            data = json.loads(row["task_json"])
+            data = _task_json_to_dict(row["task_json"])
             result_path = data.get("result_path")
             if result_path:
                 path = Path(result_path)
@@ -109,7 +121,7 @@ def _load_task_from_disk(task_id: str) -> Optional[Task]:
             row = get_persistent_task(task_id)
             if row and row.get("task_json"):
                 TASK_DIR.mkdir(exist_ok=True)
-                path.write_text(row["task_json"])
+                path.write_text(_task_json_to_text(row["task_json"]))
                 _hydrate_files_from_persistent(task_id, row)
             else:
                 return None
