@@ -30,6 +30,14 @@ class Settings(BaseSettings):
 
     # PhotoFix backend (only needed when ai_provider=photofix)
     photofix_api_url: str = "https://backend.artimagehub.com/api/restore"
+    # Optional M2/local restore endpoint. When configured, PhotoFixProvider
+    # tries it first for old-photo restoration/enhance and falls back to
+    # photofix_api_url if the M2 service is offline or fails.
+    m2_restore_enabled: bool = True
+    m2_restore_api_url: str = ""
+    m2_restore_health_url: str = ""
+    m2_restore_health_timeout_s: float = 2.0
+    m2_restore_connect_timeout_s: float = 5.0
     # Internal API key for service-to-service calls (bypasses payment check)
     internal_api_key: str = "artimagehub-internal-2026"
 

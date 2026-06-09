@@ -1191,9 +1191,61 @@ class PhotoFixProvider(AIProvider):
 
     REQUEST_TIMEOUT = 6000.0  # backend can take up to ~100 min for large inputs
 
-    def __init__(self, api_url: str, internal_api_key: str = ""):
+    def __init__(
+        self,
+        api_url: str,
+        internal_api_key: str = "",
+        m2_api_url: str = "",
+        m2_health_url: str = "",
+        m2_enabled: bool = True,
+        m2_health_timeout_s: float = 2.0,
+        m2_connect_timeout_s: float = 5.0,
+    ):
         self.api_url = api_url
         self.internal_api_key = internal_api_key
+        self.m2_api_url = m2_api_url
+        self.m2_health_url = m2_health_url
+        self.m2_enabled = m2_enabled
+        self.m2_health_timeout_s = m2_health_timeout_s
+        self.m2_connect_timeout_s = m2_connect_timeout_s
+
+    def _candidate_urls(self, task: str) -> list[tuple[str, str, float]]:
+        """Return restore endpoints in priority order."""
+        urls: list[tuple[str, str, float]] = []
+        if self.m2_enabled and task in {"restore", "enhance"} and self.m2_api_url:
+            urls.append(("m2", self.m2_api_url, self.m2_connect_timeout_s))
+        if self.api_url:
+            urls.append(("remote", self.api_url, 30.0))
+        return urls
+
+    async def _m2_is_online(self, logger) -> bool:
+        """Fast health probe for the optional M2 restore service."""
+        import httpx
+
+        if not (self.m2_enabled and self.m2_api_url):
+            return False
+        if not self.m2_health_url:
+            return True
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    self.m2_health_timeout_s,
+                    connect=self.m2_health_timeout_s,
+                ),
+                follow_redirects=True,
+            ) as http:
+                resp = await http.get(self.m2_health_url)
+            if 200 <= resp.status_code < 300:
+                return True
+            logger.warning(
+                "PhotoFix M2 health returned %s; using remote fallback",
+                resp.status_code,
+            )
+            return False
+        except Exception as exc:
+            logger.warning("PhotoFix M2 health failed; using remote fallback: %s", exc)
+            return False
 
     async def process_photo(
         self,
@@ -1209,10 +1261,10 @@ class PhotoFixProvider(AIProvider):
 
         logger = logging.getLogger("artimagehub.photofix")
 
-        if not self.api_url:
-            return ProcessingResult(success=False, error="PHOTOFIX_API_URL is not configured.")
-
         task = "colorize" if colorize else "restore"
+        candidate_urls = self._candidate_urls(task)
+        if not candidate_urls:
+            return ProcessingResult(success=False, error="PHOTOFIX_API_URL is not configured.")
 
         # Retry policy: cloudflared tunnel + Render → 221 path can have transient
         # connect-time blips (sin POP failover, Render egress reroute, etc).
@@ -1237,51 +1289,77 @@ class PhotoFixProvider(AIProvider):
             if progress_callback:
                 await progress_callback("Processing with PhotoFix...", 20)
 
-            for attempt_idx, delay in enumerate(RETRY_DELAYS):
-                if delay:
-                    logger.warning(
-                        "PhotoFix retry %d/3 after %ds backoff (last error: %s)",
-                        attempt_idx + 1, delay, last_exc,
-                    )
-                    await asyncio.sleep(delay)
-                try:
-                    async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(self.REQUEST_TIMEOUT, connect=30.0),
-                        follow_redirects=True,
-                    ) as http:
-                        resp = await http.post(
-                            self.api_url,
-                            headers={
-                                "Content-Type": "application/json",
-                                "X-Internal-Key": self.internal_api_key,
-                            },
-                            json={"image": image_b64, "task": task},
+            if candidate_urls[0][0] == "m2" and not await self._m2_is_online(logger):
+                candidate_urls = [item for item in candidate_urls if item[0] != "m2"]
+
+            for endpoint_idx, (endpoint_name, endpoint_url, connect_timeout_s) in enumerate(candidate_urls):
+                delays = [0] if endpoint_name == "m2" else RETRY_DELAYS
+                for attempt_idx, delay in enumerate(delays):
+                    if delay:
+                        logger.warning(
+                            "PhotoFix %s retry %d/%d after %ds backoff (last error: %s)",
+                            endpoint_name,
+                            attempt_idx + 1,
+                            len(delays),
+                            delay,
+                            last_exc,
                         )
-                        resp.raise_for_status()
-                        data = resp.json()
+                        await asyncio.sleep(delay)
+                    try:
+                        async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(
+                                self.REQUEST_TIMEOUT,
+                                connect=connect_timeout_s,
+                            ),
+                            follow_redirects=True,
+                        ) as http:
+                            resp = await http.post(
+                                endpoint_url,
+                                headers={
+                                    "Content-Type": "application/json",
+                                    "X-Internal-Key": self.internal_api_key,
+                                },
+                                json={"image": image_b64, "task": task},
+                            )
+                            resp.raise_for_status()
+                            data = resp.json()
 
-                    if not data.get("ok"):
-                        raise RuntimeError(data.get("error") or "PhotoFix returned ok=false")
+                        if not data.get("ok"):
+                            raise RuntimeError(data.get("error") or "PhotoFix returned ok=false")
 
-                    result_bytes = base64.b64decode(data["result"])
-                    Path(output_path).write_bytes(result_bytes)
+                        result_bytes = base64.b64decode(data["result"])
+                        Path(output_path).write_bytes(result_bytes)
 
-                    if progress_callback:
-                        await progress_callback("Complete", 100)
+                        if progress_callback:
+                            await progress_callback("Complete", 100)
 
-                    if attempt_idx > 0:
-                        logger.info(
-                            "PhotoFix: succeeded on retry %d/3 → %s",
-                            attempt_idx + 1, output_path,
-                        )
-                    else:
-                        logger.info("PhotoFix: done, output saved to %s", output_path)
-                    return ProcessingResult(success=True, output_path=output_path)
-                except Exception as exc:
-                    last_exc = exc
-                    # Continue retry loop unless this is the final attempt
-                    if attempt_idx == len(RETRY_DELAYS) - 1:
-                        raise
+                        if attempt_idx > 0:
+                            logger.info(
+                                "PhotoFix %s: succeeded on retry %d/%d -> %s",
+                                endpoint_name,
+                                attempt_idx + 1,
+                                len(delays),
+                                output_path,
+                            )
+                        else:
+                            logger.info(
+                                "PhotoFix %s: done, output saved to %s",
+                                endpoint_name,
+                                output_path,
+                            )
+                        return ProcessingResult(success=True, output_path=output_path)
+                    except Exception as exc:
+                        last_exc = exc
+                        final_attempt = attempt_idx == len(delays) - 1
+                        if final_attempt:
+                            if endpoint_idx < len(candidate_urls) - 1:
+                                logger.warning(
+                                    "PhotoFix %s failed; trying next endpoint: %s",
+                                    endpoint_name,
+                                    exc,
+                                )
+                                break
+                            raise
 
         except Exception as exc:
             logger.error("PhotoFix processing failed after retries: %s", exc)
@@ -1800,7 +1878,15 @@ class AIService:
         elif provider == "replicate":
             self._provider: AIProvider = ReplicateProvider(settings.replicate_api_token)
         elif provider == "photofix":
-            self._provider = PhotoFixProvider(settings.photofix_api_url, settings.internal_api_key)
+            self._provider = PhotoFixProvider(
+                settings.photofix_api_url,
+                settings.internal_api_key,
+                m2_api_url=settings.m2_restore_api_url,
+                m2_health_url=settings.m2_restore_health_url,
+                m2_enabled=settings.m2_restore_enabled,
+                m2_health_timeout_s=settings.m2_restore_health_timeout_s,
+                m2_connect_timeout_s=settings.m2_restore_connect_timeout_s,
+            )
             # Auto-fallback: if photofix backend is down or returning errors, use HF Spaces
             self._fallback_provider: AIProvider | None = HuggingFaceProvider()
         elif provider == "nero":
