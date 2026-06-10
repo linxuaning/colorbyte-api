@@ -1,6 +1,8 @@
 """
 AI Service - Strategy pattern with multiple AI backends.
 """
+from __future__ import annotations
+
 import asyncio
 import io
 import json
@@ -1913,8 +1915,10 @@ class AIService:
                 m2_health_timeout_s=settings.m2_restore_health_timeout_s,
                 m2_connect_timeout_s=settings.m2_restore_connect_timeout_s,
             )
-            # Auto-fallback: if photofix backend is down or returning errors, use HF Spaces
-            self._fallback_provider: AIProvider | None = HuggingFaceProvider()
+            # Paid restoration must not silently downgrade to HF Spaces. If the
+            # PhotoFix/M2 chain fails, fail the task and let the user retry
+            # instead of returning a visibly worse "successful" result.
+            self._fallback_provider = None
         elif provider == "nero":
             self._provider = NeroAIProvider(settings.nero_api_key)
         elif provider == "hf_inference":
