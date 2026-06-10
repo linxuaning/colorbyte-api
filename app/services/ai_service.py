@@ -1223,7 +1223,7 @@ class PhotoFixProvider(AIProvider):
     def _candidate_urls(self, task: str) -> list[tuple[str, str, float]]:
         """Return restore endpoints in priority order."""
         urls: list[tuple[str, str, float]] = []
-        if self.m2_enabled and task in {"restore", "enhance"} and self.m2_api_url:
+        if self.m2_enabled and task in {"restore", "colorize", "enhance"} and self.m2_api_url:
             urls.append(("m2", self.m2_api_url, self.m2_connect_timeout_s))
         if self.api_url:
             urls.append(("remote", self.api_url, 30.0))
