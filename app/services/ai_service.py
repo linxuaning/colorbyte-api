@@ -1301,8 +1301,15 @@ class PhotoFixProvider(AIProvider):
             if progress_callback:
                 await progress_callback("Processing with PhotoFix...", 20)
 
-            if candidate_urls[0][0] == "m2" and not await self._m2_is_online(logger):
-                candidate_urls = [item for item in candidate_urls if item[0] != "m2"]
+            if candidate_urls[0][0] == "m2":
+                if await self._m2_is_online(logger):
+                    # Founder rule: when the local M2 restore service is online,
+                    # paid old-photo restore must use it. Do not fall through to
+                    # the remote PhotoFix endpoint after an M2 processing failure;
+                    # failing fast is better than returning a worse route.
+                    candidate_urls = [candidate_urls[0]]
+                else:
+                    candidate_urls = [item for item in candidate_urls if item[0] != "m2"]
 
             for endpoint_idx, (endpoint_name, endpoint_url, connect_timeout_s) in enumerate(candidate_urls):
                 delays = M2_RETRY_DELAYS if endpoint_name == "m2" else RETRY_DELAYS
