@@ -23,7 +23,7 @@ jobs:
       - name: Warm /health
         run: |
           echo "::group::/health"
-          time curl -sS https://colorbyte-api.onrender.com/health \
+          time curl -sS https://api.artimagehub.com/health \
             --max-time 45 -o /dev/null -w "http=%{http_code} total=%{time_total}s\n" \
             || echo "WARN: /health non-2xx"
           echo "::endgroup::"
@@ -31,7 +31,7 @@ jobs:
       - name: Warm /api/payment/subscription (same code path the frontend hits on page load)
         run: |
           echo "::group::subscription"
-          time curl -sS "https://colorbyte-api.onrender.com/api/payment/subscription/keepalive@artimagehub.com" \
+          time curl -sS "https://api.artimagehub.com/api/payment/subscription/keepalive@artimagehub.com" \
             --max-time 45 -o /dev/null -w "http=%{http_code} total=%{time_total}s\n" \
             || echo "WARN: subscription non-2xx"
           echo "::endgroup::"
@@ -39,7 +39,8 @@ jobs:
       - name: Warm /api/metrics/processing-complete (read path)
         run: |
           echo "::group::metrics"
-          time curl -sS "https://colorbyte-api.onrender.com/api/metrics/processing-complete?hours=168" \
+          time curl -sS "https://api.artimagehub.com/api/metrics/processing-complete?hours=168" \
             --max-time 45 -o /dev/null -w "http=%{http_code} total=%{time_total}s\n" \
             || echo "WARN: metrics non-2xx"
           echo "::endgroup::"
+
