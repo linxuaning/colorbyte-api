@@ -35,6 +35,7 @@ jobs:
             -H "Content-Type: application/json" \
             --max-time 60 \
             -w "\nhttp=%{http_code}\n" \
-            "https://colorbyte-api.onrender.com/api/internal/mask-email-poll")
+            "https://api.artimagehub.com/api/internal/mask-email-poll")
           echo "$response"
           echo "::endgroup::"
+
