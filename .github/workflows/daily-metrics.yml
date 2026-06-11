@@ -30,6 +30,7 @@ jobs:
           RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
           RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
           ARTIMAGEHUB_GA4_SA_KEY: ${{ secrets.ARTIMAGEHUB_GA4_SA_KEY }}
-          METRICS_BASE: "https://colorbyte-api.onrender.com"
+          METRICS_BASE: "https://api.artimagehub.com"
           ALERT_TO: "linxuaning98@gmail.com"
         run: python3 scripts/daily-metrics.py
+
