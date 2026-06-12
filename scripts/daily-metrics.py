@@ -17,6 +17,8 @@ Optional env:
 """
 from __future__ import annotations
 
+import re
+import html as _html
 import json
 import os
 import sys
@@ -554,13 +556,84 @@ def build_email_body() -> tuple[str, str]:
     return subj, "\n".join(lines)
 
 
-def send_email(api_key: str, subject: str, body: str) -> None:
+
+def text_to_html(subject: str, body: str) -> str:
+    """Render the plain-text daily report as a mobile-friendly HTML email.
+
+    Generic by design: works off the text structure (blank-line sections,
+    `key: value` lines, fixed-width tables) so future text changes flow
+    through without dual maintenance.
+    """
+    C_BG, C_CARD, C_TXT, C_MUT, C_ACC = "#f5f6f8", "#ffffff", "#1f2430", "#6b7280", "#2563eb"
+
+    def esc(s): return _html.escape(s, quote=False)
+
+    blocks = [b for b in body.split("\n\n") if b.strip()]
+    parts = []
+    for block in blocks:
+        lines = block.split("\n")
+        # fixed-width table block (7日趋势): header row + ──── separator
+        if any(set(l.strip()) <= set("─ ") and l.strip() for l in lines):
+            rows = [l for l in lines if l.strip() and not set(l.strip()) <= set("─ ")]
+            title = ""
+            if rows and not re.search(r"\s{2,}", rows[0].strip()):
+                title, rows = rows[0].strip(), rows[1:]
+            trs = []
+            for i, r in enumerate(rows):
+                cells = re.split(r"\s{2,}", r.strip())
+                tag = "th" if i == 0 else "td"
+                sty = ("font-weight:600;color:%s;border-bottom:1px solid #e5e7eb;" % C_MUT) if i == 0 else "border-bottom:1px solid #f0f1f3;"
+                trs.append("<tr>" + "".join(
+                    f'<{tag} style="padding:6px 8px;text-align:right;font-size:13px;{sty}white-space:nowrap;">{esc(c)}</{tag}>'
+                    for c in cells) + "</tr>")
+            t = (f'<div style="font-weight:700;font-size:15px;margin:0 0 8px;">{esc(title)}</div>' if title else "")
+            parts.append(t + '<div style="overflow-x:auto;"><table style="border-collapse:collapse;width:100%;">' + "".join(trs) + "</table></div>")
+            continue
+        # bar-chart / list block (GEO 趋势, 渠道列表, 口径说明)
+        rendered = []
+        for l in lines:
+            s = l.rstrip()
+            if not s.strip():
+                continue
+            m = re.match(r"^(\s*)([^:：]{1,24})[:：]\s+(.+)$", s)
+            if m and not s.strip().startswith(("-", "—")):
+                k, v = m.group(2).strip(), m.group(3).strip()
+                hi = bool(re.match(r"^(付费订单|收入)", k))
+                vs = f"color:{C_ACC};font-weight:700;" if hi else "font-weight:600;"
+                rendered.append(
+                    f'<div style="display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #f0f1f3;">'
+                    f'<span style="color:{C_MUT};font-size:13px;">{esc(k)}</span>'
+                    f'<span style="font-size:14px;{vs}text-align:right;">{esc(v)}</span></div>')
+            elif re.match(r"^[^\s].*[:：]$", s):  # section heading line
+                rendered.append(f'<div style="font-weight:700;font-size:15px;margin:2px 0 6px;">{esc(s.rstrip(":："))}</div>')
+            else:
+                mono = "font-family:ui-monospace,Menlo,monospace;" if ("█" in s or "░" in s) else ""
+                rendered.append(f'<div style="font-size:13px;color:{C_TXT};{mono}padding:3px 0;">{esc(s.strip())}</div>')
+        if rendered:
+            parts.append("".join(rendered))
+
+    cards = "".join(
+        f'<div style="background:{C_CARD};border-radius:12px;padding:16px 18px;margin:0 0 12px;'
+        f'box-shadow:0 1px 2px rgba(16,24,40,.06);">{p}</div>' for p in parts)
+    return (
+        f'<!DOCTYPE html><html><body style="margin:0;padding:0;background:{C_BG};">'
+        f'<div style="max-width:640px;margin:0 auto;padding:20px 14px;'
+        f'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:{C_TXT};">'
+        f'<div style="font-size:17px;font-weight:800;margin:0 0 14px;">{esc(subject)}</div>'
+        f'{cards}'
+        f'<div style="color:{C_MUT};font-size:11px;margin-top:6px;">ArtImageHub · 自动日报</div>'
+        f"</div></body></html>")
+
+
+def send_email(api_key: str, subject: str, body: str, html: str | None = None) -> None:
     payload = {
         "from": ALERT_FROM,
         "to": [ALERT_TO],
         "subject": subject,
         "text": body,
     }
+    if html:
+        payload["html"] = html
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=json.dumps(payload).encode("utf-8"),
@@ -594,7 +667,7 @@ def main() -> int:
     if os.environ.get("DRY_RUN") == "1":
         print("DRY_RUN=1 — not sending")
         return 0
-    send_email(resend_key, subj, body)
+    send_email(resend_key, subj, body, html=text_to_html(subj, body))
     return 0
 
 
