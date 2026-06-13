@@ -1278,19 +1278,31 @@ class PhotoFixProvider(AIProvider):
             return ProcessingResult(success=False, error="PHOTOFIX_API_URL is not configured.")
 
         # Retry policy: cloudflared tunnel + Render → 221 path can have transient
-        # connect-time blips (sin POP failover, Render egress reroute, etc).
-        # Without retry these blips cascade to silent HF Spaces fallback that
-        # serves bad output (5/10 evening: Mariella's tunnel switch caught two
-        # users in fallback windows). Retry 3x: 0s/2s/8s backoff. Total worst-case
-        # 10s + 3 connect-timeouts before giving up to outer fallback. Most
-        # transient blips resolve <2s. Single full chain runs ~80-90s so adding
-        # 10s when blip occurs is acceptable; the alternative (HF fallback) gives
-        # PIL UnsharpMask quality which is worse than waiting another attempt.
-        # Keep HF fallback (founder 5-10 directive "HF fallback 还是要的，作为保底").
-        import asyncio
+        # disconnects can surface as a 502/timeout/connect error. For restore
+        # traffic, absorb one short tunnel flap before failing the request.
+        # Logical model failures and busy responses are not edge-network
+        # transients, so do not hide them behind retry.
+        RESTORE_TRANSIENT_RETRY_DELAY_S = 9
         RETRY_DELAYS = [0, 2, 8]
         M2_RETRY_DELAYS = [0, 10, 30]
         last_exc: Exception | None = None
+
+        def _is_transient_restore_error(exc: Exception) -> bool:
+            if isinstance(
+                exc,
+                (
+                    httpx.TimeoutException,
+                    httpx.ConnectError,
+                    httpx.ReadError,
+                    httpx.RemoteProtocolError,
+                    httpx.TransportError,
+                ),
+            ):
+                return True
+            if isinstance(exc, httpx.HTTPStatusError):
+                return exc.response.status_code == 502
+            return False
+
         try:
             if progress_callback:
                 await progress_callback("Preparing image...", 10)
@@ -1312,7 +1324,11 @@ class PhotoFixProvider(AIProvider):
                     candidate_urls = [item for item in candidate_urls if item[0] != "m2"]
 
             for endpoint_idx, (endpoint_name, endpoint_url, connect_timeout_s) in enumerate(candidate_urls):
-                delays = M2_RETRY_DELAYS if endpoint_name == "m2" else RETRY_DELAYS
+                delays = (
+                    [0, RESTORE_TRANSIENT_RETRY_DELAY_S]
+                    if task == "restore"
+                    else M2_RETRY_DELAYS if endpoint_name == "m2" else RETRY_DELAYS
+                )
                 for attempt_idx, delay in enumerate(delays):
                     if delay:
                         logger.warning(
@@ -1385,6 +1401,22 @@ class PhotoFixProvider(AIProvider):
                         )
                     except Exception as exc:
                         last_exc = exc
+                        transient_retry_available = (
+                            task == "restore"
+                            and attempt_idx < len(delays) - 1
+                            and _is_transient_restore_error(exc)
+                        )
+                        if transient_retry_available:
+                            logger.warning(
+                                "PhotoFix %s transient restore retry %d/%d after %ds backoff (last error: %s)",
+                                endpoint_name,
+                                attempt_idx + 1,
+                                len(delays) - 1,
+                                RESTORE_TRANSIENT_RETRY_DELAY_S,
+                                exc,
+                            )
+                            continue
+
                         final_attempt = attempt_idx == len(delays) - 1
                         if final_attempt:
                             if endpoint_idx < len(candidate_urls) - 1:
