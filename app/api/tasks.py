@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from app.services.task_store import get_task
+from app.services.error_messages import to_user_message
 
 router = APIRouter()
 
@@ -28,12 +29,17 @@ async def get_task_status(task_id: str):
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    # T174 belt-and-suspenders: _process_task already stores only safe copy, but
+    # sanitize again here so no raw upstream/HTTP/traceback text can ever reach the
+    # frontend via this route, regardless of who wrote task.error.
+    safe_error = to_user_message(task.error) if task.error else None
+
     return TaskResponse(
         task_id=task.id,
         status=task.status.value,
         progress=task.progress,
         stage=task.stage,
-        error=task.error,
+        error=safe_error,
         provider_used=task.provider_used,
         provider_backend=task.provider_backend,
     )

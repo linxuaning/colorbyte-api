@@ -23,12 +23,18 @@ class ProcessingResult:
         error: Optional[str] = None,
         provider_used: Optional[str] = None,
         provider_backend: Optional[str] = None,
+        error_code: Optional[str] = None,
     ):
         self.success = success
         self.output_path = output_path
         self.error = error
         self.provider_used = provider_used
         self.provider_backend = provider_backend
+        # T174: machine-readable failure class. 'upstream_unavailable' = inference
+        # backend down/unreachable after retries+failover. `error` keeps raw text
+        # for logs/alerts; user-facing copy is derived from error_code at the user
+        # boundary — raw text is never shown to end users.
+        self.error_code = error_code
 
 
 ProgressCallback = Optional[Callable[[str, int], Awaitable[None]]]
@@ -1300,7 +1306,11 @@ class PhotoFixProvider(AIProvider):
             ):
                 return True
             if isinstance(exc, httpx.HTTPStatusError):
-                return exc.response.status_code == 502
+                # T174: 530 is the Cloudflare-tunnel "origin unreachable" code that
+                # Tony hit — it must be treated as a transient edge failure, same as
+                # the other CF 52x edge codes, not just 502. These are tunnel/edge
+                # flaps the retry+failover window is meant to absorb.
+                return exc.response.status_code in {502, 520, 521, 522, 523, 524, 525, 526, 527, 530}
             return False
 
         try:
@@ -1430,7 +1440,13 @@ class PhotoFixProvider(AIProvider):
 
         except Exception as exc:
             logger.error("PhotoFix processing failed after retries: %s", exc)
-            return ProcessingResult(success=False, error=str(exc))
+            # T174: tag upstream/edge unavailability so the user boundary maps it to
+            # safe copy. Raw `error` is kept for logs/alerts only — never shown.
+            return ProcessingResult(
+                success=False,
+                error=str(exc),
+                error_code="upstream_unavailable",
+            )
 
 
 async def _try_local_mac(

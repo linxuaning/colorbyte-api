@@ -54,6 +54,7 @@ from app.services.ai_service import get_ai_service
 from app.services.storage import RESULT_DIR
 from app.services.database import is_feature_entitled, record_processing_complete, upsert_persistent_task
 from app.services.alert_email import send_payment_failure_alert
+from app.services.error_messages import USER_FACING_UPSTREAM_MSG, GENERIC_PROCESSING_MSG
 
 router = APIRouter()
 
@@ -260,13 +261,21 @@ async def _process_task(task_id: str):
                 result.provider_backend,
             )
         else:
+            # T174: every failure here is a processing failure — store ONLY safe
+            # user-facing copy (the frontend polls /tasks and shows it). Raw error
+            # goes to logs + the internal alert below, never to the user.
+            user_msg = (
+                USER_FACING_UPSTREAM_MSG
+                if getattr(result, "error_code", None) == "upstream_unavailable"
+                else GENERIC_PROCESSING_MSG
+            )
             update_task(
                 task_id,
                 status=TaskStatus.FAILED,
                 stage="Failed",
-                error=result.error or "Processing failed",
+                error=user_msg,
             )
-            logger.warning("Task %s failed: %s", task_id, result.error)
+            logger.warning("Task %s failed (raw): %s", task_id, result.error)
             send_payment_failure_alert(
                 alert_type="processing_failed",
                 customer_email=task.email,
@@ -275,11 +284,12 @@ async def _process_task(task_id: str):
             )
     except Exception as exc:
         logger.exception("Task %s crashed: %s", task_id, exc)
+        # T174: never surface the raw exception to the user.
         update_task(
             task_id,
             status=TaskStatus.FAILED,
             stage="Failed",
-            error=f"Unexpected error: {exc}",
+            error=GENERIC_PROCESSING_MSG,
         )
         send_payment_failure_alert(
             alert_type="processing_failed",
