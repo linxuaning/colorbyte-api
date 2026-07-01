@@ -1208,6 +1208,18 @@ class PhotoFixProvider(AIProvider):
 
     REQUEST_TIMEOUT = 6000.0  # backend can take up to ~100 min for large inputs
 
+    # T204: the M2 restore service now exposes an async job contract
+    # (POST /api/restore/async -> {job_id}; GET /api/restore/result/{job_id}).
+    # Each HTTP hop finishes well under Cloudflare's ~100s tunnel edge boundary,
+    # so a long flux.2 Klein restore is no longer context-canceled mid-flight.
+    # If the M2 endpoint does not speak the contract yet (404/405 on /async), we
+    # transparently fall back to the legacy single synchronous POST, so this ships
+    # safely regardless of M2 rollout order.
+    M2_SUBMIT_TIMEOUT_S = 15.0    # submit returns in <1s; generous ceiling
+    M2_POLL_READ_S = 30.0        # each poll returns instantly
+    M2_POLL_INTERVAL_S = 3.0
+    M2_POLL_MAX_S = 1200.0       # macmini may grind ~1000s (sticky flux) + run
+
     def __init__(
         self,
         api_url: str,
@@ -1263,6 +1275,100 @@ class PhotoFixProvider(AIProvider):
         except Exception as exc:
             logger.warning("PhotoFix M2 health failed; using remote fallback: %s", exc)
             return False
+
+    async def _restore_call(
+        self, endpoint_name: str, endpoint_url: str, image_b64: str, task: str,
+        connect_timeout_s: float, logger,
+    ) -> dict:
+        """One restore call to a candidate, returning the response dict.
+
+        For the M2 endpoint this uses the async job contract (submit -> poll);
+        every other endpoint (and an M2 that doesn't speak /async yet) uses the
+        legacy single synchronous POST. Raises httpx transient errors so the
+        caller's retry/failover logic still applies unchanged.
+        """
+        import hashlib
+        import httpx
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Internal-Key": self.internal_api_key,
+            "User-Agent": "artimagehub-backend/1.0",
+        }
+        if endpoint_name != "m2":
+            return await self._legacy_sync_restore(endpoint_url, image_b64, task, connect_timeout_s, headers)
+
+        base = endpoint_url.rstrip("/")
+        # Stable content-derived id so a retry / re-poll never enqueues a
+        # duplicate job on M2 (M2 also dedups by content hash as a backstop).
+        job_key = hashlib.sha256((image_b64 + "|" + task).encode()).hexdigest()[:16]
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(self.M2_SUBMIT_TIMEOUT_S, connect=connect_timeout_s),
+            follow_redirects=True,
+        ) as http:
+            sub = await http.post(
+                base + "/async", headers=headers,
+                json={"image": image_b64, "task": task, "job_id": job_key},
+            )
+        if sub.status_code in (404, 405):
+            logger.warning("M2 async endpoint unsupported (HTTP %s); using legacy sync POST", sub.status_code)
+            return await self._legacy_sync_restore(endpoint_url, image_b64, task, connect_timeout_s, headers)
+        sub.raise_for_status()
+        sdata = sub.json()
+        job_id = sdata.get("job_id")
+        if not sdata.get("ok") or not job_id:
+            raise RuntimeError(f"M2 async submit rejected: {sdata.get('error') or sdata.get('status')}")
+        logger.info("M2 async submitted job_id=%s status=%s", job_id, sdata.get("status"))
+        return await self._poll_m2_result(base, job_id, connect_timeout_s, logger)
+
+    async def _legacy_sync_restore(
+        self, endpoint_url: str, image_b64: str, task: str, connect_timeout_s: float, headers: dict,
+    ) -> dict:
+        import httpx
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(self.REQUEST_TIMEOUT, connect=connect_timeout_s),
+            follow_redirects=True,
+        ) as http:
+            resp = await http.post(endpoint_url, headers=headers, json={"image": image_b64, "task": task})
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _poll_m2_result(
+        self, base: str, job_id: str, connect_timeout_s: float, logger,
+    ) -> dict:
+        import httpx
+
+        result_url = base + "/result/" + job_id
+        poll_headers = {"X-Internal-Key": self.internal_api_key, "User-Agent": "artimagehub-backend/1.0"}
+        transient_edge = {502, 503, 520, 521, 522, 523, 524, 525, 526, 527, 530}
+        deadline = asyncio.get_running_loop().time() + self.M2_POLL_MAX_S
+        while True:
+            await asyncio.sleep(self.M2_POLL_INTERVAL_S)
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(self.M2_POLL_READ_S, connect=connect_timeout_s),
+                follow_redirects=True,
+            ) as http:
+                r = await http.get(result_url, headers=poll_headers)
+            if r.status_code in transient_edge:
+                # tunnel/edge flap during polling — keep polling until the deadline
+                if asyncio.get_running_loop().time() > deadline:
+                    r.raise_for_status()
+                continue
+            if r.status_code == 404:
+                # job expired/lost (e.g. server restart) — transient so the outer
+                # retry re-submits (same job_key resumes/recreates cleanly)
+                raise httpx.RemoteProtocolError("M2 job result not found (expired/restarted)", request=r.request)
+            r.raise_for_status()
+            rj = r.json()
+            status = rj.get("status")
+            if status in ("queued", "processing"):
+                if asyncio.get_running_loop().time() > deadline:
+                    raise httpx.TimeoutException(f"M2 restore poll exceeded {self.M2_POLL_MAX_S:.0f}s")
+                continue
+            # done -> full payload (ok/result/route_used/...); failed -> ok:false + error
+            logger.info("M2 async job_id=%s final_status=%s route_used=%s", job_id, status, rj.get("route_used"))
+            return rj
 
     async def process_photo(
         self,
@@ -1351,24 +1457,10 @@ class PhotoFixProvider(AIProvider):
                         )
                         await asyncio.sleep(delay)
                     try:
-                        async with httpx.AsyncClient(
-                            timeout=httpx.Timeout(
-                                self.REQUEST_TIMEOUT,
-                                connect=connect_timeout_s,
-                            ),
-                            follow_redirects=True,
-                        ) as http:
-                            resp = await http.post(
-                                endpoint_url,
-                                headers={
-                                    "Content-Type": "application/json",
-                                    "X-Internal-Key": self.internal_api_key,
-                                    "User-Agent": "artimagehub-backend/1.0",
-                                },
-                                json={"image": image_b64, "task": task},
-                            )
-                            resp.raise_for_status()
-                            data = resp.json()
+                        data = await self._restore_call(
+                            endpoint_name, endpoint_url, image_b64, task,
+                            connect_timeout_s, logger,
+                        )
 
                         if endpoint_name == "m2" and data.get("error") == "busy":
                             raise RuntimeError(
