@@ -1282,10 +1282,15 @@ class PhotoFixProvider(AIProvider):
     ) -> dict:
         """One restore call to a candidate, returning the response dict.
 
-        For the M2 endpoint this uses the async job contract (submit -> poll);
-        every other endpoint (and an M2 that doesn't speak /async yet) uses the
-        legacy single synchronous POST. Raises httpx transient errors so the
-        caller's retry/failover logic still applies unchanged.
+        Every candidate is attempted with the async job contract first
+        (POST {url}/async -> job_id, then poll {url}/result/{id}); if that
+        endpoint doesn't speak it (404/405 on /async) we transparently fall
+        back to the legacy single synchronous POST. This is deliberately keyed
+        on the URL's capability, NOT the candidate label, so whichever endpoint
+        actually points at the async-capable inference tunnel (whether it is
+        configured as the 'm2' or the 'remote' candidate) gets the async path
+        and stops hitting the Cloudflare ~100s edge boundary. Raises httpx
+        transient errors so the caller's retry/failover logic applies unchanged.
         """
         import hashlib
         import httpx
@@ -1295,9 +1300,6 @@ class PhotoFixProvider(AIProvider):
             "X-Internal-Key": self.internal_api_key,
             "User-Agent": "artimagehub-backend/1.0",
         }
-        if endpoint_name != "m2":
-            return await self._legacy_sync_restore(endpoint_url, image_b64, task, connect_timeout_s, headers)
-
         base = endpoint_url.rstrip("/")
         # Stable content-derived id so a retry / re-poll never enqueues a
         # duplicate job on M2 (M2 also dedups by content hash as a backstop).
