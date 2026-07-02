@@ -131,6 +131,17 @@ def _use_postgres() -> bool:
     return bool(_get_database_url())
 
 
+def _raise_if_authoritative_write_failed(op: str, sqlite_ok: bool, pg_ok: bool, detail: str) -> None:
+    """Only fail a write when the configured authoritative backend failed."""
+    if _use_postgres():
+        if not pg_ok:
+            raise RuntimeError(f"postgres write failed for {op} {detail}")
+        return
+
+    if not sqlite_ok:
+        raise RuntimeError(f"sqlite write failed for {op} {detail}")
+
+
 def get_database_backend() -> str:
     return "postgres" if _use_postgres() else "sqlite"
 
@@ -763,8 +774,9 @@ def mark_event_processed(event_id: str, event_type: str):
             logger.exception("dual_write mark_event_processed pg failed event_id=%s", event_id)
 
     _record_obs("mark_event_processed", sqlite_ok, pg_ok)
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for mark_event_processed event_id={event_id}")
+    _raise_if_authoritative_write_failed(
+        "mark_event_processed", sqlite_ok, pg_ok, f"event_id={event_id}"
+    )
 
 
 def upsert_subscription(
@@ -877,8 +889,9 @@ def upsert_subscription(
         "Subscription upserted: %s provider=%s status=%s sqlite_ok=%s pg_ok=%s",
         email, payment_provider, status, sqlite_ok, pg_ok,
     )
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for upsert_subscription email={email}")
+    _raise_if_authoritative_write_failed(
+        "upsert_subscription", sqlite_ok, pg_ok, f"email={email}"
+    )
 
 
 def get_subscription(email: str) -> dict | None:
@@ -969,8 +982,9 @@ def save_paypal_checkout_email(order_id: str, checkout_email: str):
         "Saved PayPal checkout email: order_id=%s checkout_email=%s sqlite_ok=%s pg_ok=%s",
         order_id, normalized_email, sqlite_ok, pg_ok,
     )
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for save_paypal_checkout_email order_id={order_id}")
+    _raise_if_authoritative_write_failed(
+        "save_paypal_checkout_email", sqlite_ok, pg_ok, f"order_id={order_id}"
+    )
 
 
 def get_paypal_checkout_email(order_id: str) -> str | None:
@@ -1081,8 +1095,9 @@ def record_paypal_capture(
         "Recorded PayPal capture audit: order_id=%s capture_id=%s payer_email=%s sqlite_ok=%s pg_ok=%s",
         order_id, capture_id, normalized_payer_email, sqlite_ok, pg_ok,
     )
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for record_paypal_capture order_id={order_id}")
+    _raise_if_authoritative_write_failed(
+        "record_paypal_capture", sqlite_ok, pg_ok, f"order_id={order_id}"
+    )
 
 
 def is_user_active(email: str) -> bool:
@@ -1200,8 +1215,12 @@ def grant_feature_entitlement(email: str, feature_key: str, payment_id: str | No
 
     _record_obs("grant_feature_entitlement", sqlite_ok, pg_ok)
     logger.info("Feature entitlement granted: %s feature=%s payment_id=%s", normalized, feature_key, payment_id)
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for grant_feature_entitlement email={normalized} feature={feature_key}")
+    _raise_if_authoritative_write_failed(
+        "grant_feature_entitlement",
+        sqlite_ok,
+        pg_ok,
+        f"email={normalized} feature={feature_key}",
+    )
 
 
 def is_feature_entitled(email: str, feature_key: str) -> bool:
@@ -1270,8 +1289,9 @@ def cancel_subscription_db(email: str):
         "Subscription cancel requested: %s sqlite_ok=%s pg_ok=%s",
         email, sqlite_ok, pg_ok,
     )
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for cancel_subscription_db email={email}")
+    _raise_if_authoritative_write_failed(
+        "cancel_subscription_db", sqlite_ok, pg_ok, f"email={email}"
+    )
 
 
 # --- Download tracking ---
@@ -1331,8 +1351,9 @@ def record_download(ip: str, task_id: str):
             logger.exception("dual_write record_download pg failed ip=%s task_id=%s", ip, task_id)
 
     _record_obs("record_download", sqlite_ok, pg_ok)
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for record_download ip={ip}")
+    _raise_if_authoritative_write_failed(
+        "record_download", sqlite_ok, pg_ok, f"ip={ip}"
+    )
 
 
 def check_download_limit(ip: str, email: str | None = None) -> dict:
@@ -1423,8 +1444,9 @@ def record_processing_complete(
             logger.exception("dual_write record_processing_complete pg failed task_id=%s", task_id)
 
     _record_obs("record_processing_complete", sqlite_ok, pg_ok)
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for record_processing_complete task_id={task_id}")
+    _raise_if_authoritative_write_failed(
+        "record_processing_complete", sqlite_ok, pg_ok, f"task_id={task_id}"
+    )
 
 
 def get_processing_complete_metrics(hours: int = 24) -> dict:
@@ -1535,8 +1557,9 @@ def record_payment_initiation(
             logger.exception("dual_write record_payment_initiation pg failed order_id=%s", order_id)
 
     _record_obs("record_payment_initiation", sqlite_ok, pg_ok)
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for record_payment_initiation order_id={order_id}")
+    _raise_if_authoritative_write_failed(
+        "record_payment_initiation", sqlite_ok, pg_ok, f"order_id={order_id}"
+    )
 
 
 def get_payment_initiation_metrics(hours: int = 24) -> dict:
@@ -1845,8 +1868,9 @@ def record_payment_success(
             logger.exception("dual_write record_payment_success pg failed key=%s", success_key)
 
     _record_obs("record_payment_success", sqlite_ok, pg_ok)
-    if not sqlite_ok:
-        raise RuntimeError(f"sqlite write failed for record_payment_success key={success_key}")
+    _raise_if_authoritative_write_failed(
+        "record_payment_success", sqlite_ok, pg_ok, f"key={success_key}"
+    )
 
 
 # Historical test-you ($0.99, product pdt_0NcPYot…) contamination recorded into
