@@ -13,6 +13,12 @@ from pydantic import BaseModel
 _MAX_INPUT_LONG_EDGE = 1200   # cap uploaded input before AI processing
 _MAX_RESULT_LONG_EDGE = 1600  # cap AI result before saving (upscalers can 4× the size)
 
+# Hard ceiling for a feature-specific algorithm attempt (NAFNet denoise/deblur,
+# SwinIR jpeg-fix) before falling back to the restore chain. The M2 host has
+# shown these hang/OOM well past what the restore chain itself takes — a paying
+# customer must not wait longer than the normal path just to hit a failure.
+_FEATURE_ALGO_TIMEOUT_SECONDS = 25.0
+
 
 def _resize_if_needed(content: bytes) -> bytes:
     """Resize image so longest edge ≤ _MAX_INPUT_LONG_EDGE, re-encode as JPEG 85%.
@@ -183,27 +189,56 @@ async def _process_task(task_id: str):
 
         from app.services.database import FEATURE_DENOISING, FEATURE_DEBLURRING, FEATURE_JPEG_FIX
         ai = get_ai_service()
-        if task.feature_key == FEATURE_DENOISING:
-            result = await ai.denoise_photo(
-                input_path=task.upload_path,
-                output_path=result_path,
-                progress_callback=on_progress,
-                email=task.email,
-            )
-        elif task.feature_key == FEATURE_DEBLURRING:
-            result = await ai.deblur_photo(
-                input_path=task.upload_path,
-                output_path=result_path,
-                progress_callback=on_progress,
-                email=task.email,
-            )
-        elif task.feature_key == FEATURE_JPEG_FIX:
-            result = await ai.fix_jpeg_artifacts(
-                input_path=task.upload_path,
-                output_path=result_path,
-                progress_callback=on_progress,
-                email=task.email,
-            )
+
+        # Feature-specific algorithms are tried on a hard timeout; any failure or
+        # timeout falls back to the restore chain so the task still completes
+        # with a usable result instead of failing the customer outright.
+        feature_algorithms = {
+            FEATURE_DENOISING: ai.denoise_photo,
+            FEATURE_DEBLURRING: ai.deblur_photo,
+            FEATURE_JPEG_FIX: ai.fix_jpeg_artifacts,
+        }
+        algo_func = feature_algorithms.get(task.feature_key)
+        fell_back_to_restore = False
+
+        if algo_func is not None:
+            try:
+                result = await asyncio.wait_for(
+                    algo_func(
+                        input_path=task.upload_path,
+                        output_path=result_path,
+                        progress_callback=on_progress,
+                        email=task.email,
+                    ),
+                    timeout=_FEATURE_ALGO_TIMEOUT_SECONDS,
+                )
+                if not result.success:
+                    logger.warning(
+                        "Task %s feature_key=%s algorithm failed (%s) -> falling back to restore chain",
+                        task_id, task.feature_key, result.error,
+                    )
+                    fell_back_to_restore = True
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Task %s feature_key=%s algorithm exceeded %.0fs -> falling back to restore chain",
+                    task_id, task.feature_key, _FEATURE_ALGO_TIMEOUT_SECONDS,
+                )
+                fell_back_to_restore = True
+            except Exception as exc:
+                logger.warning(
+                    "Task %s feature_key=%s algorithm crashed (%s) -> falling back to restore chain",
+                    task_id, task.feature_key, exc,
+                )
+                fell_back_to_restore = True
+
+            if fell_back_to_restore:
+                result = await ai.process_photo(
+                    input_path=task.upload_path,
+                    output_path=result_path,
+                    colorize=False,
+                    progress_callback=on_progress,
+                    email=task.email,
+                )
         else:
             result = await ai.process_photo(
                 input_path=task.upload_path,
@@ -219,7 +254,12 @@ async def _process_task(task_id: str):
             # safety on Render free during preview generation is handled in
             # download._create_preview via PIL.Image.draft() subsampling.
 
-            mode = task.feature_key if task.feature_key != "restoration" else ("colorize" if task.colorize else "restore")
+            if task.feature_key == "restoration":
+                mode = "colorize" if task.colorize else "restore"
+            elif fell_back_to_restore:
+                mode = f"{task.feature_key}_fallback_restore"
+            else:
+                mode = task.feature_key
             record_processing_complete(
                 task_id=task_id,
                 mode=mode,
