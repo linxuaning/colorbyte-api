@@ -189,19 +189,46 @@ async def _process_task(task_id: str):
 
         from app.services.database import FEATURE_DENOISING, FEATURE_DEBLURRING, FEATURE_JPEG_FIX
         ai = get_ai_service()
+        fell_back_to_restore = False
 
         # Feature-specific algorithms are tried on a hard timeout; any failure or
         # timeout falls back to the restore chain so the task still completes
         # with a usable result instead of failing the customer outright.
         feature_algorithms = {
-            FEATURE_DENOISING: ai.denoise_photo,
             FEATURE_DEBLURRING: ai.deblur_photo,
             FEATURE_JPEG_FIX: ai.fix_jpeg_artifacts,
         }
         algo_func = feature_algorithms.get(task.feature_key)
-        fell_back_to_restore = False
 
-        if algo_func is not None:
+        if task.feature_key == FEATURE_DENOISING:
+            # T210: denoising tries the flux2_klein-capable restore chain first —
+            # it already does its own face detection and graceful degradation
+            # server-side (T204: has-face -> flux2_klein generative repair,
+            # no-face -> diffbir fallback), which produces better results on old
+            # noisy/faded photos with faces than the plain NAFNet-SIDD path. The
+            # NAFNet chain (ai.denoise_photo) is now the safety net, not the
+            # primary, for this feature only — used only if the restore chain
+            # itself fails outright. No new face-detection code needed here.
+            result = await ai.process_photo(
+                input_path=task.upload_path,
+                output_path=result_path,
+                colorize=False,
+                progress_callback=on_progress,
+                email=task.email,
+            )
+            if not result.success:
+                logger.warning(
+                    "Task %s denoising restore-chain path failed (%s) -> falling back to NAFNet",
+                    task_id, result.error,
+                )
+                fell_back_to_restore = True
+                result = await ai.denoise_photo(
+                    input_path=task.upload_path,
+                    output_path=result_path,
+                    progress_callback=on_progress,
+                    email=task.email,
+                )
+        elif algo_func is not None:
             try:
                 result = await asyncio.wait_for(
                     algo_func(
@@ -256,6 +283,13 @@ async def _process_task(task_id: str):
 
             if task.feature_key == "restoration":
                 mode = "colorize" if task.colorize else "restore"
+            elif task.feature_key == FEATURE_DENOISING:
+                # T210: for denoising the fallback direction is inverted vs the
+                # other features — the restore chain (flux2_klein) is primary,
+                # NAFNet is the fallback — so label accordingly, not with the
+                # generic "_fallback_restore" suffix used below (which would
+                # misleadingly claim it fell back TO restore, backwards here).
+                mode = "denoising_fallback_nafnet" if fell_back_to_restore else "denoising_flux2klein"
             elif fell_back_to_restore:
                 mode = f"{task.feature_key}_fallback_restore"
             else:
