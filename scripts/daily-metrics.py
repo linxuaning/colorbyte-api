@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """ArtImageHub 每日增长/收入指标邮件。
 
-订单数只读取 ArtImageHub 后端 `/api/metrics/payment-successes`，不要使用
-GA4 purchase、Dodo 全账号总数、mbtiusa/test you 项目的订单。
+订单数/收入/归因来自 Dodo 真实成交记录（T213，见 dodo_order_truth.py），不
+再读取 ArtImageHub 后端 `/api/metrics/payment-successes`（该计数器自 6/11
+Render 迁移起恒为 0，见 memory reference_backend_metrics_broken_use_dodo）。
+不使用 GA4 purchase、Dodo 全账号订单数、mbtiusa/test you 项目的订单。
 
 脚本拉取最近 24h 与前一 24h 的指标做环比，并在配置
 ARTIMAGEHUB_GA4_SA_KEY 时附带 GA4 流量/GEO 趋势。GitHub Actions 每天
@@ -10,7 +12,8 @@ ARTIMAGEHUB_GA4_SA_KEY 时附带 GA4 流量/GEO 趋势。GitHub Actions 每天
 
 Required env:
     RESEND_API_KEY           — for outbound email
-    METRICS_BASE             — backend base URL (default https://colorbyte-api.onrender.com)
+    DODO_PAYMENTS_API_KEY    — for real order truth (see dodo_order_truth.py)
+    METRICS_BASE             — backend base URL (default https://api.artimagehub.com)
     ALERT_TO                 — recipient (default linxuaning98@gmail.com)
 Optional env:
     ARTIMAGEHUB_GA4_SA_KEY   — GA4 service account JSON string; enables PV/UV/GEO section
@@ -25,8 +28,10 @@ import sys
 import urllib.request
 from datetime import datetime, timezone
 
+from dodo_order_truth import fetch_dodo_real_orders
 
-METRICS_BASE = os.environ.get("METRICS_BASE", "https://colorbyte-api.onrender.com").rstrip("/")
+
+METRICS_BASE = os.environ.get("METRICS_BASE", "https://api.artimagehub.com").rstrip("/")
 ALERT_TO = os.environ.get("ALERT_TO", "linxuaning98@gmail.com")
 ALERT_FROM = os.environ.get("ALERT_FROM", "support@artimagehub.com")  # alerts@ isn't verified in Resend → 403
 DASHBOARD_HINT = "https://artimagehub.com"
@@ -424,8 +429,13 @@ def build_email_body() -> tuple[str, str]:
     init48 = fetch("/api/metrics/payment-initiations", 48)
     breakdown24 = fetch("/api/metrics/payment-funnel-breakdown", 24)
     breakdown48 = fetch("/api/metrics/payment-funnel-breakdown", 48)
-    succ24 = fetch("/api/metrics/payment-successes", 24)
-    succ48 = fetch("/api/metrics/payment-successes", 48)
+    # T213: order count/revenue/attribution now come from Dodo's own succeeded-
+    # payment records (dodo_order_truth.py), not the backend's payment_successes
+    # counter (broken since 6/11, reads 0 while real orders keep happening).
+    # payment-initiations and processing-complete are unaffected by that break
+    # (separate write paths) and stay on the backend endpoint.
+    succ24 = fetch_dodo_real_orders(24)
+    succ48 = fetch_dodo_real_orders(48)
     proc24 = fetch("/api/metrics/processing-complete", 24)
     proc48 = fetch("/api/metrics/processing-complete", 48)
 
@@ -437,13 +447,17 @@ def build_email_body() -> tuple[str, str]:
         init_prev = max(0, init48.get("count", 0) - init_now)
     else:
         init_prev = max(0, init48_filtered - init_now)
+    # A Dodo fetch failure must never be read as "confirmed zero orders" — that
+    # is exactly the failure mode this task exists to fix. Surface it plainly
+    # instead of silently defaulting to 0.
+    succ_available = succ24.get("available", False) and succ48.get("available", False)
     succ_now = succ24.get("count", 0)
     succ_prev = max(0, succ48.get("count", 0) - succ_now)
     proc_now = proc24.get("count", 0)
     proc_prev = max(0, proc48.get("count", 0) - proc_now)
 
-    revenue = succ_now * 4.99
-    conv = (succ_now / init_now * 100) if init_now > 0 else 0
+    revenue = succ24.get("revenue_usd", 0.0)
+    conv = (succ_now / init_now * 100) if (init_now > 0 and succ_available) else 0
 
     wh = fetch_webhook_health()
     wh_line = (
@@ -456,26 +470,40 @@ def build_email_body() -> tuple[str, str]:
     trend = fetch_ga4_7day_trend()
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    subj = f"[ArtImageHub 日报] {today} — 订单={succ_now} 收入(NET)=${revenue:.2f} | checkout={init_now} | 转化={conv:.1f}%"
+    order_display = f"{succ_now}" if succ_available else f"{succ_now}?(取数失败)"
+    subj = f"[ArtImageHub 日报] {today} — 订单={order_display} 收入(NET)=${revenue:.2f} | checkout={init_now} | 转化={conv:.1f}%"
 
     lines = [
         f"ArtImageHub 每日快照 — {today}（窗口：滚动 24 小时，UTC）",
         "",
         f"  付费订单:        {succ_now:4}    较前 24h: {delta(succ_now, succ_prev)}",
         f"  收入(NET):       ${revenue:7.2f}",
-        f"  （已排除 test-you 跨项目污染: {succ24.get('excluded_test_you', 0)} 笔）",
         f"  Checkout 发起:   {init_now:4}    较前 24h: {delta(init_now, init_prev)}",
         f"  修复完成:        {proc_now:4}    较前 24h: {delta(proc_now, proc_prev)}",
         f"  Checkout→付款率: {conv:5.1f}%   （样本 <50 次时只看方向，不做结论）",
+    ]
+    if not succ_available:
+        lines.append(
+            f"  ⚠ Dodo 订单数据获取失败（{succ24.get('reason') or succ48.get('reason') or 'unknown'}）"
+            "，以上订单/收入数字不可信，不是真实 0。"
+        )
+    lines += [
+        f"  （已排除自测邮箱: {succ24.get('excluded_self_test', 0)} 笔 | 已排除非 artimagehub 产品: {succ24.get('excluded_foreign_product', 0)} 笔）",
         "",
         wh_line,
         "",
-        "支付渠道（付费订单 24h）:",
+        "订单归因（Dodo 真实成交 24h，按 landing/cta/entry/source）:",
     ]
-    for prov, n in (succ24.get("by_provider") or {}).items():
-        lines.append(f"  - {prov}: {n}")
-    if not (succ24.get("by_provider") or {}):
+    for row in (succ24.get("breakdown") or []):
+        lines.append(
+            f"  - {row['landing_page']} / {row['cta_slot']} / {row['entry_variant']} / {row['checkout_source']}: {row['count']}"
+        )
+    if not (succ24.get("breakdown") or []):
         lines.append("  （无）")
+    if succ24.get("unmatched_attribution"):
+        lines.append(f"  （其中 {succ24['unmatched_attribution']} 笔缺归因字段，早于 5 月归因埋点上线，标记 unknown 未强行归类）")
+    if succ24.get("non_usd_payment_ids"):
+        lines.append(f"  ⚠ 非 USD 结算，收入求和可能有误差: {', '.join(succ24['non_usd_payment_ids'])}")
 
     lines.append("")
     if ga4.get("available"):
@@ -547,7 +575,10 @@ def build_email_body() -> tuple[str, str]:
     lines += [
         "",
         "口径说明",
-        "- 订单/收入/checkout：只来自 ArtImageHub live backend `/api/metrics/payment-*` 的滚动 24h 数据。",
+        "- 订单/收入/归因：来自 Dodo 真实成交记录（product_id=pdt_0NcPHNyTthqNlXt3sjLjk 精确过滤，"
+        "已排除自测邮箱与其他共账号产品），不是 backend `/api/metrics/payment-successes`（该计数器已知恒 0）。",
+        "- Checkout 发起：仍来自 backend `/api/metrics/payment-initiations`（独立写入路径，未受影响）。",
+        "- 归因字段直接读 Dodo payment 的 metadata（与本地 checkout 创建时写入的一致），缺失时标 unknown，不强行匹配。",
         "- 不使用 GA4 `purchase`、Dodo 全账号订单数、mbtiusa/test you 项目订单作为本日报订单数。",
         "- 流量/GEO：GA4 T-1 日（北京时间昨天）。GEO 来源包含 chatgpt/perplexity/claude/gemini/copilot/you/phind 等。",
         "- 可疑新加坡流量：country=Singapore + direct/(none)，且 sessions>=50、engagement rate<=10%、0 conversion 时，按疑似无效流量单列并从净 sessions 扣除。",
