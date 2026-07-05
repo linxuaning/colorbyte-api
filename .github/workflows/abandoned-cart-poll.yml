@@ -1,0 +1,40 @@
+name: Abandoned-cart recovery poll
+
+# T209 (founder-authorized 2026-07-05): once daily, scan Dodo for
+# requires_payment_method checkouts and send at most one recovery email per
+# customer, ever. The poll endpoint is idempotent — discovery dedups on
+# email (UNIQUE constraint), send dedups on sent_at IS NULL, so duplicate
+# fires only re-scan, never double-send.
+on:
+  schedule:
+    - cron: '0 14 * * *'           # 14:00 UTC daily (~22:00 Beijing)
+  workflow_dispatch:
+
+concurrency:
+  group: abandoned-cart-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Trigger abandoned-cart poll
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+        run: |
+          if [ -z "$ADMIN_SECRET" ]; then
+            echo "WARN: ADMIN_SECRET not set in repo secrets — skipping poll"
+            exit 0
+          fi
+          echo "::group::POST /api/internal/abandoned-cart-poll"
+          # Auth header uses env-var expansion (per feedback_admin_cmd_output_redact);
+          # secret never appears in stdout/stderr/log.
+          response=$(curl -sS -X POST \
+            -H "Authorization: Bearer $ADMIN_SECRET" \
+            -H "Content-Type: application/json" \
+            --max-time 90 \
+            -w "\nhttp=%{http_code}\n" \
+            "https://api.artimagehub.com/api/internal/abandoned-cart-poll")
+          echo "$response"
+          echo "::endgroup::"

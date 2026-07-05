@@ -11,6 +11,7 @@ from fastapi import APIRouter, Header, HTTPException
 
 from app.config import get_settings
 from app.services.mask_email import process_due_emails
+from app.services.abandoned_cart import discover_abandoned_carts, process_due_reminders
 
 logger = logging.getLogger("artimagehub.internal")
 router = APIRouter()
@@ -32,3 +33,14 @@ async def mask_email_poll(authorization: str | None = Header(default=None)):
     summary = process_due_emails()
     logger.info("mask_email poll summary: %s", summary)
     return summary
+
+
+@router.post("/internal/abandoned-cart-poll")
+async def abandoned_cart_poll(authorization: str | None = Header(default=None)):
+    """Discover new Dodo requires_payment_method checkouts and send any due
+    reminder emails. Called once daily by GitHub Actions cron (T209)."""
+    _require_admin(authorization)
+    discovery = discover_abandoned_carts()
+    send_summary = process_due_reminders()
+    logger.info("abandoned_cart poll: discovery=%s send=%s", discovery, send_summary)
+    return {"discovery": discovery, "send": send_summary}

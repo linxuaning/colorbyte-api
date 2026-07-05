@@ -119,6 +119,11 @@ class Settings(BaseSettings):
     # Mask post-purchase thank-you email (founder feature, 2026-04-26)
     mask_email_enabled: bool = True  # Kill switch: set MASK_EMAIL_ENABLED=false to stop all sends
 
+    # Abandoned-cart recovery email (T209, founder-authorized 2026-07-05)
+    # Kill switch default OFF: code ships with sends disabled until the copy
+    # is reviewed and approved, then flipped on via env var — no separate deploy.
+    abandoned_cart_email_enabled: bool = False
+
     # GA4 Measurement Protocol (server-side paid conversion attribution)
     ga4_measurement_id: str = ""
     ga4_measurement_api_secret: str = ""

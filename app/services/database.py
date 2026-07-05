@@ -534,8 +534,34 @@ def _init_postgres():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mask_email_due ON mask_email_queue(scheduled_at) WHERE sent_at IS NULL;"
             )
+
+            # abandoned_cart_reminders (T209: one-time nudge for Dodo
+            # requires_payment_method checkouts). UNIQUE(email) is the dedup
+            # guarantee — a customer gets at most one reminder ever, even if
+            # they abandon checkout multiple times across different sessions.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS abandoned_cart_reminders (
+                    id BIGSERIAL PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    dodo_payment_id TEXT NOT NULL,
+                    checkout_url TEXT,
+                    landing_page TEXT,
+                    feature_key TEXT,
+                    abandoned_at TIMESTAMPTZ NOT NULL,
+                    sent_at TIMESTAMPTZ,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_abandoned_cart_due ON abandoned_cart_reminders(created_at) WHERE sent_at IS NULL;"
+            )
         conn.commit()
-    logger.info("PostgreSQL schema initialized (subscriptions + auxiliary + metrics + mask_email_queue)")
+    logger.info("PostgreSQL schema initialized (subscriptions + auxiliary + metrics + mask_email_queue + abandoned_cart_reminders)")
 
 
 # Deprecated alias retained for callers in current app-code; rewritten in Commit B.
