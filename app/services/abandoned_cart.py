@@ -66,14 +66,19 @@ ABANDONED_CART_POLL_BATCH_LIMIT = 50
 
 # Plain, honest, transactional copy — no fabricated urgency, no fake scarcity.
 # States only real facts: they started checkout, it didn't complete, here is
-# the real link if they still want to finish it.
+# the real link if they still want to finish it. Reviewed + amended by 创始人
+# 2026-07-05: "photo hasn't been charged" -> "you haven't been charged" (a
+# photo can't be charged); added an expired-link fallback since Dodo
+# payment_link sessions can go stale.
 ABANDONED_CART_SUBJECT = "Your photo restoration checkout didn't go through"
 ABANDONED_CART_BODY_TEMPLATE = """Hi,
 
-We noticed you started checking out for {tool_name} on artimagehub but the payment didn't go through. Your photo hasn't been charged.
+We noticed you started checking out for {tool_name} on artimagehub but the payment didn't go through. You haven't been charged.
 
 If you'd still like to complete it, here's your checkout link:
 {checkout_url}
+
+If the link has expired, you can start fresh anytime at artimagehub.com/{tool_path}.
 
 If this wasn't you, or you've changed your mind, no action is needed — you won't hear from us about this again.
 
@@ -87,11 +92,22 @@ _TOOL_NAME_MAP = {
     "deblurring": "photo deblurring",
     "jpeg-fix": "JPEG artifact removal",
 }
+_TOOL_PATH_MAP = {
+    "restoration": "old-photo-restoration",
+    "denoising": "photo-denoiser",
+    "deblurring": "photo-deblurrer",
+    "jpeg-fix": "jpeg-artifact-remover",
+}
 _TOOL_NAME_DEFAULT = "photo restoration"
+_TOOL_PATH_DEFAULT = "old-photo-restoration"
 
 
 def _feature_key_to_tool_name(feature_key: str | None) -> str:
     return _TOOL_NAME_MAP.get((feature_key or "").strip().lower(), _TOOL_NAME_DEFAULT)
+
+
+def _feature_key_to_tool_path(feature_key: str | None) -> str:
+    return _TOOL_PATH_MAP.get((feature_key or "").strip().lower(), _TOOL_PATH_DEFAULT)
 
 
 def _dodo_get(path: str, key: str) -> dict:
@@ -254,6 +270,7 @@ def process_due_reminders() -> dict:
         email = row["email"]
         checkout_url = row.get("checkout_url") or ""
         tool_name = _feature_key_to_tool_name(row.get("feature_key"))
+        tool_path = _feature_key_to_tool_path(row.get("feature_key"))
         attempts = int(row.get("attempt_count") or 0)
 
         if not checkout_url:
@@ -265,7 +282,9 @@ def process_due_reminders() -> dict:
             skipped += 1
             continue
 
-        body = ABANDONED_CART_BODY_TEMPLATE.format(tool_name=tool_name, checkout_url=checkout_url)
+        body = ABANDONED_CART_BODY_TEMPLATE.format(
+            tool_name=tool_name, checkout_url=checkout_url, tool_path=tool_path,
+        )
         try:
             _send_via_resend(
                 api_key=settings.resend_api_key,
