@@ -52,6 +52,7 @@ _DASHBOARD_HTML = """<!doctype html>
   .err { color: #b00; font-size: 13px; }
   .bad { color: #b00; font-weight: 600; }
   .ok { color: #2a7a2a; }
+  .note { font-size: 11px; color: #999; margin-top: 6px; line-height: 1.5; }
   input, select, button { font-size: 13px; padding: 4px 8px; margin-right: 8px; }
   #key { width: 260px; }
 </style>
@@ -96,6 +97,32 @@ async function load() {
 function render(d) {
   const out = document.getElementById('out');
   let html = `<div style="color:#888;font-size:11px">generated_at ${d.generated_at}</div>`;
+
+  const f = d.funnel;
+  html += '<h2>Daily top-of-funnel</h2>';
+  if (f.error) {
+    html += `<div class="err">${f.error}</div>`;
+  } else {
+    html += `<div class="stat-row">
+      <div class="stat"><div class="n">${f.totals.sessions_external}</div><div class="l">sessions (external, ${f.days}d)</div></div>
+      <div class="stat"><div class="n">${f.totals.payment_attempts}</div><div class="l">payment attempts</div></div>
+      <div class="stat"><div class="n">${f.totals.funnel_start_users_external}</div><div class="l">"registration" proxy</div></div>
+    </div>`;
+    if (f.errors && (f.errors.ga4 || f.errors.dodo)) {
+      html += `<div class="err">${f.errors.ga4 ? 'GA4: '+f.errors.ga4+'<br>' : ''}${f.errors.dodo ? 'Dodo: '+f.errors.dodo : ''}</div>`;
+    }
+    html += '<table><tr><th>date</th><th>sessions (ext)</th><th>users (ext)</th><th>payment attempts</th><th>"registration" proxy</th></tr>';
+    for (const row of f.series) {
+      html += `<tr><td>${row.date}</td><td>${row.sessions_external}</td><td>${row.users_external}</td>` +
+        `<td>${row.payment_attempts}</td><td>${row.funnel_start_users_external}</td></tr>`;
+    }
+    html += '</table>';
+    html += `<div class="note">
+      traffic: ${f.notes.traffic_filter}<br>
+      payment attempts: ${f.notes.payment_attempts_definition}<br>
+      "registration": ${f.notes.registration_caveat}
+    </div>`;
+  }
 
   const o = d.orders;
   html += '<h2>Orders (Dodo live truth)</h2>';

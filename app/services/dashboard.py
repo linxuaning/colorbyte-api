@@ -14,7 +14,12 @@ revenue signal.
 """
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import subprocess
+import tempfile
+import time
 import httpx
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -26,6 +31,90 @@ from app.services.abandoned_cart import SELF_TEST_EMAILS
 logger = logging.getLogger("artimagehub.dashboard")
 
 DODO_PAGE_SIZE = 100
+
+# T227: same exclusion list as scripts/artimagehub-clean-growth-report.py --
+# confirmed 2026-07-07 as bot-crawler/founder-VPN noise, not real external
+# traffic (China: 1.7% engagement / 1.5s avg session).
+INTERNAL_COUNTRIES = {"Singapore", "Japan", "China"}
+# GA4 event marking the moment a visitor enters the payment flow -- the
+# closest available proxy for "attempted to start using the product" on a
+# pay-first, no-login product (see T227 dispatch: this is 创始人's own
+# interpretation, explicitly flagged as unconfirmed with founder).
+FUNNEL_START_EVENT = "payment_click"
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _ga4_access_token(sa_key_json: str) -> str:
+    """Mints a GA4 Data API OAuth2 token from a service-account JSON, via the
+    same openssl-signed JWT approach as artimagehub-clean-growth-report.py
+    (no new crypto/google-auth dependency needed -- openssl is a standard
+    system binary, unlike an added Python package)."""
+    sa = json.loads(sa_key_json)
+    now = int(time.time())
+    token_uri = sa.get("token_uri", "https://oauth2.googleapis.com/token")
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = _b64url(
+        json.dumps(
+            {
+                "iss": sa["client_email"],
+                "scope": "https://www.googleapis.com/auth/analytics.readonly",
+                "aud": token_uri,
+                "iat": now,
+                "exp": now + 3600,
+            },
+            separators=(",", ":"),
+        ).encode()
+    )
+    unsigned = f"{header}.{payload}".encode("ascii")
+    with tempfile.NamedTemporaryFile("w", delete=True) as key_file:
+        key_file.write(sa["private_key"])
+        key_file.flush()
+        sig = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", key_file.name],
+            input=unsigned,
+            capture_output=True,
+            check=True,
+        ).stdout
+    assertion = f"{unsigned.decode('ascii')}.{_b64url(sig)}"
+    resp = httpx.post(
+        token_uri,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": assertion,
+        },
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def _ga4_run_report(body: dict) -> dict:
+    settings = get_settings()
+    if not settings.artimagehub_ga4_sa_key:
+        raise RuntimeError("ARTIMAGEHUB_GA4_SA_KEY not configured")
+    token = _ga4_access_token(settings.artimagehub_ga4_sa_key)
+    url = f"https://analyticsdata.googleapis.com/v1beta/properties/{settings.ga4_property_id}:runReport"
+    resp = httpx.post(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=body,
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _ga4_rows(raw: dict) -> list[tuple[list[str], list[int]]]:
+    rows = []
+    for row in raw.get("rows") or []:
+        dims = [v.get("value", "") for v in row.get("dimensionValues") or []]
+        metrics = [int(float(v.get("value", "0"))) for v in row.get("metricValues") or []]
+        rows.append((dims, metrics))
+    return rows
 
 
 def _dodo_get(path: str, api_key: str) -> dict:
@@ -217,8 +306,120 @@ def get_task_health_panel(days: int = 30) -> dict:
     return {"days": days, "features": result}
 
 
+def get_funnel_panel(days: int = 30) -> dict:
+    """T227 (2026-07-07, founder direct instruction): daily top-of-funnel —
+    traffic / payment attempts / distinct visitors starting the flow.
+
+    ① traffic: GA4 sessions/users, external-clean (INTERNAL_COUNTRIES excluded)
+       -- same filter as artimagehub-clean-growth-report.py, deliberately
+       reused rather than re-derived so this panel can't silently drift from
+       the already-corrected methodology.
+    ② payment attempts: every Dodo payment record (any status) for
+       artimagehub's product_id, self-test emails excluded -- an "attempt"
+       includes abandoned/failed/requires_payment_method, not just success
+       (that's the orders panel).
+    ③ "registration" proxy: distinct GA4 users firing payment_click per day,
+       external-clean. This product is pay-first with no account system, so
+       there is no real registration event -- 创始人's own interpretation
+       (NOT founder-confirmed yet), labeled as such in the response so it
+       can't be mistaken for a real signup metric.
+    """
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days - 1)
+
+    traffic_by_day: dict[str, dict] = defaultdict(lambda: {"sessions": 0, "users": 0})
+    funnel_start_by_day: dict[str, dict] = defaultdict(lambda: {"events": 0, "users": 0})
+    ga4_error = None
+    try:
+        traffic_raw = _ga4_run_report({
+            "dateRanges": [{"startDate": start.isoformat(), "endDate": end.isoformat()}],
+            "dimensions": [{"name": "date"}, {"name": "country"}],
+            "metrics": [{"name": "sessions"}, {"name": "totalUsers"}],
+            "limit": 5000,
+        })
+        for dims, metrics in _ga4_rows(traffic_raw):
+            date_raw, country = dims
+            if country in INTERNAL_COUNTRIES:
+                continue
+            sessions, users = metrics
+            day = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+            traffic_by_day[day]["sessions"] += sessions
+            traffic_by_day[day]["users"] += users
+
+        funnel_raw = _ga4_run_report({
+            "dateRanges": [{"startDate": start.isoformat(), "endDate": end.isoformat()}],
+            "dimensions": [{"name": "date"}, {"name": "country"}],
+            "metrics": [{"name": "eventCount"}, {"name": "totalUsers"}],
+            "dimensionFilter": {
+                "filter": {
+                    "fieldName": "eventName",
+                    "stringFilter": {"matchType": "EXACT", "value": FUNNEL_START_EVENT},
+                }
+            },
+            "limit": 5000,
+        })
+        for dims, metrics in _ga4_rows(funnel_raw):
+            date_raw, country = dims
+            if country in INTERNAL_COUNTRIES:
+                continue
+            events, users = metrics
+            day = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+            funnel_start_by_day[day]["events"] += events
+            funnel_start_by_day[day]["users"] += users
+    except Exception as exc:
+        logger.exception("GA4 funnel fetch failed")
+        ga4_error = str(exc)
+
+    payments_by_day: dict[str, int] = defaultdict(int)
+    dodo_error = None
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        raw = _fetch_dodo_payments_since(cutoff)
+        for item in raw:
+            email = ((item.get("customer") or {}).get("email") or "").strip().lower()
+            if email in SELF_TEST_EMAILS:
+                continue
+            if not _is_real_artimagehub_payment(item):
+                continue
+            created_dt = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+            payments_by_day[created_dt.strftime("%Y-%m-%d")] += 1
+    except Exception as exc:
+        logger.exception("Dodo payment-attempts fetch failed")
+        dodo_error = str(exc)
+
+    all_days = sorted(set(traffic_by_day) | set(funnel_start_by_day) | set(payments_by_day))
+    series = [
+        {
+            "date": day,
+            "sessions_external": traffic_by_day[day]["sessions"],
+            "users_external": traffic_by_day[day]["users"],
+            "payment_attempts": payments_by_day.get(day, 0),
+            "funnel_start_users_external": funnel_start_by_day[day]["users"],
+            "funnel_start_events_external": funnel_start_by_day[day]["events"],
+        }
+        for day in all_days
+    ]
+    return {
+        "days": days,
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "series": series,
+        "totals": {
+            "sessions_external": sum(r["sessions_external"] for r in series),
+            "users_external": sum(r["users_external"] for r in series),
+            "payment_attempts": sum(r["payment_attempts"] for r in series),
+            "funnel_start_users_external": sum(r["funnel_start_users_external"] for r in series),
+        },
+        "notes": {
+            "traffic_filter": "GA4 sessions/users with INTERNAL_COUNTRIES (Singapore/Japan/China) excluded, matching scripts/artimagehub-clean-growth-report.py",
+            "payment_attempts_definition": "any Dodo payment record (succeeded/failed/requires_payment_method/etc) for artimagehub's product_id, self-test emails excluded -- not just successful orders",
+            "registration_caveat": "\"registration\" has no real meaning on this pay-first, no-login product. funnel_start_users_external = distinct external visitors who fired the payment_click event (start of the payment flow), used as a proxy. This is 创始人's own interpretation, NOT yet confirmed with founder -- do not read this as a real signup count.",
+        },
+        "errors": {"ga4": ga4_error, "dodo": dodo_error},
+    }
+
+
 def get_dashboard_snapshot(days: int = 30, granularity: str = "day") -> dict:
-    """All three panels in one call, each independently fault-isolated --
+    """All four panels in one call, each independently fault-isolated --
     a Dodo API hiccup must not blank out the (locally-sourced) task-health
     panel, and vice versa."""
     out: dict = {"generated_at": datetime.now(timezone.utc).isoformat()}
@@ -237,4 +438,9 @@ def get_dashboard_snapshot(days: int = 30, granularity: str = "day") -> dict:
     except Exception as exc:
         logger.exception("task_health panel failed")
         out["task_health"] = {"error": str(exc)}
+    try:
+        out["funnel"] = get_funnel_panel(days=days)
+    except Exception as exc:
+        logger.exception("funnel panel failed")
+        out["funnel"] = {"error": str(exc)}
     return out

@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     # Alert Email (payment failure notifications)
     alert_email_to: str = "linxuaning98@gmail.com"
     resend_api_key: str = ""  # Resend API key (preferred over SMTP when set)
+
+    # GA4 Data API (T227 dashboard funnel panel) — service-account JSON, same
+    # key artimagehub-clean-growth-report.py reads (ARTIMAGEHUB_GA4_SA_KEY env
+    # var or ~/.config/artimagehub/gcp-sa.json locally; Render only has the env var).
+    artimagehub_ga4_sa_key: str = ""
+    ga4_property_id: str = "525510036"
     resend_from_email: str = "support@artimagehub.com"  # Verified Resend sender
     alert_smtp_host: str = "smtp.gmail.com"
     alert_smtp_port: int = 587
