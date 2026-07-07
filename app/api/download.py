@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 from app.services.task_store import get_task, TaskStatus
 from app.services.database import (
     check_download_limit,
+    is_feature_entitled,
     record_download,
 )
 
@@ -127,11 +128,15 @@ async def download_result(
 ):
     """Download the processed result image in original quality for Pro users only."""
     task = _get_completed_task_or_404(task_id)
-
     client_ip = _get_client_ip(request)
-    limit_check = check_download_limit(client_ip, email)
 
-    if not limit_check["is_subscriber"]:
+    # T220: gate on entitlement for the SPECIFIC feature this task was
+    # processed under (task.feature_key), not "is this email a subscriber to
+    # anything" (check_download_limit -> is_user_active was feature-agnostic,
+    # letting a restoration buyer freely download a denoising/deblurring/
+    # jpeg-fix result). is_feature_entitled already carries the legacy
+    # subscription grandfather clause for feature_key == "restoration".
+    if not email or not is_feature_entitled(email.strip().lower(), task.feature_key):
         raise HTTPException(
             status_code=402,
             detail="Paid download access is required for this photo. Use the same paid email that unlocked upload and processing.",
@@ -165,8 +170,8 @@ async def preview_result(
     """Serve a paid-only watermarked preview for in-browser comparison."""
     task = _get_completed_task_or_404(task_id)
 
-    limit_check = check_download_limit(_get_client_ip(request), email)
-    if not email or not limit_check["is_subscriber"]:
+    # T220: same feature-specific gate as download_result (see comment there).
+    if not email or not is_feature_entitled(email.strip().lower(), task.feature_key):
         raise HTTPException(
             status_code=402,
             detail="Paid access is required to preview this processed photo. Use the same paid email that unlocked upload and processing.",
