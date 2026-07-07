@@ -13,10 +13,12 @@ from pydantic import BaseModel
 _MAX_INPUT_LONG_EDGE = 1200   # cap uploaded input before AI processing
 _MAX_RESULT_LONG_EDGE = 1600  # cap AI result before saving (upscalers can 4× the size)
 
-# Hard ceiling for a feature-specific algorithm attempt (NAFNet denoise/deblur,
-# SwinIR jpeg-fix) before falling back to the restore chain. The M2 host has
-# shown these hang/OOM well past what the restore chain itself takes — a paying
-# customer must not wait longer than the normal path just to hit a failure.
+# Hard ceiling for the legacy feature-specific algorithm (NAFNet denoise/
+# deblur, SwinIR jpeg-fix) when it's used as the SAFETY-NET fallback after the
+# restore chain (flux2_klein, primary as of T210/T221) itself fails. These
+# models have shown hang/OOM well past what the restore chain itself takes — a
+# paying customer must not wait longer than the normal path just to hit a
+# second failure.
 _FEATURE_ALGO_TIMEOUT_SECONDS = 25.0
 
 
@@ -56,7 +58,7 @@ def _cap_result_image(path: str) -> None:
 
 from app.services.storage import save_upload
 from app.services.task_store import create_task, update_task, TaskStatus
-from app.services.ai_service import get_ai_service
+from app.services.ai_service import get_ai_service, ProcessingResult
 from app.services.storage import RESULT_DIR
 from app.services.database import is_feature_entitled, record_processing_complete, upsert_persistent_task
 from app.services.alert_email import send_payment_failure_alert
@@ -191,24 +193,25 @@ async def _process_task(task_id: str):
         ai = get_ai_service()
         fell_back_to_restore = False
 
-        # Feature-specific algorithms are tried on a hard timeout; any failure or
-        # timeout falls back to the restore chain so the task still completes
-        # with a usable result instead of failing the customer outright.
-        feature_algorithms = {
+        # T210/T221: denoising/deblurring/jpeg-fix all try the flux2_klein-
+        # capable restore chain first — it already does its own face detection
+        # and graceful degradation server-side (T204: has-face -> flux2_klein
+        # generative repair, no-face -> diffbir fallback), which produces
+        # better results on old damaged/faded photos with faces than the
+        # specialized real-world-degradation models (NAFNet-SIDD/NAFNet-deblur/
+        # SwinIR-JPEG were trained for camera-sensor noise, motion blur, and
+        # JPEG compression artifacts respectively -- not the scan damage/fading
+        # that dominates old-photo uploads). Those specialized models are now
+        # the safety net per feature, not the primary -- used only if the
+        # restore chain itself fails outright. No new face-detection code
+        # needed here (T221 verified same real-photo A/B methodology as T210).
+        restore_chain_first_features = {
+            FEATURE_DENOISING: ai.denoise_photo,
             FEATURE_DEBLURRING: ai.deblur_photo,
             FEATURE_JPEG_FIX: ai.fix_jpeg_artifacts,
         }
-        algo_func = feature_algorithms.get(task.feature_key)
-
-        if task.feature_key == FEATURE_DENOISING:
-            # T210: denoising tries the flux2_klein-capable restore chain first —
-            # it already does its own face detection and graceful degradation
-            # server-side (T204: has-face -> flux2_klein generative repair,
-            # no-face -> diffbir fallback), which produces better results on old
-            # noisy/faded photos with faces than the plain NAFNet-SIDD path. The
-            # NAFNet chain (ai.denoise_photo) is now the safety net, not the
-            # primary, for this feature only — used only if the restore chain
-            # itself fails outright. No new face-detection code needed here.
+        if task.feature_key in restore_chain_first_features:
+            fallback_algo = restore_chain_first_features[task.feature_key]
             result = await ai.process_photo(
                 input_path=task.upload_path,
                 output_path=result_path,
@@ -218,54 +221,31 @@ async def _process_task(task_id: str):
             )
             if not result.success:
                 logger.warning(
-                    "Task %s denoising restore-chain path failed (%s) -> falling back to NAFNet",
-                    task_id, result.error,
+                    "Task %s %s restore-chain path failed (%s) -> falling back to legacy algorithm",
+                    task_id, task.feature_key, result.error,
                 )
                 fell_back_to_restore = True
-                result = await ai.denoise_photo(
-                    input_path=task.upload_path,
-                    output_path=result_path,
-                    progress_callback=on_progress,
-                    email=task.email,
-                )
-        elif algo_func is not None:
-            try:
-                result = await asyncio.wait_for(
-                    algo_func(
-                        input_path=task.upload_path,
-                        output_path=result_path,
-                        progress_callback=on_progress,
-                        email=task.email,
-                    ),
-                    timeout=_FEATURE_ALGO_TIMEOUT_SECONDS,
-                )
-                if not result.success:
-                    logger.warning(
-                        "Task %s feature_key=%s algorithm failed (%s) -> falling back to restore chain",
-                        task_id, task.feature_key, result.error,
+                # T221: wrap the legacy-model fallback in the same T211 hard
+                # timeout (M2 NAFNet-deblur/SwinIR-jpeg historically hung/OOM'd
+                # here -- 0%/17% success rates) rather than leaving it
+                # unprotected. T210 didn't wrap denoising's fallback call; that
+                # gap gets closed here too since the same models/history apply.
+                try:
+                    result = await asyncio.wait_for(
+                        fallback_algo(
+                            input_path=task.upload_path,
+                            output_path=result_path,
+                            progress_callback=on_progress,
+                            email=task.email,
+                        ),
+                        timeout=_FEATURE_ALGO_TIMEOUT_SECONDS,
                     )
-                    fell_back_to_restore = True
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Task %s feature_key=%s algorithm exceeded %.0fs -> falling back to restore chain",
-                    task_id, task.feature_key, _FEATURE_ALGO_TIMEOUT_SECONDS,
-                )
-                fell_back_to_restore = True
-            except Exception as exc:
-                logger.warning(
-                    "Task %s feature_key=%s algorithm crashed (%s) -> falling back to restore chain",
-                    task_id, task.feature_key, exc,
-                )
-                fell_back_to_restore = True
-
-            if fell_back_to_restore:
-                result = await ai.process_photo(
-                    input_path=task.upload_path,
-                    output_path=result_path,
-                    colorize=False,
-                    progress_callback=on_progress,
-                    email=task.email,
-                )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Task %s %s legacy fallback also exceeded %.0fs -> no usable result",
+                        task_id, task.feature_key, _FEATURE_ALGO_TIMEOUT_SECONDS,
+                    )
+                    result = ProcessingResult(success=False, error="restore chain and legacy fallback both failed/timed out")
         else:
             result = await ai.process_photo(
                 input_path=task.upload_path,
@@ -289,7 +269,11 @@ async def _process_task(task_id: str):
                 # NAFNet is the fallback — so label accordingly, not with the
                 # generic "_fallback_restore" suffix used below (which would
                 # misleadingly claim it fell back TO restore, backwards here).
+                # Label unchanged from T210 (analytics backward-compat).
                 mode = "denoising_fallback_nafnet" if fell_back_to_restore else "denoising_flux2klein"
+            elif task.feature_key in restore_chain_first_features:
+                # T221: deblurring/jpeg-fix, same inverted-fallback direction.
+                mode = f"{task.feature_key}_fallback_legacy" if fell_back_to_restore else f"{task.feature_key}_flux2klein"
             elif fell_back_to_restore:
                 mode = f"{task.feature_key}_fallback_restore"
             else:
