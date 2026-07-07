@@ -83,6 +83,32 @@ async def send_email(req: _SendEmailRequest, authorization: str | None = Header(
         raise HTTPException(status_code=502, detail=f"Resend error {exc.code}: {detail}")
 
 
+@router.get("/internal/email-status/{email_id}")
+async def email_status(email_id: str, authorization: str | None = Header(default=None)):
+    """T223 follow-up: independent delivery-status check for the send-email
+    endpoint above (founder verification, not just trusting the send-time 200).
+    Proxies Resend's GET /emails/{id} using the backend's own resend_api_key
+    (the only environment in this stack with real DNS/network to resend.com)."""
+    _require_admin(authorization)
+    settings = get_settings()
+    if not settings.resend_api_key:
+        raise HTTPException(status_code=503, detail="Resend not configured")
+    r = urllib.request.Request(
+        f"https://api.resend.com/emails/{email_id}",
+        headers={
+            "Authorization": f"Bearer {settings.resend_api_key}",
+            "User-Agent": "artimagehub-backend/1.0",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            return {"ok": True, "status": resp.status, "body": json.loads(resp.read())}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()
+        raise HTTPException(status_code=502, detail=f"Resend error {exc.code}: {detail}")
+
+
 @router.post("/internal/mask-email-poll")
 async def mask_email_poll(authorization: str | None = Header(default=None)):
     """Send all due Mask emails. Called every 5 min by GitHub Actions cron."""
