@@ -7,7 +7,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import upload, tasks, download, payment, metrics, admin, internal, inpaint, restore
+from app.api import upload, tasks, download, payment, metrics, admin, internal, inpaint, restore, dashboard
 from app.services.database import (
     get_database_backend,
     get_dual_write_health,
@@ -55,6 +55,7 @@ app.include_router(admin.router, prefix="/api", tags=["admin"])
 app.include_router(internal.router, prefix="/api", tags=["internal"])
 app.include_router(inpaint.router, prefix="/api", tags=["inpaint"])
 app.include_router(restore.router, prefix="/api", tags=["restore"])
+app.include_router(dashboard.router, prefix="/api", tags=["dashboard"])
 
 
 @app.get("/")
