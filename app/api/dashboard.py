@@ -378,6 +378,30 @@ function render(d) {
       o.series.map(row => `<tr><td>${row.period}</td><td>${row.orders}</td><td>$${row.revenue_usd}</td></tr>`).join('');
     tbl.appendChild(table);
     out.appendChild(tbl);
+
+    // T231 (founder direct instruction, 2026-07-09): per-order channel
+    // attribution so a specific order can be traced to a channel without a
+    // manual DB query. Older orders that predate the attribution columns
+    // show "no attribution data" rather than blank cells or an error.
+    if (o.recent_orders) {
+      const ord = document.createElement('details');
+      ord.className = 'tbl';
+      ord.open = true;
+      ord.innerHTML = `<summary>recent orders — channel attribution (${o.recent_orders.length})</summary>`;
+      const ordTable = document.createElement('table');
+      const rowsHtml = o.recent_orders.map(row => {
+        if (!row.attribution_available) {
+          return `<tr><td>${escapeHtml(row.created_at)}</td><td>${escapeHtml(row.email)}</td>` +
+            `<td>$${row.revenue_usd}</td><td colspan="4" class="note" style="padding:6px 10px">no attribution data</td></tr>`;
+        }
+        return `<tr><td>${escapeHtml(row.created_at)}</td><td>${escapeHtml(row.email)}</td><td>$${row.revenue_usd}</td>` +
+          `<td>${escapeHtml(row.landing_page || '—')}</td><td>${escapeHtml(row.cta_slot || '—')}</td>` +
+          `<td>${escapeHtml(row.entry_variant || '—')}</td><td>${escapeHtml(row.checkout_source || '—')}</td></tr>`;
+      }).join('');
+      ordTable.innerHTML = '<tr><th>time</th><th>email</th><th>revenue</th><th>landing_page</th><th>cta_slot</th><th>entry_variant</th><th>checkout_source</th></tr>' + rowsHtml;
+      ord.appendChild(ordTable);
+      out.appendChild(ord);
+    }
   }
 
   const c = d.customers;

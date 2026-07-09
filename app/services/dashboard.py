@@ -183,6 +183,31 @@ def _period_key(dt: datetime, granularity: str) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+_ATTRIBUTION_FIELDS = ("landing_page", "cta_slot", "entry_variant", "checkout_source")
+
+
+def _fetch_attribution_by_order_id(order_ids: list[str]) -> dict[str, dict]:
+    """T231 (founder direct instruction, 2026-07-09): row-level channel
+    attribution for real orders, keyed by Dodo's payment_id (= payment_successes
+    .order_id, see api/payment.py's record_payment_success(order_id=payment_id)).
+    Orders that predate the T-whatever attribution columns (or that never got
+    a payment_successes row for some other reason) simply won't be in the
+    returned dict -- callers must treat a missing key as "no attribution data",
+    never as an error."""
+    if not order_ids or not _use_postgres():
+        return {}
+    with _connect_postgres() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT order_id, {", ".join(_ATTRIBUTION_FIELDS)}
+            FROM payment_successes
+            WHERE order_id = ANY(%s)
+            """,
+            (order_ids,),
+        ).fetchall()
+    return {r["order_id"]: r for r in rows if r["order_id"]}
+
+
 def get_orders_panel(days: int = 30, granularity: str = "day") -> dict:
     if granularity not in ("day", "week", "month"):
         granularity = "day"
@@ -193,6 +218,7 @@ def get_orders_panel(days: int = 30, granularity: str = "day") -> dict:
     excluded_self_test = 0
     excluded_other_product = 0
     included = 0
+    recent_orders: list[dict] = []
     for item in raw:
         if item.get("status") != "succeeded":
             continue
@@ -208,6 +234,27 @@ def get_orders_panel(days: int = 30, granularity: str = "day") -> dict:
         buckets[key]["orders"] += 1
         buckets[key]["revenue_usd"] += (item.get("total_amount") or 0) / 100.0
         included += 1
+        recent_orders.append({
+            "order_id": item.get("payment_id"),
+            "email": email,
+            "created_at": item["created_at"],
+            "revenue_usd": round((item.get("total_amount") or 0) / 100.0, 2),
+        })
+
+    # T231: attach per-order channel attribution from payment_successes --
+    # founder's own explicit instruction is to query that table directly
+    # (no new table), so every recent real order can be traced to a channel
+    # without a manual DB query.
+    attribution_by_id = _fetch_attribution_by_order_id(
+        [o["order_id"] for o in recent_orders if o["order_id"]]
+    )
+    for o in recent_orders:
+        attr = attribution_by_id.get(o["order_id"])
+        has_attribution = bool(attr) and any(attr.get(f) for f in _ATTRIBUTION_FIELDS)
+        o["attribution_available"] = has_attribution
+        for f in _ATTRIBUTION_FIELDS:
+            o[f] = attr.get(f) if (attr and has_attribution) else None
+    recent_orders.sort(key=lambda o: o["created_at"], reverse=True)
 
     series = [
         {"period": k, "orders": v["orders"], "revenue_usd": round(v["revenue_usd"], 2)}
@@ -223,6 +270,7 @@ def get_orders_panel(days: int = 30, granularity: str = "day") -> dict:
         },
         "excluded_self_test": excluded_self_test,
         "excluded_other_product": excluded_other_product,
+        "recent_orders": recent_orders,
         "source": "dodo_live_api",
     }
 
