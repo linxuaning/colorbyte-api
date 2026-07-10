@@ -60,6 +60,13 @@ _DASHBOARD_HTML = """<!doctype html>
     --border:         rgba(11,11,11,0.10);
     --series-1:       #2a78d6; /* blue */
     --series-2:       #1baf7a; /* aqua */
+    --series-3:       #eda100; /* yellow */
+    --series-4:       #008300; /* green */
+    --series-5:       #4a3aa7; /* violet */
+    --series-6:       #e34948; /* red */
+    --series-7:       #e87ba4; /* magenta */
+    --series-8:       #eb6834; /* orange */
+    --series-other:   #898781; /* neutral gray, not a categorical identity */
     --good:           #006300;
     --bad:            #d03b3b;
   }
@@ -75,6 +82,13 @@ _DASHBOARD_HTML = """<!doctype html>
       --border:         rgba(255,255,255,0.10);
       --series-1:       #3987e5;
       --series-2:       #199e70;
+      --series-3:       #c98500;
+      --series-4:       #008300;
+      --series-5:       #9085e9;
+      --series-6:       #e66767;
+      --series-7:       #d55181;
+      --series-8:       #d95926;
+      --series-other:   #898781;
       --good:           #0ca30c;
       --bad:            #e66767;
     }
@@ -197,7 +211,10 @@ function lineChartSVG(series, opts) {
     }
   }
 
-  // lines + end dots + end value label
+  // lines + end dots + end value label. Past ~4 series, direct end-labels
+  // collide and read as noise (dataviz guidance) -- rely on the legend +
+  // tooltip + detail table instead for those, still keep the dot.
+  const skipDirectLabels = series.length > 4;
   series.forEach((s, si) => {
     if (s.points.length === 0) return;
     const d = s.points.map((p, i) => `${i===0?'M':'L'}${xAt(i).toFixed(1)},${yAt(p.y).toFixed(1)}`).join(' ');
@@ -205,11 +222,13 @@ function lineChartSVG(series, opts) {
     const last = s.points[s.points.length - 1];
     const lx = xAt(s.points.length - 1), ly = yAt(last.y);
     svg += `<circle cx="${lx}" cy="${ly}" r="4" fill="${s.color}" stroke="var(--surface-1)" stroke-width="2"/>`;
-    // stagger end labels vertically a touch if multiple series to reduce collision
-    const dy = series.length > 1 ? (si - (series.length-1)/2) * 11 : 0;
-    const anchor = lx > w - padR - 26 ? 'end' : 'start';
-    const lxLabel = anchor === 'end' ? lx - 6 : lx + 6;
-    svg += `<text x="${lxLabel}" y="${ly + 3 + dy}" font-size="10" font-weight="700" fill="var(--text-primary)" text-anchor="${anchor}">${fmtNum(last.y)}</text>`;
+    if (!skipDirectLabels) {
+      // stagger end labels vertically a touch if multiple series to reduce collision
+      const dy = series.length > 1 ? (si - (series.length-1)/2) * 11 : 0;
+      const anchor = lx > w - padR - 26 ? 'end' : 'start';
+      const lxLabel = anchor === 'end' ? lx - 6 : lx + 6;
+      svg += `<text x="${lxLabel}" y="${ly + 3 + dy}" font-size="10" font-weight="700" fill="var(--text-primary)" text-anchor="${anchor}">${fmtNum(last.y)}</text>`;
+    }
   });
 
   // hover hit layer (crosshair, added by attachHover)
@@ -296,6 +315,23 @@ function attachHover(card, series, valueFmt) {
   hitRect.addEventListener('pointerleave', () => { tip.style.display = 'none'; crosshair.style.display = 'none'; });
 }
 
+// T238: fixed channel -> color-slot lookup, one UNIQUE slot per name (no
+// modulo wraparound) so two channels that co-occur (at most CHANNEL_MAX_SERIES
+// = 6 at once) never collide on the same hue -- color follows entity, not
+// rank. Covers the 8 channel groups most likely to actually appear for this
+// site; anything else falls back to a cycling assignment (rare, since at
+// most 6 real channels are ever shown together and these 8 already cover
+// everything observed in production).
+const CHANNEL_COLOR_ORDER = [
+  'Organic Search', 'Direct', 'AI Assistant', 'Organic Social',
+  'Referral', 'Paid Search', 'Unassigned', 'Cross-network',
+];
+function channelColor(name) {
+  const idx = CHANNEL_COLOR_ORDER.indexOf(name);
+  const slot = (idx === -1 ? name.length : idx) % 8 + 1;
+  return `var(--series-${slot})`;
+}
+
 function shortDate(s) {
   // "2026-07-04" -> "07-04"; leave week/month periods as-is
   const m = /^\\d{4}-(\\d{2}-\\d{2})$/.exec(s);
@@ -326,8 +362,9 @@ function render(d) {
     const chartsRow = document.createElement('div');
     chartsRow.className = 'charts-row';
     out.appendChild(chartsRow);
-    renderChartCard(chartsRow, 'External sessions', [
+    renderChartCard(chartsRow, 'External sessions & unique visitors', [
       { name: 'sessions', color: 'var(--series-1)', points: f.series.map(r => ({ x: shortDate(r.date), y: r.sessions_external })) },
+      { name: 'unique visitors (UV)', color: 'var(--series-2)', points: f.series.map(r => ({ x: shortDate(r.date), y: r.users_external })) },
     ]);
     renderChartCard(chartsRow, 'Payment attempts vs "registration" proxy', [
       { name: 'payment attempts', color: 'var(--series-1)', points: f.series.map(r => ({ x: shortDate(r.date), y: r.payment_attempts })) },
@@ -348,6 +385,40 @@ function render(d) {
       `payment attempts: ${escapeHtml(f.notes.payment_attempts_definition)}<br>` +
       `"registration": ${escapeHtml(f.notes.registration_caveat)}`;
     out.appendChild(note);
+  }
+
+  const ch = d.channels;
+  appendH2(out, 'Traffic channel mix (external, daily)');
+  if (ch.error) {
+    appendErr(out, ch.error);
+  } else if (!ch.channels || ch.channels.length === 0) {
+    appendErr(out, 'no channel data in this window');
+  } else {
+    const chartsRow2 = document.createElement('div');
+    chartsRow2.className = 'charts-row';
+    out.appendChild(chartsRow2);
+    const channelSeries = ch.channels.map(name => ({
+      name,
+      color: name === 'Other' ? 'var(--series-other)' : channelColor(name),
+      points: ch.series.map(r => ({ x: shortDate(r.date), y: r[name] || 0 })),
+    }));
+    renderChartCard(chartsRow2, 'Sessions by channel group', channelSeries);
+    const tbl2 = document.createElement('details');
+    tbl2.className = 'tbl';
+    tbl2.innerHTML = '<summary>daily detail table</summary>';
+    const table2 = document.createElement('table');
+    table2.innerHTML = '<tr><th>date</th>' + ch.channels.map(c => `<th>${escapeHtml(c)}</th>`).join('') + '</tr>' +
+      ch.series.map(row => `<tr><td>${row.date}</td>` + ch.channels.map(c => `<td>${row[c] || 0}</td>`).join('') + '</tr>').join('');
+    tbl2.appendChild(table2);
+    out.appendChild(tbl2);
+    const note2 = document.createElement('div');
+    note2.className = 'note';
+    let noteText = escapeHtml(ch.notes.channel_dimension);
+    if (ch.notes.folded_into_other && ch.notes.folded_into_other.length > 0) {
+      noteText += `<br>folded into "Other": ${escapeHtml(ch.notes.folded_into_other.join(', '))}`;
+    }
+    note2.innerHTML = noteText;
+    out.appendChild(note2);
   }
 
   const o = d.orders;

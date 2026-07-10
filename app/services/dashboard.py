@@ -466,6 +466,83 @@ def get_funnel_panel(days: int = 30) -> dict:
     }
 
 
+# T238 (2026-07-10, founder direct instruction): daily channel-mix chart.
+# GA4's own channel-group dimension, not raw source -- 创始人's explicit call
+# ("source太碎曲线没法看") over per-source granularity. Which channels get a
+# line is decided purely by total sessions over the window (below); color
+# identity per channel name is a fixed lookup on the frontend
+# (channelColor() in api/dashboard.py) so a channel's color never depends on
+# which channels happen to rank in a given window (dataviz: color follows
+# entity, not rank).
+CHANNEL_MAX_SERIES = 6  # remaining channels (by window-total volume) fold into "Other"
+
+
+def get_traffic_channel_panel(days: int = 30) -> dict:
+    """T238: daily sessions by GA4 default channel group, external-clean
+    (same INTERNAL_COUNTRIES filter as get_funnel_panel). Which channels get
+    their own line is decided by total sessions over the window (top
+    CHANNEL_MAX_SERIES); everything else folds into "Other" -- logged in
+    `notes.folded_into_other` so the cap is never silent.
+    """
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days - 1)
+
+    raw_by_day_channel: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    channel_totals: dict[str, int] = defaultdict(int)
+    error = None
+    try:
+        raw = _ga4_run_report({
+            "dateRanges": [{"startDate": start.isoformat(), "endDate": end.isoformat()}],
+            "dimensions": [{"name": "date"}, {"name": "sessionDefaultChannelGroup"}, {"name": "country"}],
+            "metrics": [{"name": "sessions"}],
+            "limit": 10000,
+        })
+        for dims, metrics in _ga4_rows(raw):
+            date_raw, channel, country = dims
+            if country in INTERNAL_COUNTRIES:
+                continue
+            (sessions,) = metrics
+            day = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+            channel = channel or "Unassigned"
+            raw_by_day_channel[day][channel] += sessions
+            channel_totals[channel] += sessions
+    except Exception as exc:
+        logger.exception("GA4 channel-mix fetch failed")
+        error = str(exc)
+
+    ranked_channels = sorted(channel_totals.items(), key=lambda kv: -kv[1])
+    top_channels = [c for c, _ in ranked_channels[:CHANNEL_MAX_SERIES]]
+    folded_channels = [c for c, _ in ranked_channels[CHANNEL_MAX_SERIES:]]
+
+    all_days = sorted(raw_by_day_channel.keys())
+    series = []
+    for day in all_days:
+        row = {"date": day}
+        other = 0
+        for channel, count in raw_by_day_channel[day].items():
+            if channel in top_channels:
+                row[channel] = count
+            else:
+                other += count
+        for channel in top_channels:
+            row.setdefault(channel, 0)
+        row["Other"] = other
+        series.append(row)
+
+    return {
+        "days": days,
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "channels": top_channels + (["Other"] if any(r.get("Other") for r in series) or folded_channels else []),
+        "series": series,
+        "totals": {c: channel_totals.get(c, 0) for c in top_channels},
+        "notes": {
+            "channel_dimension": "GA4 sessionDefaultChannelGroup (channel group, not raw source) -- 创始人's explicit call over per-source granularity, matching get_funnel_panel's INTERNAL_COUNTRIES external-clean filter",
+            "folded_into_other": folded_channels,
+        },
+        "error": error,
+    }
+
+
 def get_dashboard_snapshot(days: int = 30, granularity: str = "day") -> dict:
     """All four panels in one call, each independently fault-isolated --
     a Dodo API hiccup must not blank out the (locally-sourced) task-health
@@ -491,4 +568,9 @@ def get_dashboard_snapshot(days: int = 30, granularity: str = "day") -> dict:
     except Exception as exc:
         logger.exception("funnel panel failed")
         out["funnel"] = {"error": str(exc)}
+    try:
+        out["channels"] = get_traffic_channel_panel(days=days)
+    except Exception as exc:
+        logger.exception("channels panel failed")
+        out["channels"] = {"error": str(exc)}
     return out
