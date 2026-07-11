@@ -1666,37 +1666,19 @@ class NAFNetDenoiseProvider:
             return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as exc:
-            logger.warning("NAFNet denoising failed (%s); falling back to HuggingFace restore approach", exc)
-            return await HuggingFaceProvider().process_photo(
-                input_path, output_path, False, progress_callback, email=email
-            )
-
-    async def _pil_denoise_fallback(
-        self, input_path: str, output_path: str, progress_callback: ProgressCallback
-    ) -> ProcessingResult:
-        """Bilateral-filter-style PIL fallback: smoothing + sharpening."""
-        import logging
-        logger = logging.getLogger("artimagehub.nafnet")
-        try:
-            from PIL import Image, ImageFilter, ImageEnhance
-
-            def _process():
-                img = Image.open(input_path).convert("RGB")
-                # Smooth then sharpen — approximates noise reduction
-                img = img.filter(ImageFilter.SMOOTH_MORE)
-                img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=130, threshold=2))
-                img = ImageEnhance.Contrast(img).enhance(1.1)
-                img.save(output_path, "JPEG", quality=90)
-
-            await asyncio.to_thread(_process)
-
-            if progress_callback:
-                await progress_callback("Complete (fallback)", 100)
-
-            logger.info("NAFNet PIL fallback succeeded")
-            return ProcessingResult(success=True, output_path=output_path)
-        except Exception as exc:
-            logger.error("NAFNet PIL fallback also failed: %s", exc)
+            # T242 (2026-07-11, founder direct instruction): this used to fall
+            # back to HuggingFaceProvider().process_photo() -- a face-restore/
+            # ESRGAN/colorize pipeline never designed for denoising, whose own
+            # internal design ("funnel never returns a hard error") silently
+            # degrades all the way to a near-noop PIL enhance and still
+            # reports success=True. T210 found chuxiaojie/NAFNet in a
+            # persistent RUNTIME_ERROR crash state, so this path was live and
+            # silently serving degraded-but-"completed" results. Matches the
+            # same principle already applied to the primary restoration
+            # provider (PhotoFixProvider: "must not silently downgrade...fail
+            # the task and let the user retry") -- a fake success is worse
+            # than a visible failure.
+            logger.error("NAFNet denoising failed (%s); both local Mac and HF Space exhausted, failing (no more silent PIL fallback)", exc)
             return ProcessingResult(success=False, error=str(exc))
 
 
@@ -1772,35 +1754,10 @@ class NAFNetDeblurProvider:
             return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as exc:
-            logger.warning("NAFNet deblurring failed (%s); falling back to HuggingFace restore approach", exc)
-            return await HuggingFaceProvider().process_photo(
-                input_path, output_path, False, progress_callback, email=email
-            )
-
-    async def _pil_deblur_fallback(
-        self, input_path: str, output_path: str, progress_callback: ProgressCallback
-    ) -> ProcessingResult:
-        import logging
-        logger = logging.getLogger("artimagehub.nafnet_deblur")
-        try:
-            from PIL import Image, ImageFilter, ImageEnhance
-
-            def _process():
-                img = Image.open(input_path).convert("RGB")
-                img = img.filter(ImageFilter.UnsharpMask(radius=2.0, percent=180, threshold=2))
-                img = ImageEnhance.Sharpness(img).enhance(1.8)
-                img = ImageEnhance.Contrast(img).enhance(1.1)
-                img.save(output_path, "JPEG", quality=92)
-
-            await asyncio.to_thread(_process)
-
-            if progress_callback:
-                await progress_callback("Complete (fallback)", 100)
-
-            logger.info("NAFNet deblur PIL fallback succeeded")
-            return ProcessingResult(success=True, output_path=output_path)
-        except Exception as exc:
-            logger.error("NAFNet deblur PIL fallback also failed: %s", exc)
+            # T242: see matching comment in NAFNetDenoiseProvider.denoise_photo --
+            # same fix, same reasoning (fail loud, no more masking via
+            # HuggingFaceProvider's own silent PIL-enhance degradation).
+            logger.error("NAFNet deblurring failed (%s); both local Mac and HF Space exhausted, failing (no more silent PIL fallback)", exc)
             return ProcessingResult(success=False, error=str(exc))
 
 
@@ -1969,36 +1926,10 @@ class SwinIRJpegProvider:
             return ProcessingResult(success=True, output_path=output_path)
 
         except Exception as exc:
-            logger.warning("SwinIR JPEG fix failed (%s); falling back to HuggingFace restore approach", exc)
-            return await HuggingFaceProvider().process_photo(
-                input_path, output_path, False, progress_callback, email=email
-            )
-
-    async def _pil_jpeg_fallback(
-        self, input_path: str, output_path: str, progress_callback: ProgressCallback
-    ) -> ProcessingResult:
-        import logging
-        logger = logging.getLogger("artimagehub.swinir_jpeg")
-        try:
-            from PIL import Image, ImageFilter, ImageEnhance
-
-            def _process():
-                img = Image.open(input_path).convert("RGB")
-                # Mild smoothing to reduce JPEG blocking
-                img = img.filter(ImageFilter.SMOOTH)
-                # Unsharp mask to recover edge sharpness lost to compression
-                img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=3))
-                img.save(output_path, "JPEG", quality=92)
-
-            await asyncio.to_thread(_process)
-
-            if progress_callback:
-                await progress_callback("Complete (fallback)", 100)
-
-            logger.info("SwinIR PIL fallback succeeded")
-            return ProcessingResult(success=True, output_path=output_path)
-        except Exception as exc:
-            logger.error("SwinIR PIL fallback also failed: %s", exc)
+            # T242: see matching comment in NAFNetDenoiseProvider.denoise_photo --
+            # same fix, same reasoning (fail loud, no more masking via
+            # HuggingFaceProvider's own silent PIL-enhance degradation).
+            logger.error("SwinIR JPEG fix failed (%s); both local Mac and HF Space exhausted, failing (no more silent PIL fallback)", exc)
             return ProcessingResult(success=False, error=str(exc))
 
 
