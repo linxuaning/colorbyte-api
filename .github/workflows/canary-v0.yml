@@ -33,7 +33,6 @@ jobs:
 
       - name: Run canary v0
         env:
-          CANARY_API_URL: https://api.artimagehub.invalid  # TEMP: force-fail for alert-path verification, reverted next commit
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           # ALERT_EMAIL_TO: intentionally omitted -- this secret was never
           # created, so referencing it here set the env var to "" (present
