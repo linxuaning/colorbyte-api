@@ -49,6 +49,20 @@ ESRGAN_SPACES = [
     ("doevent/Face-Real-ESRGAN", "single_arg"),
 ]
 
+# T241/T242 (2026-07-10/11): the legacy-algorithm safety net for denoising/
+# deblurring/jpeg-fix (NAFNetDenoiseProvider/NAFNetDeblurProvider/
+# SwinIRJpegProvider in ai_service.py) -- used only when the primary
+# flux2_klein/DiffBIR chain fails outright. T210's real-photo test found
+# chuxiaojie/NAFNet in a persistent RUNTIME_ERROR crash state, meaning this
+# safety net currently silently degrades to a near-noop PIL enhance instead
+# of catching the failure. Was never tracked here before -- this closes
+# that exact blind spot. Critical: yes, same tier as the primary restore
+# Space, since a broken safety net is a real (if lower-volume) customer risk.
+LEGACY_FALLBACK_SPACES = [
+    ("chuxiaojie/NAFNet", "denoise/deblur fallback (NAFNetDenoiseProvider + NAFNetDeblurProvider)"),
+    ("JingyunLiang/SwinIR", "jpeg-fix fallback (SwinIRJpegProvider)"),
+]
+
 # State file — written to CI artifact dir when run in GH Actions, else local.
 STATE_PATH = Path(os.environ.get("HF_AUDIT_STATE_PATH", "hf-spaces-audit.json"))
 
@@ -68,7 +82,7 @@ def probe(space_id: str) -> dict:
 
 
 def main() -> int:
-    report: dict = {"restore": [], "colorize": [], "esrgan": [], "critical_failed": False}
+    report: dict = {"restore": [], "colorize": [], "esrgan": [], "legacy_fallback": [], "critical_failed": False}
 
     print("== RESTORE ==")
     for i, entry in enumerate(RESTORE_SPACES):
@@ -100,6 +114,19 @@ def main() -> int:
         marker = "OK" if r["status"] == "ok" else "FAIL"
         print(f"  [{marker}] {sid:<70} {r.get('endpoints') or r.get('error_type')}")
 
+    print("\n== LEGACY FALLBACK (denoise/deblur/jpeg-fix safety net) ==")
+    for entry in LEGACY_FALLBACK_SPACES:
+        sid, label = entry
+        r = probe(sid)
+        r["space_id"] = sid
+        r["label"] = label
+        r["critical"] = True
+        report["legacy_fallback"].append(r)
+        marker = "OK" if r["status"] == "ok" else "FAIL"
+        print(f"  [{marker}] {sid:<30} {label:<55} {r.get('endpoints') or r.get('error_type')}")
+        if r["status"] != "ok":
+            report["critical_failed"] = True
+
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"\nState -> {STATE_PATH}")
@@ -122,6 +149,7 @@ def send_alert(report: dict) -> None:
 
     failed_restore = [r for r in report["restore"] if r["status"] != "ok"]
     failed_colorize = [r for r in report["colorize"] if r["status"] != "ok"]
+    failed_legacy = [r for r in report.get("legacy_fallback", []) if r["status"] != "ok"]
 
     lines = [
         "<h2>HF Spaces audit — critical failure</h2>",
@@ -139,6 +167,19 @@ def send_alert(report: dict) -> None:
         for r in failed_colorize:
             lines.append(
                 f"<li>{r['space_id']} — {r.get('error_type', 'unknown')}: "
+                f"{(r.get('error') or '')[:200]}</li>"
+            )
+        lines.append("</ul>")
+    if failed_legacy:
+        lines.append(
+            "<h3>Failed legacy-fallback Spaces (denoise/deblur/jpeg-fix safety net)</h3>"
+            "<p>These only fire when the primary flux2_klein chain fails, but when THEY "
+            "are also down, that failure silently degrades to a near-noop PIL enhance "
+            "instead of surfacing an error (T210/T242 finding).</p><ul>"
+        )
+        for r in failed_legacy:
+            lines.append(
+                f"<li>{r['space_id']} ({r.get('label', '')}) — {r.get('error_type', 'unknown')}: "
                 f"{(r.get('error') or '')[:200]}</li>"
             )
         lines.append("</ul>")

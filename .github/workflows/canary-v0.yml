@@ -1,0 +1,39 @@
+name: Canary v0 (attribution + restoration pipeline)
+
+# T241 (founder direct instruction, 2026-07-10/11): synthetic checks against
+# the real live site/API -- a real visitor-path attribution assertion and a
+# real test-photo restoration sanity check. Runs every 6h; a real inference
+# job runs on shared GPU infra (M2/macmini), so this stays far less frequent
+# than the lightweight HF-Spaces-reachability audit (hourly).
+
+on:
+  schedule:
+    - cron: "20 */6 * * *"   # every 6 hours, offset from the hourly HF audit
+  workflow_dispatch:
+
+concurrency:
+  group: canary-v0
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright Pillow
+          python -m playwright install --with-deps chromium
+
+      - name: Run canary v0
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          CANARY_INTERNAL_KEY: ${{ secrets.CANARY_INTERNAL_KEY }}
+        run: python3 scripts/canary-v0.py
