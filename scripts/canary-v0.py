@@ -256,8 +256,13 @@ def send_alert(results: dict) -> None:
         print("(RESEND_API_KEY not set -- skipping email)")
         return
 
-    to = os.environ.get("ALERT_EMAIL_TO", "linxuaning98@gmail.com")
-    sender = os.environ.get("ALERT_EMAIL_FROM", "support@artimagehub.com")
+    # 2026-07-11 incident: the workflow set ALERT_EMAIL_TO from a GH secret
+    # that was never created, so the env var was PRESENT but "" -- os.environ
+    # .get(..., default) only falls back when the key is *absent*, so the
+    # canary silently failed to alert on a real outage. `or` treats an empty
+    # string the same as unset.
+    to = os.environ.get("ALERT_EMAIL_TO") or "linxuaning98@gmail.com"
+    sender = os.environ.get("ALERT_EMAIL_FROM") or "support@artimagehub.com"
 
     lines = ["<h2>Canary v0 -- failure</h2>"]
     for name, r in results.items():

@@ -34,6 +34,11 @@ jobs:
       - name: Run canary v0
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          # ALERT_EMAIL_TO: intentionally omitted -- this secret was never
+          # created, so referencing it here set the env var to "" (present
+          # but empty), which defeated canary-v0.py's own default and made
+          # every real alert fail silently (2026-07-11 incident). Leaving it
+          # unset lets the script's default apply; set a real GH secret here
+          # only if the alert address needs to differ from that default.
           CANARY_INTERNAL_KEY: ${{ secrets.CANARY_INTERNAL_KEY }}
         run: python3 scripts/canary-v0.py
