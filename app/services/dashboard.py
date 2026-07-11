@@ -8,9 +8,13 @@ Three panels, MVP scope only:
   3. customers — dedup + repeat-purchase rate, derived from the same Dodo pull
 
 Self-test emails and non-artimagehub (shared Dodo merchant account) payments
-are excluded from orders/customers. Task health intentionally includes all
-tasks (including self-test) since it's a system-reliability signal, not a
-revenue signal.
+are excluded from orders/customers. Task health originally included
+self-test traffic on purpose (a system-reliability signal, not a revenue
+signal) -- T241 (2026-07-11) added the same self-test email exclusion here
+too, once canary-v0.py's recurring synthetic restoration task started
+contributing a large, systematic share of this panel's volume (~40%),
+which would otherwise inflate success_rate and break comparability with
+the T226 baseline. See get_task_health_panel's own docstring for detail.
 """
 from __future__ import annotations
 
@@ -307,11 +311,27 @@ _FEATURE_KEYS = ("restoration", "denoising", "deblurring", "jpeg-fix")
 def get_task_health_panel(days: int = 30) -> dict:
     """Per feature_key task volume/success rate. persistent_tasks is the
     source of truth for ALL task outcomes (completed/failed/processing),
-    unlike processing_events which only records completions."""
+    unlike processing_events which only records completions.
+
+    T241 hotfix (2026-07-11, founder direct instruction): self-test emails
+    (same SELF_TEST_EMAILS list already excluded from orders/customers) are
+    now excluded here too. This panel was originally left unfiltered on
+    purpose (see T224 -- "system-reliability signal, not a revenue signal"),
+    which was fine when self-test traffic was occasional/ad-hoc noise. Once
+    canary-v0.py started running a real synthetic restoration task every 6h
+    (~4/day against ~6 real restoration tasks/day), that assumption broke:
+    ~40% of the panel's volume became synthetic, which would systematically
+    inflate success_rate and make it useless for comparing against the T226
+    baseline (67.4%) going forward. Filtering keeps this panel about real
+    customer reliability while the canary still runs (and still gets
+    caught by the OTHER two canary checks, which read their own script
+    output directly rather than through this dashboard).
+    """
     if not _use_postgres():
         return {"days": days, "error": "postgres not configured", "features": {}}
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    self_test_emails = list(SELF_TEST_EMAILS)
     result: dict[str, dict] = {}
     with _connect_postgres() as conn:
         for feature_key in _FEATURE_KEYS:
@@ -320,9 +340,10 @@ def get_task_health_panel(days: int = 30) -> dict:
                 SELECT task_json->>'status' AS status, count(*) AS n
                 FROM persistent_tasks
                 WHERE task_json->>'feature_key' = %s AND created_at >= %s
+                  AND NOT (LOWER(task_json->>'email') = ANY(%s))
                 GROUP BY 1
                 """,
-                (feature_key, cutoff),
+                (feature_key, cutoff, self_test_emails),
             ).fetchall()
             by_status = {r["status"]: r["n"] for r in rows}
             total = sum(by_status.values())
@@ -336,9 +357,10 @@ def get_task_health_panel(days: int = 30) -> dict:
                 FROM processing_events pe
                 JOIN persistent_tasks pt ON pt.task_id = pe.task_id
                 WHERE pt.task_json->>'feature_key' = %s AND pt.created_at >= %s
+                  AND NOT (LOWER(pt.task_json->>'email') = ANY(%s))
                 GROUP BY 1
                 """,
-                (feature_key, cutoff),
+                (feature_key, cutoff, self_test_emails),
             ).fetchall()
             fallback_count = sum(r["n"] for r in mode_rows if "fallback" in (r["mode"] or ""))
 
