@@ -302,6 +302,90 @@ def _fetch_attribution_by_order_id(order_ids: list[str]) -> dict[str, dict]:
     return {r["order_id"]: r for r in rows if r["order_id"]}
 
 
+def get_recall_candidates(days: int = 14) -> dict:
+    """召回名单 (创始人 dispatch, 2026-07-12, founder direct authorization on the
+    recall action itself; this call is read-only and sends nothing).
+
+    Real paying customers (Dodo succeeded, self-test/other-product excluded,
+    same filters as get_orders_panel) in the last `days` who have at least
+    one failed task in persistent_tasks with no completed task afterward --
+    paid, hit a failure, never got a working result since. First known case:
+    dj@deanejohnson.com (paid 2026-07-04, task a6aace412d34 failed 530 on
+    2026-07-10) -- this exists to find whether there are more like it.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    raw = _fetch_dodo_payments_since(cutoff)
+
+    paying_emails: dict[str, str] = {}
+    for item in raw:
+        if item.get("status") != "succeeded":
+            continue
+        email = ((item.get("customer") or {}).get("email") or "").strip().lower()
+        if not email or email in SELF_TEST_EMAILS:
+            continue
+        if not _is_real_artimagehub_payment(item):
+            continue
+        created_at = item["created_at"]
+        if email not in paying_emails or created_at < paying_emails[email]:
+            paying_emails[email] = created_at
+
+    if not paying_emails:
+        return {"days": days, "checked_customers": 0, "candidates": [], "error": None}
+
+    error = None
+    candidates: list[dict] = []
+    try:
+        with _connect_postgres() as conn:
+            rows = conn.execute(
+                """
+                SELECT task_id, task_json->>'email' AS email,
+                       task_json->>'status' AS status,
+                       task_json->>'feature_key' AS feature_key,
+                       task_json->>'error' AS error,
+                       created_at
+                FROM persistent_tasks
+                WHERE LOWER(task_json->>'email') = ANY(%s) AND created_at >= %s
+                ORDER BY LOWER(task_json->>'email'), created_at
+                """,
+                (list(paying_emails.keys()), cutoff),
+            ).fetchall()
+        by_email: dict[str, list[dict]] = defaultdict(list)
+        for r in rows:
+            by_email[r["email"]].append(r)
+        for email, tasks in by_email.items():
+            failed_tasks = [t for t in tasks if t["status"] == "failed"]
+            if not failed_tasks:
+                continue
+            last_failed = failed_tasks[-1]
+            has_success_after = any(
+                t["status"] == "completed" and t["created_at"] > last_failed["created_at"]
+                for t in tasks
+            )
+            if has_success_after:
+                continue
+            candidates.append({
+                "email": email,
+                "paid_at": paying_emails[email],
+                "last_failed_task_id": last_failed["task_id"],
+                "last_failed_feature_key": last_failed["feature_key"],
+                "last_failed_error": last_failed["error"],
+                "last_failed_at": last_failed["created_at"].isoformat(),
+                "total_tasks_in_window": len(tasks),
+                "failed_tasks_in_window": len(failed_tasks),
+            })
+    except Exception as exc:
+        logger.exception("recall-candidates query failed")
+        error = str(exc)
+
+    candidates.sort(key=lambda c: c["last_failed_at"], reverse=True)
+    return {
+        "days": days,
+        "checked_customers": len(paying_emails),
+        "candidates": candidates,
+        "error": error,
+    }
+
+
 def get_orders_panel(days: int = 30, granularity: str = "day") -> dict:
     if granularity not in ("day", "week", "month"):
         granularity = "day"

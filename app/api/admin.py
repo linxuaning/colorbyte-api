@@ -5,7 +5,7 @@ Only enabled when admin_secret is non-empty.
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Query
 from pydantic import BaseModel, EmailStr
 
 from app.config import get_settings
@@ -14,6 +14,7 @@ from app.services.database import (
     grant_feature_entitlement, is_feature_entitled,
     FEATURE_RESTORATION, FEATURE_DENOISING, FEATURE_DEBLURRING, FEATURE_JPEG_FIX,
 )
+from app.services.dashboard import get_recall_candidates
 
 logger = logging.getLogger("artimagehub.admin")
 router = APIRouter()
@@ -82,3 +83,16 @@ async def grant_all_features(
 
     logger.info("Admin granted all features: %s features=%s note=%r", body.email, list(results), body.note)
     return {"ok": True, "email": body.email, "features": results}
+
+
+@router.get("/admin/recall-candidates")
+async def recall_candidates(
+    days: int = Query(default=14, ge=1, le=90),
+    authorization: str | None = Header(default=None),
+):
+    """T244 (创始人 dispatch, 2026-07-12, founder direct authorization on the
+    recall action): read-only lookup of real paying customers whose most
+    recent task in the window failed with no success since. Sends nothing;
+    the list is for review before any recall action is taken."""
+    _require_admin(authorization)
+    return get_recall_candidates(days=days)
