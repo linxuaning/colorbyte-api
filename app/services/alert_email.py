@@ -25,6 +25,17 @@ _dedup_lock = threading.Lock()
 _dedup_store: dict[str, float] = {}
 _DEDUP_WINDOW_SECS = 3600  # 60 minutes
 
+# T244 (创始人 dispatch, 2026-07-12): every alert_type was labeled "Payment
+# Failure" in the subject regardless of what actually failed (a processing_failed
+# alert misread as a payment outage). Unknown types fall back to a title-cased
+# version of the raw alert_type rather than a misleading default.
+_ALERT_TYPE_LABELS = {
+    "processing_failed": "Processing Failure",
+    "checkout_create_failed": "Checkout Failure",
+    "payment_failed_webhook": "Payment Failure",
+    "webhook_sig_failed": "Webhook Signature Failure",
+}
+
 
 def _is_duplicate(alert_key: str) -> bool:
     with _dedup_lock:
@@ -77,13 +88,14 @@ def send_payment_failure_alert(
         return
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    label = _ALERT_TYPE_LABELS.get(alert_type, alert_type.replace("_", " ").title())
     subject = (
-        f"[Alert] Payment Failure: {alert_type} | "
+        f"[Alert] {label}: {alert_type} | "
         f"{payment_id or customer_email or 'unknown'}"
     )
 
     lines = [
-        "Payment failure alert from artimagehub.com",
+        f"{label} alert from artimagehub.com",
         "",
         f"Time:           {now_str}",
         f"Alert Type:     {alert_type}",
