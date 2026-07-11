@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import subprocess
 import tempfile
 import time
@@ -119,6 +120,95 @@ def _ga4_rows(raw: dict) -> list[tuple[list[str], list[int]]]:
         metrics = [int(float(v.get("value", "0"))) for v in row.get("metricValues") or []]
         rows.append((dims, metrics))
     return rows
+
+
+BING_SITE_URL = "https://artimagehub.com/"
+BING_API_BASE = "https://ssl.bing.com/webmaster/api.svc/json"
+BING_CTR_MAX_ROWS = 100  # cap the table; truncation is logged, never silent
+_BING_DATE_RE = re.compile(r"/Date\((-?\d+)")
+
+
+def _bing_date_iso(raw: str) -> str | None:
+    m = _BING_DATE_RE.search(raw or "")
+    if not m:
+        return None
+    return datetime.fromtimestamp(int(m.group(1)) / 1000, tz=timezone.utc).date().isoformat()
+
+
+def _bing_get(method: str, params: dict) -> list:
+    settings = get_settings()
+    if not settings.bing_webmaster_api_key:
+        raise RuntimeError("BING_WEBMASTER_API_KEY not configured")
+    resp = httpx.get(
+        f"{BING_API_BASE}/{method}",
+        params={**params, "apikey": settings.bing_webmaster_api_key},
+        timeout=20.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "d" not in data:
+        raise RuntimeError(f"Bing API {method} returned no data: {data}")
+    return data["d"]
+
+
+def get_bing_ctr_panel() -> dict:
+    """CTR微调基础设施 (创始人 dispatch, 2026-07-11): Bing query-level CTR table,
+    reusing the site's existing Bing Webmaster Tools verification key
+    (bing-webmaster.key / BING_WEBMASTER_API_KEY) via the standard
+    GetQueryStats endpoint -- a plain apikey query param, no JWT needed.
+
+    GetQueryStats has no date-range parameter; it returns Bing's own rolling
+    window (observed empirically: ~2 weekly buckets, i.e. roughly the last 2
+    weeks), which we sum per-query rather than re-slice by the dashboard's
+    days= selector -- that selector does not apply to this panel.
+
+    Scope note: this is site-wide query stats, not a query->page join. A real
+    per-page breakdown would need a GetPageQueryStats call per known landing
+    page (N+1 calls against Bing's API) -- out of scope for this lightweight
+    pass per 创始人's framing; noted here rather than silently omitted.
+    """
+    error = None
+    rows: list[dict] = []
+    window_dates: set[str] = set()
+    try:
+        raw_rows = _bing_get("GetQueryStats", {"siteUrl": BING_SITE_URL})
+        agg: dict[str, dict] = {}
+        for r in raw_rows:
+            query = r.get("Query", "") or "(unknown)"
+            impressions = int(r.get("Impressions", 0) or 0)
+            clicks = int(r.get("Clicks", 0) or 0)
+            d = _bing_date_iso(r.get("Date", ""))
+            if d:
+                window_dates.add(d)
+            bucket = agg.setdefault(query, {"query": query, "impressions": 0, "clicks": 0})
+            bucket["impressions"] += impressions
+            bucket["clicks"] += clicks
+        for bucket in agg.values():
+            bucket["ctr"] = round(bucket["clicks"] / bucket["impressions"], 4) if bucket["impressions"] else 0.0
+        rows = sorted(agg.values(), key=lambda b: -b["impressions"])
+    except Exception as exc:
+        logger.exception("Bing query-stats fetch failed")
+        error = str(exc)
+
+    truncated = len(rows) > BING_CTR_MAX_ROWS
+    zero_click = [r for r in rows if r["clicks"] == 0 and r["impressions"] > 0]
+
+    return {
+        "window": {"observed_dates": sorted(window_dates)},
+        "rows": rows[:BING_CTR_MAX_ROWS],
+        "totals": {
+            "queries": len(rows),
+            "impressions": sum(r["impressions"] for r in rows),
+            "clicks": sum(r["clicks"] for r in rows),
+            "zero_click_queries": len(zero_click),
+        },
+        "notes": {
+            "source": "Bing Webmaster Tools GetQueryStats (site-wide, no page dimension)",
+            "window_caveat": "Bing's own rolling window (see observed_dates), not the days= selector",
+            "truncated_to": BING_CTR_MAX_ROWS if truncated else None,
+        },
+        "error": error,
+    }
 
 
 def _dodo_get(path: str, api_key: str) -> dict:
@@ -595,4 +685,9 @@ def get_dashboard_snapshot(days: int = 30, granularity: str = "day") -> dict:
     except Exception as exc:
         logger.exception("channels panel failed")
         out["channels"] = {"error": str(exc)}
+    try:
+        out["bing_ctr"] = get_bing_ctr_panel()
+    except Exception as exc:
+        logger.exception("bing_ctr panel failed")
+        out["bing_ctr"] = {"error": str(exc)}
     return out

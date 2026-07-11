@@ -113,6 +113,10 @@ class Settings(BaseSettings):
     # var or ~/.config/artimagehub/gcp-sa.json locally; Render only has the env var).
     artimagehub_ga4_sa_key: str = ""
     ga4_property_id: str = "525510036"
+
+    # Bing Webmaster Tools API (T199/T217 site verification key, reused here
+    # for the CTR-table dashboard panel). Simple apikey query param, no OAuth.
+    bing_webmaster_api_key: str = ""
     resend_from_email: str = "support@artimagehub.com"  # Verified Resend sender
     alert_smtp_host: str = "smtp.gmail.com"
     alert_smtp_port: int = 587

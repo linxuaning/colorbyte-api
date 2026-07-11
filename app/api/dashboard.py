@@ -421,6 +421,37 @@ function render(d) {
     out.appendChild(note2);
   }
 
+  const bq = d.bing_ctr;
+  appendH2(out, 'Bing query CTR (keyword-mining input)');
+  if (bq.error) {
+    appendErr(out, bq.error);
+  } else if (!bq.rows || bq.rows.length === 0) {
+    appendErr(out, 'no query data');
+  } else {
+    appendStatRow(out, [
+      [bq.totals.queries, 'queries'],
+      [bq.totals.impressions, 'impressions'],
+      [bq.totals.clicks, 'clicks'],
+      [bq.totals.zero_click_queries, 'zero-click queries'],
+    ]);
+    const bqTbl = document.createElement('table');
+    bqTbl.innerHTML = '<tr><th>query</th><th>impressions</th><th>clicks</th><th>CTR</th></tr>' +
+      bq.rows.map(r => {
+        const ctrClass = r.clicks === 0 && r.impressions > 0 ? 'bad' : '';
+        return `<tr><td>${escapeHtml(r.query)}</td><td>${r.impressions}</td><td>${r.clicks}</td>` +
+          `<td class="${ctrClass}">${(r.ctr*100).toFixed(1)}%</td></tr>`;
+      }).join('');
+    out.appendChild(bqTbl);
+    const bqNote = document.createElement('div');
+    bqNote.className = 'note';
+    let bqNoteText = `${escapeHtml(bq.notes.source)}<br>window: ${bq.window.observed_dates.join(', ') || 'n/a'} — ${escapeHtml(bq.notes.window_caveat)}`;
+    if (bq.notes.truncated_to) {
+      bqNoteText += `<br>showing top ${bq.notes.truncated_to} of ${bq.totals.queries} queries by impressions`;
+    }
+    bqNote.innerHTML = bqNoteText;
+    out.appendChild(bqNote);
+  }
+
   const o = d.orders;
   appendH2(out, 'Orders (Dodo live truth)');
   if (o.error) {
