@@ -1336,6 +1336,21 @@ class PhotoFixProvider(AIProvider):
             resp.raise_for_status()
             return resp.json()
 
+    # T246 (2026-07-13, founder-approved fix (b)): the async submit call
+    # succeeding while the FIRST poll's raw transport connection fails (no
+    # HTTP response at all -- ConnectError/TimeoutException/etc, not a status
+    # code) used to propagate straight out of this function, which made the
+    # OUTER retry re-submit a brand-new job instead of just re-polling the one
+    # already running. Confirmed against real M2 logs on 2026-07-13: the M2
+    # job (same job_key) ran to completion in both incidents while the
+    # backend had already given up and alerted "failed". job_key is a stable
+    # content hash, so re-polling costs nothing and doesn't risk a duplicate
+    # job. Scope discipline: this only changes what happens on a transport
+    # exception DURING polling -- submit behavior and the final fail-loud
+    # (error_code=upstream_unavailable) outcome once this budget is exhausted
+    # are unchanged.
+    POLL_TRANSPORT_RETRY_MAX = 3
+
     async def _poll_m2_result(
         self, base: str, job_id: str, connect_timeout_s: float, logger,
     ) -> dict:
@@ -1345,13 +1360,26 @@ class PhotoFixProvider(AIProvider):
         poll_headers = {"X-Internal-Key": self.internal_api_key, "User-Agent": "artimagehub-backend/1.0"}
         transient_edge = {502, 503, 520, 521, 522, 523, 524, 525, 526, 527, 530}
         deadline = asyncio.get_running_loop().time() + self.M2_POLL_MAX_S
+        transport_retries = 0
         while True:
             await asyncio.sleep(self.M2_POLL_INTERVAL_S)
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(self.M2_POLL_READ_S, connect=connect_timeout_s),
-                follow_redirects=True,
-            ) as http:
-                r = await http.get(result_url, headers=poll_headers)
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(self.M2_POLL_READ_S, connect=connect_timeout_s),
+                    follow_redirects=True,
+                ) as http:
+                    r = await http.get(result_url, headers=poll_headers)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
+                    httpx.RemoteProtocolError, httpx.TransportError) as exc:
+                transport_retries += 1
+                if transport_retries > self.POLL_TRANSPORT_RETRY_MAX or asyncio.get_running_loop().time() > deadline:
+                    raise
+                logger.warning(
+                    "M2 poll transport error job_id=%s attempt=%d/%d (will re-poll, not re-submit): %s",
+                    job_id, transport_retries, self.POLL_TRANSPORT_RETRY_MAX, str(exc) or type(exc).__name__,
+                )
+                continue
+            transport_retries = 0
             if r.status_code in transient_edge:
                 # tunnel/edge flap during polling — keep polling until the deadline
                 if asyncio.get_running_loop().time() > deadline:
