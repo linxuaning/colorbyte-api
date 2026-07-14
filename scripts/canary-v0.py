@@ -62,7 +62,13 @@ API_URL = os.environ.get("CANARY_API_URL", "https://api.artimagehub.com").rstrip
 BLOG_PATH = "/blog/restore-old-photos-online-free/"
 TOOL_PATH = "/old-photo-restoration/"
 CANARY_EMAIL = "linxuaning98@gmail.com"  # self-test address, excluded from revenue metrics
-POLL_TIMEOUT_S = 180
+POLL_TIMEOUT_S = 300  # T248 follow-up (2026-07-14): a real run hit 183.6s and
+# flapped the canary's own budget -- see this file's own commit message for
+# why 300s, not the 160s->184s story it was initially attributed to (that
+# story doesn't hold: this script's own test image has zero faces, confirmed
+# against ab_server.log, so it never reaches gentle-routing or existence-check
+# code at all). 300s leaves real margin while staying far under the real
+# 1200s upstream timeout.
 POLL_INTERVAL_S = 5
 MIN_MEAN_BRIGHTNESS = 10  # 0-255; a real photo's restored preview should never average this dark
 
