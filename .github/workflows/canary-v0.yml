@@ -18,7 +18,10 @@ concurrency:
 jobs:
   canary:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # T248 follow-up (2026-07-14): two restoration checks now run per round
+    # (no-face DiffBIR path + a real 2-face image exercising gentle-routing/
+    # existence-check), observed ~6-7min total; 15min leaves real margin.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

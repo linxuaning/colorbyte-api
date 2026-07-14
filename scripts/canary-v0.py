@@ -15,12 +15,25 @@ Two independent checks, run against the real live site/API:
    nobody exercises," is exactly what let both bugs live undetected for
    months).
 
-2. Restoration-pipeline sanity check: uploads a synthetic test photo to
+2. Restoration-pipeline sanity check, TWO variants -- uploads a test photo to
    /api/upload and polls for completion, then fetches the watermarked
    preview (/api/result-preview/{id}) and asserts it isn't corrupted or
    near-black. This is the T223 incident class (a real customer photo came
    back solid black) -- this check would have caught it automatically
    instead of waiting for a customer complaint or someone spot-checking.
+     a. no_face: the original synthetic gradient (zero faces) -- exercises
+        the DiffBIR fallback path only, never touches T248's gentle-routing
+        or face-existence-check code.
+     b. face (added 2026-07-14, T248 follow-up, founder-approved): a real
+        2-face vintage photo -- exercises gentle-routing + existence-check
+        on every run, doubling as a live regression test for that new code.
+        Image source: Internet Archive item "kaczynskaja-fota-16-002"
+        (https://archive.org/details/kaczynskaja-fota-16-002), licensed
+        Public Domain Mark 1.0 (https://creativecommons.org/publicdomain/
+        mark/1.0/) -- explicitly not a customer photo; customer images are
+        never used as test/CI assets, diagnostic one-off use excepted (see
+        T244/T248 incident notes). Its content-hash is fixed and known --
+        exclude it when analyzing production face/identity metrics.
 
    Both endpoints are pay-first gated (T220 per-feature entitlement, no
    free path exists) -- this uses CANARY_EMAIL, the same self-test address
@@ -155,6 +168,22 @@ def _make_test_image() -> bytes:
     return buf.getvalue()
 
 
+# T248 follow-up (2026-07-14, founder-approved): a real 2-face test image so
+# the canary also regression-tests gentle-routing + face-existence-check on
+# every run, not just the no-face DiffBIR path. Source: Internet Archive item
+# "kaczynskaja-fota-16-002" (https://archive.org/details/kaczynskaja-fota-16-002),
+# a 1925 studio portrait from the Vitebsk Belarusian documents collection,
+# licensed Public Domain Mark 1.0 (https://creativecommons.org/publicdomain/
+# mark/1.0/) -- not a customer photo. See this commit's message for the full
+# provenance note; customer images are never used as test/CI assets.
+FACE_TEST_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "canary-face-test.jpg")
+
+
+def _load_face_test_image() -> bytes:
+    with open(FACE_TEST_IMAGE_PATH, "rb") as f:
+        return f.read()
+
+
 def _post_multipart(url: str, fields: dict, file_field: str, filename: str, file_bytes: bytes) -> dict:
     boundary = "----canaryv0boundary"
     parts = []
@@ -175,7 +204,7 @@ def _post_multipart(url: str, fields: dict, file_field: str, filename: str, file
         return json.loads(r.read())
 
 
-def check_restoration_pipeline() -> dict:
+def check_restoration_pipeline(image_bytes: bytes, label: str) -> dict:
     """Upload -> poll -> fetch preview -> assert not corrupted/black.
 
     Both /api/upload and /api/result-preview/{id} are pay-first gated
@@ -188,9 +217,11 @@ def check_restoration_pipeline() -> dict:
     entitlement bypass per its own docstring) so this keeps working even if
     that email's entitlement ever lapses; result-preview has no such bypass
     parameter, so it relies on the email's real entitlement either way.
-    """
-    image_bytes = _make_test_image()
 
+    `label` is cosmetic (surfaces in filename/logs only) -- which code path
+    actually runs is determined entirely by whether image_bytes has a
+    detectable face, same as any real customer upload.
+    """
     try:
         upload_resp = _post_multipart(
             f"{API_URL}/api/upload",
@@ -201,7 +232,7 @@ def check_restoration_pipeline() -> dict:
                 "internal_key": os.environ.get("CANARY_INTERNAL_KEY", ""),
             },
             "file",
-            "canary-v0-test.jpg",
+            f"canary-v0-test-{label}.jpg",
             image_bytes,
         )
     except Exception as e:
@@ -312,12 +343,19 @@ def main() -> int:
         results["attribution"] = {"ok": False, "reason": f"check crashed: {e}"}
     print(f"  {'OK' if results['attribution']['ok'] else 'FAIL'}: {results['attribution']}")
 
-    print("\n== Restoration pipeline sanity check ==")
+    print("\n== Restoration pipeline sanity check (no_face -- DiffBIR path) ==")
     try:
-        results["restoration_pipeline"] = check_restoration_pipeline()
+        results["restoration_pipeline_no_face"] = check_restoration_pipeline(_make_test_image(), "no-face")
     except Exception as e:
-        results["restoration_pipeline"] = {"ok": False, "reason": f"check crashed: {e}"}
-    print(f"  {'OK' if results['restoration_pipeline']['ok'] else 'FAIL'}: {results['restoration_pipeline']}")
+        results["restoration_pipeline_no_face"] = {"ok": False, "reason": f"check crashed: {e}"}
+    print(f"  {'OK' if results['restoration_pipeline_no_face']['ok'] else 'FAIL'}: {results['restoration_pipeline_no_face']}")
+
+    print("\n== Restoration pipeline sanity check (face -- gentle-routing + existence-check path) ==")
+    try:
+        results["restoration_pipeline_face"] = check_restoration_pipeline(_load_face_test_image(), "face")
+    except Exception as e:
+        results["restoration_pipeline_face"] = {"ok": False, "reason": f"check crashed: {e}"}
+    print(f"  {'OK' if results['restoration_pipeline_face']['ok'] else 'FAIL'}: {results['restoration_pipeline_face']}")
 
     any_failed = any(not r.get("ok") for r in results.values())
     if any_failed:
