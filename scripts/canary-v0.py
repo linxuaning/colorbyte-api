@@ -75,13 +75,17 @@ API_URL = os.environ.get("CANARY_API_URL", "https://api.artimagehub.com").rstrip
 BLOG_PATH = "/blog/restore-old-photos-online-free/"
 TOOL_PATH = "/old-photo-restoration/"
 CANARY_EMAIL = "linxuaning98@gmail.com"  # self-test address, excluded from revenue metrics
-POLL_TIMEOUT_S = 300  # T248 follow-up (2026-07-14): a real run hit 183.6s and
-# flapped the canary's own budget -- see this file's own commit message for
-# why 300s, not the 160s->184s story it was initially attributed to (that
-# story doesn't hold: this script's own test image has zero faces, confirmed
-# against ab_server.log, so it never reaches gentle-routing or existence-check
-# code at all). 300s leaves real margin while staying far under the real
-# 1200s upstream timeout.
+POLL_TIMEOUT_S = 1500  # T254 (2026-07-19): the real FLUX queue (depth cap 5) can now
+# legitimately take up to ~1200s end-to-end (5 jobs ahead x ~200s + this job's own
+# ~200s -- see T254 design notes), matching the client's own 20min polling ceiling.
+# The old flat 300s deadline would false-positive-fail on a healthy deep-queue wait,
+# so this is now just the outer hard ceiling; QUEUE_STUCK_THRESHOLD_S below is the
+# real "did something actually break" signal.
+QUEUE_STUCK_THRESHOLD_S = 300  # T254: if task.stage (the same queued-position text
+# customers see, e.g. "Queued at restoration engine (position N)...") stops changing
+# for this long while status is still queued/processing, that's a real stuck/broken
+# queue -- a healthy deep queue keeps advancing. Fail fast on this instead of waiting
+# out the full POLL_TIMEOUT_S ceiling.
 POLL_INTERVAL_S = 5
 MIN_MEAN_BRIGHTNESS = 10  # 0-255; a real photo's restored preview should never average this dark
 
@@ -244,6 +248,8 @@ def check_restoration_pipeline(image_bytes: bytes, label: str) -> dict:
 
     deadline = time.time() + POLL_TIMEOUT_S
     status = None
+    last_stage = None
+    last_stage_change_at = time.time()
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(f"{API_URL}/api/tasks/{task_id}", timeout=15) as r:
@@ -252,6 +258,20 @@ def check_restoration_pipeline(image_bytes: bytes, label: str) -> dict:
             return {"ok": False, "reason": f"status poll failed: {e}", "task_id": task_id}
         if status.get("status") in ("completed", "failed"):
             break
+        stage = status.get("stage")
+        if stage != last_stage:
+            last_stage = stage
+            last_stage_change_at = time.time()
+        elif time.time() - last_stage_change_at > QUEUE_STUCK_THRESHOLD_S:
+            return {
+                "ok": False,
+                "reason": (
+                    f"stage stuck at {last_stage!r} for over {QUEUE_STUCK_THRESHOLD_S}s -- "
+                    "likely a real hang, not a healthy deep queue (which keeps advancing)"
+                ),
+                "task_id": task_id,
+                "last_status": status,
+            }
         time.sleep(POLL_INTERVAL_S)
     else:
         return {"ok": False, "reason": f"task did not finish within {POLL_TIMEOUT_S}s", "task_id": task_id, "last_status": status}

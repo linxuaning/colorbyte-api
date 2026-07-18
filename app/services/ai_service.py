@@ -1278,7 +1278,7 @@ class PhotoFixProvider(AIProvider):
 
     async def _restore_call(
         self, endpoint_name: str, endpoint_url: str, image_b64: str, task: str,
-        connect_timeout_s: float, logger,
+        connect_timeout_s: float, logger, progress_callback: ProgressCallback = None,
     ) -> dict:
         """One restore call to a candidate, returning the response dict.
 
@@ -1321,7 +1321,7 @@ class PhotoFixProvider(AIProvider):
         if not sdata.get("ok") or not job_id:
             raise RuntimeError(f"M2 async submit rejected: {sdata.get('error') or sdata.get('status')}")
         logger.info("M2 async submitted job_id=%s status=%s", job_id, sdata.get("status"))
-        return await self._poll_m2_result(base, job_id, connect_timeout_s, logger)
+        return await self._poll_m2_result(base, job_id, connect_timeout_s, logger, progress_callback)
 
     async def _legacy_sync_restore(
         self, endpoint_url: str, image_b64: str, task: str, connect_timeout_s: float, headers: dict,
@@ -1353,6 +1353,7 @@ class PhotoFixProvider(AIProvider):
 
     async def _poll_m2_result(
         self, base: str, job_id: str, connect_timeout_s: float, logger,
+        progress_callback: ProgressCallback = None,
     ) -> dict:
         import httpx
 
@@ -1393,6 +1394,13 @@ class PhotoFixProvider(AIProvider):
             rj = r.json()
             status = rj.get("status")
             if status in ("queued", "processing"):
+                # T254: server.py's own job now carries a live `stage` string
+                # (e.g. "Queued at restoration engine (position 3)...") instead
+                # of always showing generic "processing" -- forward it so the
+                # customer sees real queue position, not a stuck-looking bar.
+                if progress_callback:
+                    stage_text = rj.get("stage") or "Processing with PhotoFix..."
+                    await progress_callback(stage_text, 25)
                 if asyncio.get_running_loop().time() > deadline:
                     raise httpx.TimeoutException(f"M2 restore poll exceeded {self.M2_POLL_MAX_S:.0f}s")
                 continue
@@ -1489,7 +1497,7 @@ class PhotoFixProvider(AIProvider):
                     try:
                         data = await self._restore_call(
                             endpoint_name, endpoint_url, image_b64, task,
-                            connect_timeout_s, logger,
+                            connect_timeout_s, logger, progress_callback,
                         )
 
                         if endpoint_name == "m2" and data.get("error") == "busy":
